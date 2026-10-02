@@ -36,4 +36,36 @@ describe('ActiveRunCard', () => {
     expect(html).toContain('nodes');
     expect(html).toContain('parallel-a, parallel-b');
   });
+
+  test('a resolved gate on a chat-started run says the chat must resume it', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ActiveRunCard
+          run={{
+            ...parallelRun,
+            id: 'abcd1234-chat-run',
+            origin: 'telegram',
+            status: 'paused',
+            gateResolved: 'approved',
+          }}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain('Approved — continues when the Telegram chat that started it resumes');
+    expect(html).toContain('abcd1234');
+    expect(html).not.toContain('resuming…');
+  });
+
+  test('a resolved gate on a web-started run still says it is resuming', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ActiveRunCard
+          run={{ ...parallelRun, origin: 'web', status: 'paused', gateResolved: 'approved' }}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain('Approved — resuming…');
+  });
 });

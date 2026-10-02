@@ -781,7 +781,14 @@ describe('CommandHandler', () => {
         expect(result.message).toContain('Archon Orchestrator');
         expect(result.message).toContain('/workflow list');
         expect(result.message).toContain('/workflow resume <id>` — Resume a failed or paused run');
+        expect(result.message).toContain('/workflow respond <id> <decision> [text]`');
         expect(result.message).toContain('/status');
+      });
+
+      test('lists respond in the /workflow usage', async () => {
+        const result = await handleCommand(baseConversation, '/workflow nonsense');
+        expect(result.success).toBe(false);
+        expect(result.message).toContain('/workflow respond <id> <decision> [text]');
       });
     });
 

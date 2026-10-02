@@ -38,6 +38,7 @@ These commands are handled deterministically by the orchestrator — they always
 | `/workflow abandon <id>` | Discard a run (running, paused, or failed) |
 | `/workflow approve <id> [comment]` | Approve a paused workflow run at an approval gate (interactive-loop gates: no comment on a signal-bearing gate = accept & complete; a comment runs another iteration) |
 | `/workflow reject <id> [reason]` | Reject a paused workflow run at an approval gate |
+| `/workflow respond <id> <decision> [text]` | Answer a paused gate with one of its declared decisions (for decisions beyond approve and reject) |
 | `/workflow run <name> [args]` | Run a workflow directly |
 | `/workflow cleanup [days]` | CLI only -- delete old run records (default: 7 days) |
 

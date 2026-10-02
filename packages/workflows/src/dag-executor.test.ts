@@ -10206,6 +10206,51 @@ describe('executeDagWorkflow -- resume with priorCompletedNodes', () => {
       expect(gateMessage).toContain('Review and provide feedback.');
     });
 
+    it('interactive loop gate shows a long iteration output untruncated', async () => {
+      const longOutput = 'y'.repeat(2000);
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: longOutput };
+        yield { type: 'result', sessionId: 'loop-session-long' };
+      });
+
+      const mockDeps = createMockDeps();
+      const platform = createMockPlatform();
+
+      await executeDagWorkflow(
+        dagOptions({
+          deps: mockDeps,
+          platform,
+          cwd: testDir,
+          workflow: {
+            name: 'interactive-loop-long-output',
+            nodes: [
+              {
+                id: 'refine',
+                kind: 'loop',
+                loop: {
+                  fresh_context: false,
+                  prompt: 'Refine.',
+                  until: 'APPROVED',
+                  max_iterations: 10,
+                  interactive: true,
+                  gate_message: 'Review and provide feedback.',
+                },
+              },
+            ],
+          },
+          workflowRun: makeWorkflowRun(),
+        })
+      );
+
+      const pauseCalls = (
+        mockDeps.store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>
+      ).mock.calls;
+      expect(pauseCalls.length).toBe(1);
+      const gateMessage = (pauseCalls[0][1] as { message: string }).message;
+      expect(gateMessage).toContain(`> ${longOutput}\n\n`);
+      expect(gateMessage).not.toContain('…');
+    });
+
     it('interactive loop exits on resume when AI emits completion signal (user approved)', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
         yield {
@@ -14995,6 +15040,8 @@ describe('executeDagWorkflow -- durable wait node', () => {
     );
     expect(messages.join('\n')).toContain('Action required for workflow run `attention-wait`');
     expect(messages.join('\n')).toContain('Re-run windows tests, then resume.');
+    expect(messages.join('\n')).toContain('Resume: `/workflow resume attention-wait`');
+    expect(messages.join('\n')).toContain('Abandon: `/workflow abandon attention-wait`');
   });
 
   it('fails an action-required pause when its notification cannot be delivered', async () => {
@@ -15281,6 +15328,49 @@ describe('executeDagWorkflow -- approval node', () => {
       onRejectPrompt: 'Fix based on: $REJECTION_REASON',
       onRejectMaxAttempts: 3,
     });
+  });
+
+  it('approval node fails instead of pausing when its gate message cannot be delivered', async () => {
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    // A transient platform error (rate limit) makes safeSendMessage report non-delivery.
+    platform.sendMessage.mockImplementation(async (_conversationId, message) => {
+      if (message.includes('Approval required')) {
+        throw new Error('429: Too Many Requests: retry after 30');
+      }
+    });
+    const workflowRun = makeWorkflowRun();
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-approval',
+        cwd: testDir,
+        workflow: {
+          name: 'approval-undelivered',
+          nodes: [
+            {
+              id: 'review',
+              kind: 'gate',
+              message: 'Approve this plan?',
+              decisions: [{ id: 'approve' }, { id: 'reject' }],
+              captureResponse: false,
+              decisionsAuthored: false,
+            },
+          ],
+        },
+        workflowRun,
+      })
+    );
+
+    const pauseCalls = (store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>).mock
+      .calls;
+    expect(pauseCalls.length).toBe(0);
+    const failCalls = (store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>).mock.calls;
+    expect(failCalls.length).toBe(1);
+    expect(String(failCalls[0][1])).toContain('node review failed');
   });
 
   it('approval node without capture_response stores empty node output', async () => {

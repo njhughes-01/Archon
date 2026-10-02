@@ -48,6 +48,8 @@ TELEGRAM_STREAMING_MODE=stream  # stream (default) | batch
 
 For streaming mode details, see [Configuration](/getting-started/configuration/).
 
+`stream` sends a message for every text chunk and tool call, which can exceed Telegram's rate limit during long workflow runs. When Telegram rate-limits a send, the adapter waits the time Telegram asks for (up to 60 seconds) and retries once; a message that still fails is reported as undelivered. Use `batch` if you see `429: Too Many Requests` in the server log.
+
 ## Further Reading
 
 - [Configuration](/getting-started/configuration/)

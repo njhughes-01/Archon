@@ -2,7 +2,7 @@ import type { ReactElement } from 'react';
 import { Globe, Terminal, Hash, Send, MessageCircle, GitBranch } from 'lucide-react';
 import type { RunOrigin } from '../primitives/run';
 
-const ORIGIN_LABEL: Record<RunOrigin, string> = {
+export const ORIGIN_LABEL: Record<RunOrigin, string> = {
   web: 'Web',
   cli: 'CLI',
   slack: 'Slack',

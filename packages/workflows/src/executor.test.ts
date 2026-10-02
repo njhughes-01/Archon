@@ -2547,6 +2547,27 @@ describe('executeWorkflow', () => {
     });
   });
 
+  describe('startup message', () => {
+    it('names the run id so chat commands can target the run', async () => {
+      const platform = makePlatform();
+
+      await executeWorkflow(
+        makeDeps(),
+        platform,
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'test message',
+        'db-conv-1'
+      );
+
+      const startup = (platform.sendMessage as ReturnType<typeof mock>).mock.calls
+        .map(call => String(call[1]))
+        .find(message => message.includes('Starting workflow'));
+      expect(startup).toContain('Run ID: `run-123`');
+    });
+  });
+
   // -------------------------------------------------------------------------
   // $DOCS_DIR default resolution
   // -------------------------------------------------------------------------
