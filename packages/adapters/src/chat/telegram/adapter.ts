@@ -2,7 +2,7 @@
  * Telegram platform adapter using grammY SDK
  * Handles message sending with 4096 character limit splitting
  */
-import { Bot, Context } from 'grammy';
+import { Bot, Context, GrammyError } from 'grammy';
 import type { IPlatformAdapter, MessageMetadata } from '@archon/core';
 import { createLogger } from '@archon/paths';
 import { parseAllowedUserIds, isUserAuthorized } from './auth';
@@ -18,6 +18,36 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 const MAX_LENGTH = 4096;
+
+/**
+ * Longest rate-limit wait honoured before retrying a send. Telegram names the wait
+ * in `retry_after`; a longer one fails the send rather than stalling the run that
+ * is sending, and callers report the undelivered message.
+ */
+const MAX_RATE_LIMIT_WAIT_SECONDS = 60;
+
+/** Telegram's `retry_after` when the Bot API rate-limited the call (HTTP 429). */
+function rateLimitRetryAfter(error: unknown): number | undefined {
+  return error instanceof GrammyError && error.error_code === 429
+    ? error.parameters.retry_after
+    : undefined;
+}
+
+/**
+ * Send once; if Telegram rate-limits it, wait the time it asks for and send once more.
+ * The retry decision reads grammY's typed error code, never the error text.
+ */
+async function sendWithRateLimitRetry(send: () => Promise<unknown>): Promise<void> {
+  try {
+    await send();
+  } catch (error) {
+    const retryAfter = rateLimitRetryAfter(error);
+    if (retryAfter === undefined || retryAfter > MAX_RATE_LIMIT_WAIT_SECONDS) throw error;
+    getLog().warn({ retryAfter }, 'telegram.rate_limited_retrying');
+    await new Promise(resolve => setTimeout(resolve, retryAfter * 1000));
+    await send();
+  }
+}
 
 export class TelegramAdapter implements IPlatformAdapter {
   private bot: Bot;
@@ -84,24 +114,31 @@ export class TelegramAdapter implements IPlatformAdapter {
       let subChunk = '';
       for (const line of lines) {
         if (subChunk.length + line.length + 1 > MAX_LENGTH - 100) {
-          if (subChunk) await this.bot.api.sendMessage(id, subChunk);
+          const ready = subChunk;
+          if (ready) await sendWithRateLimitRetry(() => this.bot.api.sendMessage(id, ready));
           subChunk = line;
         } else {
           subChunk += (subChunk ? '\n' : '') + line;
         }
       }
-      if (subChunk) await this.bot.api.sendMessage(id, subChunk);
+      const last = subChunk;
+      if (last) await sendWithRateLimitRetry(() => this.bot.api.sendMessage(id, last));
       return;
     }
 
     // Try MarkdownV2 formatting
     const formatted = convertToTelegramMarkdown(chunk);
     try {
-      await this.bot.api.sendMessage(id, formatted, { parse_mode: 'MarkdownV2' });
+      await sendWithRateLimitRetry(() =>
+        this.bot.api.sendMessage(id, formatted, { parse_mode: 'MarkdownV2' })
+      );
       getLog().debug({ chunkLength: chunk.length }, 'telegram.markdownv2_chunk_sent');
     } catch (error) {
-      // Fallback to stripped plain text for this chunk
-      const err = error as Error;
+      // Only a rejected request (400, e.g. "can't parse entities") is fixed by re-sending
+      // as plain text. Re-sending after a rate limit or network failure would hit the
+      // same failure again, so those propagate to the caller.
+      if (!(error instanceof GrammyError && error.error_code === 400)) throw error;
+      const err: Error = error;
       getLog().warn(
         {
           err,
@@ -110,7 +147,7 @@ export class TelegramAdapter implements IPlatformAdapter {
         },
         'telegram.markdownv2_failed'
       );
-      await this.bot.api.sendMessage(id, stripMarkdown(chunk));
+      await sendWithRateLimitRetry(() => this.bot.api.sendMessage(id, stripMarkdown(chunk)));
     }
   }
 

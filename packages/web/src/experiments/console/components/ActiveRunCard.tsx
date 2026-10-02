@@ -2,10 +2,10 @@ import { useState, type ReactElement } from 'react';
 import { useNavigate } from 'react-router';
 import { StatusStrip } from './StatusStrip';
 import { LiveDot } from './LiveDot';
-import { OriginBadge } from './OriginBadge';
+import { OriginBadge, ORIGIN_LABEL } from './OriginBadge';
 import { ApprovalPanel } from './ApprovalPanel';
 import { ApprovalContext } from './ApprovalContext';
-import { runDetailPath, type Run } from '../primitives/run';
+import { runDetailPath, type Run, type RunOrigin } from '../primitives/run';
 import { shortRunId, formatElapsed, elapsedSince, formatCost } from '../lib/format';
 import { useIsDocker, useIdeEnv, openInIde } from '../lib/health';
 import { statusTextClass, runStatusLabel } from '../lib/run-status';
@@ -16,6 +16,23 @@ import { K } from '../store/keys';
 
 /** Present + non-empty — narrows `string | null | undefined` to `string`. */
 const hasValue = (v: string | null | undefined): v is string => v != null && v !== '';
+
+/**
+ * Origins whose runs the server does not auto-resume after a dashboard decision: the
+ * cross-adapter guard leaves them to the chat that started them. The server keys that
+ * guard off the parent conversation's platform and `origin` is the run's own
+ * conversation's platform; for a chat-started run both are that chat. A full record, so a
+ * new origin must be classified here before the client compiles.
+ */
+const RESUMED_BY_ORIGIN_CHAT: Record<RunOrigin, boolean> = {
+  web: false,
+  cli: false,
+  unknown: false,
+  slack: true,
+  telegram: true,
+  discord: true,
+  github: true,
+};
 
 interface ActiveRunCardProps {
   run: Run;
@@ -278,18 +295,20 @@ export function ActiveRunCard({
           )
         ) : null}
 
-        {/* Resolved gate awaiting auto-resume — the run is still 'paused' in the
-            DB for the second or so between approve/reject and the executor
-            flipping it to running. Show a hint instead of stale gate buttons. */}
+        {/* Resolved gate awaiting resume — the run is still 'paused' in the DB.
+            A web or CLI run auto-resumes within a second or so; a chat-started run
+            waits until its own chat resumes it, so say that instead of "resuming". */}
         {run.status === 'paused' && run.gateResolved !== null && run.gateResolved !== undefined ? (
           <div className="mt-2 flex items-center gap-2 rounded border border-border bg-surface-hover/40 px-3 py-2 text-[12px] text-text-secondary">
             <span aria-hidden className="inline-block animate-pulse leading-none">
               ▸
             </span>
             <span>
-              {run.gateResolved === 'approved'
-                ? 'Approved — resuming…'
-                : 'Rejected — running on-reject rework…'}
+              {RESUMED_BY_ORIGIN_CHAT[run.origin]
+                ? `${run.gateResolved === 'approved' ? 'Approved' : 'Rejected'} — continues when the ${ORIGIN_LABEL[run.origin]} conversation that started it resumes run ${shortRunId(run.id)}`
+                : run.gateResolved === 'approved'
+                  ? 'Approved — resuming…'
+                  : 'Rejected — running on-reject rework…'}
             </span>
           </div>
         ) : null}

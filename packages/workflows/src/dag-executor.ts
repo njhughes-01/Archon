@@ -4298,9 +4298,11 @@ async function executeScriptNode(
 }
 
 /** Cap for the iteration-output excerpt embedded in gate messages — keeps the
- *  persisted `metadata.approval.message` and SSE payloads bounded (mirrors the
- *  tool-input truncation used for progress events). */
-const GATE_EXCERPT_MAX = 500;
+ *  persisted `metadata.approval.message` and SSE payloads bounded. Sized so the
+ *  question a loop asks reaches a chat surface whole (Telegram allows 4096 chars
+ *  per message and the adapters split longer ones); a chat user cannot open the
+ *  dashboard's full-output view from the gate message. */
+const GATE_EXCERPT_MAX = 3000;
 
 type LoopCompletionCheck =
   | { channel: 'until'; signal: string; completed: boolean }
@@ -7354,7 +7356,9 @@ async function executeWaitNode(
       const delivered = await safeSendMessage(
         platform,
         conversationId,
-        `⏸️ **Action required for workflow run \`${workflowRun.id}\`**\n\n${context.message}\n\nResume this run after the action is complete, or abandon it if it should not continue.`,
+        `⏸️ **Action required for workflow run \`${workflowRun.id}\`**\n\n${context.message}\n\nResume this run after the action is complete, or abandon it if it should not continue.\n` +
+          `Resume: \`${spellWorkflowCommand(platform, `resume ${workflowRun.id}`)}\` | ` +
+          `Abandon: \`${spellWorkflowCommand(platform, `abandon ${workflowRun.id}`)}\``,
         { workflowId: workflowRun.id, nodeName: node.id }
       );
       if (!delivered) {
@@ -7617,7 +7621,29 @@ async function executeApprovalNode(
     `Run ID: \`${workflowRun.id}\`\n` +
     `Approve: \`${spellWorkflowCommand(platform, `approve ${workflowRun.id}`)}\` | ` +
     `Reject: \`${spellWorkflowCommand(platform, `reject ${workflowRun.id}`)}\``;
-  await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
+  const gateSent = await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
+  // Same rule as the loop gates: a pause nobody was told about is a silently stuck run
+  // on a chat surface, so fail the node visibly instead of pausing. Not while a
+  // rejection is staged: only the pause below replaces it, and a failed node would
+  // leave it in run metadata for a later resume to run the rework again.
+  if (!gateSent && rejectionReason === '') {
+    getLog().error(
+      { nodeId: node.id, workflowRunId: workflowRun.id },
+      'approval_node.gate_message_send_failed'
+    );
+    return recordNodeState(
+      { store: deps.store, logDir: ctx.logDir },
+      finishNodeExecution(
+        execution,
+        {
+          status: 'failed',
+          error: `Approval gate message failed to deliver for node '${node.id}' — cannot pause safely`,
+          failureKind: 'unknown',
+        },
+        { output: { text: '' }, diagnostics: { iteration } }
+      )
+    );
+  }
 
   deps.store
     .createWorkflowEvent({

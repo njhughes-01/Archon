@@ -36,4 +36,51 @@ describe('ActiveRunCard', () => {
     expect(html).toContain('nodes');
     expect(html).toContain('parallel-a, parallel-b');
   });
+
+  test('a resolved gate on a chat-started run says the chat must resume it', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ActiveRunCard
+          run={{
+            ...parallelRun,
+            id: 'abcd1234-chat-run',
+            origin: 'telegram',
+            status: 'paused',
+            gateResolved: 'approved',
+          }}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain(
+      'Approved — continues when the Telegram conversation that started it resumes'
+    );
+    expect(html).toContain('abcd1234');
+    expect(html).not.toContain('resuming…');
+  });
+
+  test('a rejected gate on a chat-started run does not claim rework is running', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ActiveRunCard
+          run={{ ...parallelRun, origin: 'slack', status: 'paused', gateResolved: 'rejected' }}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain('Rejected — continues when the Slack conversation that started it');
+    expect(html).not.toContain('running on-reject rework');
+  });
+
+  test('a resolved gate on a web-started run still says it is resuming', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ActiveRunCard
+          run={{ ...parallelRun, origin: 'web', status: 'paused', gateResolved: 'approved' }}
+        />
+      </MemoryRouter>
+    );
+
+    expect(html).toContain('Approved — resuming…');
+  });
 });

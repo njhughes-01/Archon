@@ -3234,7 +3234,7 @@ export async function executeWorkflow(
       .join('\n')
       .trim();
     const descriptionText = cleanDescription || workflow.name;
-    startupMessage += `🚀 **Starting workflow**: \`${workflow.name}\`\n\n> ${descriptionText}`;
+    startupMessage += `🚀 **Starting workflow**: \`${workflow.name}\`\nRun ID: \`${workflowRun.id}\`\n\n> ${descriptionText}`;
 
     // Send consolidated message - use critical send with limited retries (1 retry max)
     // to avoid blocking workflow execution while still catching transient failures

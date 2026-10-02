@@ -1211,6 +1211,7 @@ async function handleWorkflowCommand(
           `  ${cmd('abandon <id>')} - Abandon a running, failed, or paused run`,
           `  ${cmd('approve <id> [comment]')} - Approve a paused gate`,
           `  ${cmd('reject <id> [reason]')} - Reject a paused gate`,
+          `  ${cmd('respond <id> <decision> [text]')} - Answer a paused gate with one of its declared decisions`,
           `  ${cmd('reset-sessions <name> [<node-id>]')} - Clear persisted AI session memory for this conversation`,
           `  ${cmd('run <name> [args]')} - Run a workflow directly`,
         ].join('\n'),
@@ -1250,6 +1251,7 @@ Talk naturally — the orchestrator routes your requests to the right workflow a
 - \`${cmd('abandon <id>')}\` — Abandon a running, failed, or paused run
 - \`${cmd('approve <id>')}\` — Approve a paused gate
 - \`${cmd('reject <id>')}\` — Reject a paused gate
+- \`${cmd('respond <id> <decision> [text]')}\` — Answer a paused gate with one of its declared decisions
 - \`${cmd('reset-sessions <name> [<node-id>]')}\` — Clear persisted AI session memory for this conversation
 
 **Projects**

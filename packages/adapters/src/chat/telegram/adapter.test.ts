@@ -7,6 +7,7 @@
  */
 import { describe, test, expect, mock, beforeEach } from 'bun:test';
 import type { Mock } from 'bun:test';
+import { GrammyError } from 'grammy';
 import type { Api } from 'grammy';
 
 // Mock logger to suppress noisy output during tests
@@ -31,6 +32,21 @@ mock.module('@archon/paths', () => ({
 import { TelegramAdapter } from './adapter';
 
 type SendMessage = Api['sendMessage'];
+
+/** The error grammY throws when the Bot API answers with an error code. */
+function telegramError(errorCode: number, description: string, retryAfter?: number): GrammyError {
+  return new GrammyError(
+    `Call to 'sendMessage' failed! (${String(errorCode)}: ${description})`,
+    {
+      ok: false,
+      error_code: errorCode,
+      description,
+      ...(retryAfter !== undefined ? { parameters: { retry_after: retryAfter } } : {}),
+    },
+    'sendMessage',
+    {}
+  );
+}
 
 describe('TelegramAdapter', () => {
   describe('streaming mode configuration', () => {
@@ -81,7 +97,9 @@ describe('TelegramAdapter', () => {
     });
 
     test('should fallback to plain text when MarkdownV2 fails', async () => {
-      mockSendMessage.mockRejectedValueOnce(new Error("Bad Request: can't parse entities"));
+      mockSendMessage.mockRejectedValueOnce(
+        telegramError(400, "Bad Request: can't parse entities")
+      );
 
       await adapter.sendMessage('12345', '**test**');
 
@@ -95,6 +113,54 @@ describe('TelegramAdapter', () => {
       );
       // Second call plain text fallback (no parse_mode)
       expect(mockSendMessage).toHaveBeenNthCalledWith(2, 12345, expect.any(String));
+    });
+
+    test('retries a rate-limited send once after the wait Telegram asks for', async () => {
+      mockSendMessage.mockRejectedValueOnce(
+        telegramError(429, 'Too Many Requests: retry after 0', 0)
+      );
+
+      await adapter.sendMessage('12345', '**test**');
+
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+      // The retry repeats the formatted send; it is not the plain-text fallback.
+      expect(mockSendMessage).toHaveBeenNthCalledWith(
+        2,
+        12345,
+        expect.any(String),
+        expect.objectContaining({ parse_mode: 'MarkdownV2' })
+      );
+    });
+
+    test('gives up after one retry and never re-sends a rate-limited message as plain text', async () => {
+      mockSendMessage
+        .mockRejectedValueOnce(telegramError(429, 'Too Many Requests: retry after 0', 0))
+        .mockRejectedValueOnce(telegramError(429, 'Too Many Requests: retry after 0', 0));
+
+      await expect(adapter.sendMessage('12345', '**test**')).rejects.toBeInstanceOf(GrammyError);
+      expect(mockSendMessage).toHaveBeenCalledTimes(2);
+      expect(mockSendMessage).toHaveBeenNthCalledWith(
+        2,
+        12345,
+        expect.any(String),
+        expect.objectContaining({ parse_mode: 'MarkdownV2' })
+      );
+    });
+
+    test('does not re-send as plain text after a non-formatting failure', async () => {
+      mockSendMessage.mockRejectedValueOnce(telegramError(403, 'Forbidden: bot was blocked'));
+
+      await expect(adapter.sendMessage('12345', '**test**')).rejects.toBeInstanceOf(GrammyError);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
+    test('does not wait out a rate limit longer than a minute', async () => {
+      mockSendMessage.mockRejectedValueOnce(
+        telegramError(429, 'Too Many Requests: retry after 61', 61)
+      );
+
+      await expect(adapter.sendMessage('12345', '**test**')).rejects.toBeInstanceOf(GrammyError);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
     });
 
     test('should split long messages into multiple chunks', async () => {
@@ -151,7 +217,9 @@ describe('TelegramAdapter', () => {
 
     test('should fall back to plain text and use line-based batching when MarkdownV2 fails on chunk', async () => {
       // First MarkdownV2 attempt fails; second call is plain-text fallback
-      mockSendMessage.mockRejectedValueOnce(new Error("Bad Request: can't parse entities"));
+      mockSendMessage.mockRejectedValueOnce(
+        telegramError(400, "Bad Request: can't parse entities")
+      );
 
       await adapter.sendMessage('77777', 'plain fallback text');
 
