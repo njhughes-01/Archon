@@ -147,6 +147,13 @@ describe('TelegramAdapter', () => {
       );
     });
 
+    test('does not re-send as plain text after a non-formatting failure', async () => {
+      mockSendMessage.mockRejectedValueOnce(telegramError(403, 'Forbidden: bot was blocked'));
+
+      await expect(adapter.sendMessage('12345', '**test**')).rejects.toBeInstanceOf(GrammyError);
+      expect(mockSendMessage).toHaveBeenCalledTimes(1);
+    });
+
     test('does not wait out a rate limit longer than a minute', async () => {
       mockSendMessage.mockRejectedValueOnce(
         telegramError(429, 'Too Many Requests: retry after 61', 61)

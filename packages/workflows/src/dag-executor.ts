@@ -7622,9 +7622,11 @@ async function executeApprovalNode(
     `Approve: \`${spellWorkflowCommand(platform, `approve ${workflowRun.id}`)}\` | ` +
     `Reject: \`${spellWorkflowCommand(platform, `reject ${workflowRun.id}`)}\``;
   const gateSent = await safeSendMessage(platform, conversationId, approvalMsg, msgContext);
-  if (!gateSent) {
-    // Same rule as the loop gates: a pause nobody was told about is a silently stuck
-    // run on a chat surface, so fail the node visibly instead of pausing.
+  // Same rule as the loop gates: a pause nobody was told about is a silently stuck run
+  // on a chat surface, so fail the node visibly instead of pausing. Not while a
+  // rejection is staged: only the pause below replaces it, and a failed node would
+  // leave it in run metadata for a later resume to run the rework again.
+  if (!gateSent && rejectionReason === '') {
     getLog().error(
       { nodeId: node.id, workflowRunId: workflowRun.id },
       'approval_node.gate_message_send_failed'

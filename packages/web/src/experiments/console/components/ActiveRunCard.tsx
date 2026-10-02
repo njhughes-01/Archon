@@ -21,14 +21,18 @@ const hasValue = (v: string | null | undefined): v is string => v != null && v !
  * Origins whose runs the server does not auto-resume after a dashboard decision: the
  * cross-adapter guard leaves them to the chat that started them. The server keys that
  * guard off the parent conversation's platform and `origin` is the run's own
- * conversation's platform; for a chat-started run both are that chat.
+ * conversation's platform; for a chat-started run both are that chat. A full record, so a
+ * new origin must be classified here before the client compiles.
  */
-const CHAT_RESUMED_ORIGINS: ReadonlySet<RunOrigin> = new Set([
-  'slack',
-  'telegram',
-  'discord',
-  'github',
-]);
+const RESUMED_BY_ORIGIN_CHAT: Record<RunOrigin, boolean> = {
+  web: false,
+  cli: false,
+  unknown: false,
+  slack: true,
+  telegram: true,
+  discord: true,
+  github: true,
+};
 
 interface ActiveRunCardProps {
   run: Run;
@@ -300,8 +304,8 @@ export function ActiveRunCard({
               ▸
             </span>
             <span>
-              {CHAT_RESUMED_ORIGINS.has(run.origin)
-                ? `${run.gateResolved === 'approved' ? 'Approved' : 'Rejected'} — continues when the ${ORIGIN_LABEL[run.origin]} chat that started it resumes run ${shortRunId(run.id)}`
+              {RESUMED_BY_ORIGIN_CHAT[run.origin]
+                ? `${run.gateResolved === 'approved' ? 'Approved' : 'Rejected'} — continues when the ${ORIGIN_LABEL[run.origin]} conversation that started it resumes run ${shortRunId(run.id)}`
                 : run.gateResolved === 'approved'
                   ? 'Approved — resuming…'
                   : 'Rejected — running on-reject rework…'}

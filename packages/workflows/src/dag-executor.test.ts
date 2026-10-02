@@ -15371,6 +15371,15 @@ describe('executeDagWorkflow -- approval node', () => {
     const failCalls = (store.failWorkflowRun as Mock<IWorkflowStore['failWorkflowRun']>).mock.calls;
     expect(failCalls.length).toBe(1);
     expect(String(failCalls[0][1])).toContain('node review failed');
+    const failedEvent = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.find(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'review'
+    );
+    expect(failedEvent).toBeDefined();
+    const errorMsg = (failedEvent![0] as { data: { error: string } }).data.error;
+    expect(errorMsg).toContain("Approval gate message failed to deliver for node 'review'");
+    expect(errorMsg).toContain('cannot pause safely');
   });
 
   it('approval node without capture_response stores empty node output', async () => {
@@ -15479,6 +15488,76 @@ describe('executeDagWorkflow -- approval node', () => {
     const pauseCalls = (store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>).mock
       .calls;
     expect(pauseCalls.length).toBe(1);
+  });
+
+  it('still re-pauses after a rework when the gate message cannot be delivered', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'Fixed based on feedback' };
+      yield { type: 'result', sessionId: 'reject-fix-session' };
+    });
+
+    const store = createMockStore();
+    const mockDeps = createMockDeps(store);
+    const platform = createMockPlatform();
+    platform.sendMessage.mockImplementation(async (_conversationId, message) => {
+      if (message.includes('Approval required')) {
+        throw new Error('429: Too Many Requests: retry after 30');
+      }
+    });
+
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        platform,
+        conversationId: 'conv-approval',
+        cwd: testDir,
+        workflow: {
+          name: 'approval-reject-resume-undelivered',
+          nodes: [
+            {
+              id: 'review',
+              kind: 'gate',
+              message: 'Approve this plan?',
+              decisions: [
+                { id: 'approve' },
+                {
+                  id: 'reject',
+                  rework: { prompt: 'Fix based on: $REJECTION_REASON', maxAttempts: 3 },
+                },
+              ],
+              captureResponse: true,
+              decisionsAuthored: false,
+            },
+          ],
+        },
+        workflowRun: makeWorkflowRun('reject-resume-undelivered', {
+          metadata: {
+            approval: {
+              type: 'approval',
+              nodeId: 'review',
+              message: 'Approve this plan?',
+              onRejectPrompt: 'Fix based on: $REJECTION_REASON',
+              onRejectMaxAttempts: 3,
+            },
+            rejection_reason: 'Missing edge case handling',
+            rejection_count: 1,
+          },
+        }),
+      })
+    );
+
+    // Failing here would leave the consumed rejection staged in run metadata, and a
+    // later resume of the failed run would re-run the rework. Pausing replaces it.
+    expect(mockSendQueryDag.mock.calls.length).toBe(1);
+    const pauseCalls = (store.pauseWorkflowRun as Mock<IWorkflowStore['pauseWorkflowRun']>).mock
+      .calls;
+    expect(pauseCalls.length).toBe(1);
+    const gateFailed = (store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.some(
+      (call: unknown[]) =>
+        (call[0] as { event_type: string }).event_type === 'node_failed' &&
+        (call[0] as { step_name: string }).step_name === 'review'
+    );
+    expect(gateFailed).toBe(false);
   });
 
   it('resolves $TYPED_ARTIFACTS_FILE in an approval rework prompt', async () => {
