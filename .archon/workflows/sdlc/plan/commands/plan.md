@@ -24,6 +24,24 @@ Ground the plan in the code as it is, not as the request describes it. Read the 
 
 When a prior report is provided, treat its claims like any inherited analysis: verify the load-bearing ones against current code before building on them, and note where you confirm or refute. Implementers will follow your plan literally — a plan that repeats an inherited wrong claim ships that wrong claim.
 
+## Code graph (Codanna)
+
+This node has Codanna tools (`mcp__codanna__*`) over an index of this checkout and its markdown docs, built when the run started. Reach for them before grep and whole-file reads:
+
+- You know the behaviour but not where it lives: `semantic_search_with_context` with a plain-language description. It returns the matching functions with their callers and callees.
+- You know a name: `find_symbol` with the exact name, or `search_symbols` for part of it. Both return the file, line range, and `symbol_id`.
+- Who calls it, what it calls, and what a change to it would touch: `find_callers`, `get_calls`, `analyze_impact`. Pass `symbol_id:<N>` when a name matches several symbols.
+- What the code's own comments and docstrings say about a topic: `semantic_search_docs`.
+- What the repository's markdown documentation says (runbooks, setup guides, design notes): `search_documents`.
+
+Then read only the line ranges the results point to. Keep using text search for string literals, environment variables, config, templates, migrations, and non-code assets. The index does not see edits made after it was built. If the tools are absent or return an error, continue with ordinary reads; do not retry or diagnose them.
+
+**Required:** your first code-navigation step is a Codanna call, and every later question of where code lives, what a symbol is, or who calls it goes to Codanna before grep. Start with `semantic_search_with_context` on the behaviour in question (or `find_symbol` when the target names one), even when the target names a file: the callers and callees it returns are the point. Grep for code locations only after Codanna has answered, to confirm or fill a gap. Grep and whole-file reads remain right for string literals, config, environment variables, templates, migrations, and non-code assets.
+
+If the Codanna tools are absent or error, say so in one line and continue with ordinary reads. If Codanna returns something you then find to be wrong or incomplete (a wrong location, a caller it missed, a stale or irrelevant hit), keep going with ordinary reads and record it.
+
+The report ends with a **Code index** section: which Codanna tools you called, whether they were available, and every result you found wrong or incomplete, with the query and what was actually true. Write "no problems found" when there were none.
+
 ## Decide, don't defer
 
 Name the design decisions the work actually contains, choose, and record why — including the strongest alternative and the concrete reason it lost. A plan that defers its central decision is not a plan. Prefer the smallest coherent approach: no speculative abstraction, no capability without a current caller, deletion of superseded machinery over addition beside it, and a rewrite over a patch when it is clearly simpler and no riskier. If the path grows complicated while you plan it, step back and reconsider the approach rather than elaborating the first idea.
