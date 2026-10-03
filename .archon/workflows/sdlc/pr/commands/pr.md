@@ -8,13 +8,17 @@ Context from the run that may narrow this (often empty):
 
 $ARGUMENTS
 
+## When you stop
+
+A hard failure, a push you must not make, or work you cannot publish safely ends this step early. Then write no `pr-intent.json`, record what happened in `$ARTIFACTS_DIR/pr-action.md`, and return `{"intent": "", "blocked_reason": "<why>"}`. The reason names the branch and what you observed — for example, that `origin/<branch>` already exists with history this branch does not contain, so publishing it would need a force-push. The next node fails the run with that reason, so a stop is never reported as success.
+
 ## 1. Establish the target
 
 Record `HEAD_BRANCH=$(git branch --show-current)` before doing anything public; an empty value is a hard failure, as is a `HEAD` with no commits. Read the origin remote once and resolve its canonical forge identity as `REPO_HOST` plus `REPO_PATH` (`owner/repo`). Strip transport syntax, credentials, and a trailing `.git`; normalize GitHub's ordinary HTTPS, `git@github.com:...`, and `ssh://git@ssh.github.com/...` forms to `REPO_HOST=github.com`. An origin that does not identify one repository is a hard failure. Never persist or print a credential-bearing raw remote.
 
 Determine the base branch from evidence, in order: the repository's documented development flow (steering files, CONTRIBUTING); branch ancestry against likely integration branches (`dev`, `development`, the remote default); an existing pull request for this exact branch. Never assume `main`. Use the same resolved base for every diff.
 
-When this run was launched onto an existing pull request — the run's context names its number, and for a pull request from a fork the run sits on a review branch at that pull request's head — record that number and the qualified head repository it belongs to. Confirm `HEAD` descends from the recorded head revision. If the head lives in a fork and the author did not allow maintainer edits, this run cannot publish to it: stop and report, and do not prepare a replacement.
+When this run was launched onto an existing pull request — the run's context names its number, and for a pull request from a fork the run sits on a review branch at that pull request's head — record that number and the qualified head repository it belongs to. Confirm `HEAD` descends from the recorded head revision. If the head lives in a fork and the author did not allow maintainer edits, this run cannot publish to it: stop, and do not prepare a replacement.
 
 You do not look up whether this branch already has a pull request. The publishing node does that deterministically and never opens a second one.
 
@@ -35,7 +39,7 @@ You do not look up whether this branch already has a pull request. The publishin
 
 ## 4. Push
 
-Push the recorded branch with upstream tracking (`git push -u origin "$HEAD_BRANCH"`). For an existing fork pull request whose author allowed maintainer edits, push to the fork instead, by explicit URL and ref: `git push "https://github.com/<headRepositoryOwner>/<headRepository>.git" "HEAD:refs/heads/<headRefName>"`. If the push is rejected or the remote diverged, stop and report — never rebase or force-push here.
+Push the recorded branch with upstream tracking (`git push -u origin "$HEAD_BRANCH"`). For an existing fork pull request whose author allowed maintainer edits, push to the fork instead, by explicit URL and ref: `git push "https://github.com/<headRepositoryOwner>/<headRepository>.git" "HEAD:refs/heads/<headRefName>"`. If the push is rejected or the remote diverged, stop — never rebase or force-push here.
 
 ## 5. Record the intent
 
@@ -55,4 +59,4 @@ The file must contain no credential and no raw remote URL.
 
 Also write `$ARTIFACTS_DIR/pr-action.md` with `REPO_HOST`, `REPO_PATH`, the recorded branch, the explicit push target, and the push result. This is the durable action evidence for what you did; the publishing node records what it did with the intent.
 
-Return only `{"intent": "$ARTIFACTS_DIR/pr-intent.json"}` through the node's structured output.
+Return only `{"intent": "$ARTIFACTS_DIR/pr-intent.json"}` through the node's structured output. A step that stopped returns the shape in "When you stop" instead.
