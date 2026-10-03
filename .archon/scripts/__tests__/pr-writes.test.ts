@@ -31,13 +31,14 @@ const intent = {
   draft: true,
 };
 
-function publishPr(options: ScriptOptions & { intent?: object } = {}): ScriptRun {
+/** `intent: null` is a PR step that returned its intent path without writing the file. */
+function publishPr(options: ScriptOptions & { intent?: object | null } = {}): ScriptRun {
   const { intent: supplied, ...rest } = options;
   return runPackScript('pr/scripts/publish-pr', {
     ...rest,
     inputs: { INPUTS_INTENT: '{ARTIFACTS}/pr-intent.json', ...rest.inputs },
     artifacts: {
-      'pr-intent.json': JSON.stringify(supplied ?? intent),
+      ...(supplied === null ? {} : { 'pr-intent.json': JSON.stringify(supplied ?? intent) }),
       'pr-body.md': 'A body',
       ...rest.artifacts,
     },
@@ -183,6 +184,26 @@ describe('publish-pr opens the pull request at most once', () => {
     });
     expect(result.code).not.toBe(0);
     expect(result.stderr).toContain('not the recorded');
+  });
+
+  it('fails with the PR step\'s own reason when that step stopped before publishing', () => {
+    const reason =
+      "branch 'archon/thread-1' already exists on origin with other history; pushing would need a force-push";
+    const result = publishPr({ intent: null, inputs: { INPUTS_BLOCKED_REASON: reason } });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain(`the PR step stopped without preparing a pull request: ${reason}`);
+    expect(result.gh).toEqual([]);
+  });
+
+  it('names the PR step, not a bare file error, when that step wrote no intent', () => {
+    const result = publishPr({ intent: null });
+    expect(result.code).not.toBe(0);
+    expect(result.stdout).toBe('');
+    expect(result.stderr).toContain('the PR step wrote no pull request intent');
+    expect(result.stderr).toContain('pr-intent.json');
+    expect(result.stderr).not.toContain('ENOENT');
+    expect(result.gh).toEqual([]);
   });
 
   it('fails loudly when forge is selected but unavailable, never falling back to gh', () => {

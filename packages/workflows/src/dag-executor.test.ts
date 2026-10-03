@@ -18224,6 +18224,71 @@ describe('executeDagWorkflow -- script nodes', () => {
     ).toBe(false);
   }, 10000);
 
+  async function scriptNodeFailure(id: string, script: string): Promise<string> {
+    const mockDeps = createMockDeps();
+    await executeDagWorkflow(
+      dagOptions({
+        deps: mockDeps,
+        cwd: testDir,
+        workflow: { name: `${id}-test`, nodes: [{ id, kind: 'exec', runtime: 'bun', script }] },
+        workflowRun: makeWorkflowRun(`${id}-run`),
+      })
+    );
+    const failed = persistedEvents(mockDeps.store).filter(
+      event => event.event_type === 'node_failed'
+    );
+    expect(failed.map(event => event.step_name)).toEqual([id]);
+    return String(failed[0]?.data?.error);
+  }
+
+  it('reports a runtime missing from PATH as an executable-not-found failure', async () => {
+    // The shape Bun's execFile rejects with when it cannot spawn the binary at all.
+    const execSpy = spyOn(git, 'execFileAsync').mockRejectedValue(
+      Object.assign(new Error('Executable not found in $PATH: "bun"'), {
+        code: 'ENOENT',
+        errno: -2,
+        syscall: 'spawn bun',
+        path: 'bun',
+      })
+    );
+    try {
+      expect(await scriptNodeFailure('no-runtime', 'console.log(1)')).toBe(
+        "Script node 'no-runtime' failed: 'bun' executable not found in PATH"
+      );
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
+  it('reports a file the script could not open by its path, not as a missing runtime', async () => {
+    const missing = join(testDir, 'never-written', 'pr-intent.json');
+    const error = await scriptNodeFailure(
+      'missing-file',
+      `require('node:fs').readFileSync(${JSON.stringify(missing)}, 'utf8')`
+    );
+    expect(error).toContain("Script node 'missing-file' failed [exit 1]");
+    expect(error).toContain('ENOENT');
+    expect(error).toContain(missing);
+    expect(error).not.toContain('PATH');
+  });
+
+  it('reports a permission error the script hit as its own error, not a cwd problem', async () => {
+    // A runtime that started and exited non-zero: the numeric exit code is the
+    // structured signal, and EACCES appears only in the script's own stderr.
+    const stderr = "EACCES: permission denied, open '/srv/data/secret.json'";
+    const execSpy = spyOn(git, 'execFileAsync').mockRejectedValue(
+      Object.assign(new Error(`Command failed: bun -e <body>\n${stderr}`), { code: 1, stderr })
+    );
+    try {
+      const error = await scriptNodeFailure('denied-file', 'console.log(1)');
+      expect(error).toContain("Script node 'denied-file' failed [exit 1]");
+      expect(error).toContain('/srv/data/secret.json');
+      expect(error).not.toContain('check cwd permissions');
+    } finally {
+      execSpy.mockRestore();
+    }
+  });
+
   it('stderr output is sent to the user', async () => {
     const mockDeps = createMockDeps();
     const platform = createMockPlatform();

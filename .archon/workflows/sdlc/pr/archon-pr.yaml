@@ -31,7 +31,11 @@ nodes:
       type: object
       properties:
         intent: { type: string }
-      required: [intent]
+        # Empty unless the agent stopped without writing the intent (a rejected
+        # push, a branch it would have to force-push). publish fails with it, so
+        # the run reports the real reason at the PR step.
+        blocked_reason: { type: string }
+      required: [intent, blocked_reason]
 
   # This is the durable ownership record for every later public action in
   # delivery and inbound forge event. Consumers use this qualified identity,
@@ -42,6 +46,7 @@ nodes:
     depends_on: [pr]
     with:
       intent: "$pr.output.intent"
+      blocked_reason: "$pr.output.blocked_reason"
     output_type: pull-request
     output_format:
       type: object

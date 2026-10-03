@@ -12,9 +12,11 @@
  *
  * Bound inputs (`with:` bindings, canonical text in env):
  * - INPUTS_INTENT: path to the JSON intent the preparing node wrote.
+ * - INPUTS_BLOCKED_REASON: why the preparing node stopped without writing one;
+ *   empty when it wrote one.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { createPr, findOpenPrByHead, viewPr } from '../../.shared/pr.ts';
 import {
   forgeSource,
@@ -23,7 +25,7 @@ import {
   type PrRecord,
   type QualifiedPr,
 } from '../../.shared/forge.ts';
-import { emit, note, refuse, text } from '../../.shared/io.ts';
+import { emit, note, refuse, text, trimmed } from '../../.shared/io.ts';
 
 function repo(value: unknown, field: string): QualifiedPr['repo'] {
   const parsed = record(value);
@@ -46,8 +48,18 @@ function required(value: unknown, field: string): string {
 }
 
 function publish(): PrRecord {
+  const blockedReason = trimmed(process.env.INPUTS_BLOCKED_REASON);
+  if (blockedReason !== '') {
+    throw new Error(`the PR step stopped without preparing a pull request: ${blockedReason}`);
+  }
+  const intentPath = text(process.env.INPUTS_INTENT);
+  if (!existsSync(intentPath)) {
+    throw new Error(
+      `the PR step wrote no pull request intent at '${intentPath}' and gave no reason; its pr-action.md records what it did`
+    );
+  }
   const source = forgeSource(process.env.ARCHON_SDLC_FORGE);
-  const intent = record(JSON.parse(readFileSync(text(process.env.INPUTS_INTENT), 'utf8')));
+  const intent = record(JSON.parse(readFileSync(intentPath, 'utf8')));
   if (!intent) throw new Error('the PR intent must be a JSON object');
   const base = repo(intent.repo, 'repo');
   const headRepo = intent.headRepo === undefined ? base : repo(intent.headRepo, 'headRepo');
