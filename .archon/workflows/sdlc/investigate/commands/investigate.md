@@ -28,6 +28,24 @@ Start with the cheapest observation that separates the live hypotheses. Prefer a
 
 After each observation, name what uncertainty remains and choose the next observation that could eliminate it. If that observation requires unavailable external state, a different platform, prohibitive cost, or authority you do not have, stop. Record the exact missing evidence and declare `rooted: false`; do not compensate with broader reading or additional plausible theories.
 
+## Code graph (Codanna)
+
+This node has Codanna tools (`mcp__codanna__*`) over an index of this checkout and its markdown docs, built when the run started. Reach for them before grep and whole-file reads:
+
+- You know the behaviour but not where it lives: `semantic_search_with_context` with a plain-language description. It returns the matching functions with their callers and callees.
+- You know a name: `find_symbol` with the exact name, or `search_symbols` for part of it. Both return the file, line range, and `symbol_id`.
+- Who calls it, what it calls, and what a change to it would touch: `find_callers`, `get_calls`, `analyze_impact`. Pass `symbol_id:<N>` when a name matches several symbols.
+- What the code's own comments and docstrings say about a topic: `semantic_search_docs`.
+- What the repository's markdown documentation says (runbooks, setup guides, design notes): `search_documents`.
+
+Then read only the line ranges the results point to. Keep using text search for string literals, environment variables, config, templates, migrations, and non-code assets. The index does not see edits made after it was built. If the tools are absent or return an error, continue with ordinary reads; do not retry or diagnose them.
+
+**Required:** your first code-navigation step is a Codanna call, and every later question of where code lives, what a symbol is, or who calls it goes to Codanna before grep. Start with `semantic_search_with_context` on the behaviour in question (or `find_symbol` when the target names one), even when the target names a file: the callers and callees it returns are the point. Grep for code locations only after Codanna has answered, to confirm or fill a gap. Grep and whole-file reads remain right for string literals, config, environment variables, templates, migrations, and non-code assets.
+
+If the Codanna tools are absent or error, say so in one line and continue with ordinary reads. If Codanna returns something you then find to be wrong or incomplete (a wrong location, a caller it missed, a stale or irrelevant hit), keep going with ordinary reads and record it.
+
+The report ends with a **Code index** section: which Codanna tools you called, whether they were available, and every result you found wrong or incomplete, with the query and what was actually true. Write "no problems found" when there were none.
+
 ## Reproduce, then explain
 
 Trigger the symptom yourself whenever reasonably possible, using the project's own commands or a minimal script. Save any repro script under `$ARTIFACTS_DIR/repro/` so the fixer can rerun it. When reproduction is not reasonable — external state, prohibitive cost, timing you cannot control — say so in the report and establish the chain by other concrete evidence instead: code reading with exact locations, logs, git history. Never describe a reproduction you did not actually run.
