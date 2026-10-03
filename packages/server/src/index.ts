@@ -132,7 +132,6 @@ import {
 } from '@archon/paths';
 import { selectGitHubAuthMode, parseGitCredentialPath } from './github-auth-bootstrap';
 import { isDiscordMentionRequired } from './discord-mention';
-import { dispatchChatMessage } from './chat-dispatch';
 import {
   getAuth,
   closeAuth,
@@ -596,14 +595,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const userId = await resolveUserId('discord', platformUserId, displayName);
 
         // Fire-and-forget: handler returns immediately, processing happens async
-        dispatchChatMessage(lockManager, discordAdapter, conversationId, async () => {
-          await handleMessage(discordAdapter, conversationId, content, {
-            threadContext,
-            parentConversationId,
-            isolationHints: { workflowType: 'thread', workflowId: conversationId },
-            userId,
-          });
-        }).catch(createMessageErrorHandler('Discord', discordAdapter, conversationId));
+        lockManager
+          .acquireLock(conversationId, async () => {
+            await handleMessage(discordAdapter, conversationId, content, {
+              threadContext,
+              parentConversationId,
+              isolationHints: { workflowType: 'thread', workflowId: conversationId },
+              userId,
+            });
+          })
+          .catch(createMessageErrorHandler('Discord', discordAdapter, conversationId));
       });
 
       // Don't let a Discord login failure (bad token, missing privileged
@@ -671,14 +672,16 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const userId = await resolveUserId('slack', event.user, event.displayName);
 
         // Fire-and-forget: handler returns immediately, processing happens async
-        dispatchChatMessage(lockManager, slackAdapter, conversationId, async () => {
-          await handleMessage(slackAdapter, conversationId, content, {
-            threadContext,
-            parentConversationId,
-            isolationHints: { workflowType: 'thread', workflowId: conversationId },
-            userId,
-          });
-        }).catch(createMessageErrorHandler('Slack', slackAdapter, conversationId));
+        lockManager
+          .acquireLock(conversationId, async () => {
+            await handleMessage(slackAdapter, conversationId, content, {
+              threadContext,
+              parentConversationId,
+              isolationHints: { workflowType: 'thread', workflowId: conversationId },
+              userId,
+            });
+          })
+          .catch(createMessageErrorHandler('Slack', slackAdapter, conversationId));
       });
 
       // Attach the workflow bridge BEFORE app.start(): Bolt's Socket Mode
@@ -976,12 +979,14 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
         const userId = await resolveUserId('telegram', telegramUserId, displayName);
 
         // Fire-and-forget: handler returns immediately, processing happens async
-        dispatchChatMessage(lockManager, telegramAdapter, conversationId, async () => {
-          await handleMessage(telegramAdapter, conversationId, message, {
-            isolationHints: { workflowType: 'thread', workflowId: conversationId },
-            userId,
-          });
-        }).catch(createMessageErrorHandler('Telegram', telegramAdapter, conversationId));
+        lockManager
+          .acquireLock(conversationId, async () => {
+            await handleMessage(telegramAdapter, conversationId, message, {
+              isolationHints: { workflowType: 'thread', workflowId: conversationId },
+              userId,
+            });
+          })
+          .catch(createMessageErrorHandler('Telegram', telegramAdapter, conversationId));
       }
     );
 
