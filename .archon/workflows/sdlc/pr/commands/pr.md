@@ -59,4 +59,4 @@ The file must contain no credential and no raw remote URL.
 
 Also write `$ARTIFACTS_DIR/pr-action.md` with `REPO_HOST`, `REPO_PATH`, the recorded branch, the explicit push target, and the push result. This is the durable action evidence for what you did; the publishing node records what it did with the intent.
 
-Return only `{"intent": "$ARTIFACTS_DIR/pr-intent.json"}` through the node's structured output. A step that stopped returns the shape in "When you stop" instead.
+Return only `{"intent": "$ARTIFACTS_DIR/pr-intent.json", "blocked_reason": ""}` through the node's structured output. A step that stopped returns the shape in "When you stop" instead.

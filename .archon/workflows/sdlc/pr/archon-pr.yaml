@@ -31,11 +31,11 @@ nodes:
       type: object
       properties:
         intent: { type: string }
-        # Set only when the agent stopped without writing the intent (a rejected
+        # Empty unless the agent stopped without writing the intent (a rejected
         # push, a branch it would have to force-push). publish fails with it, so
         # the run reports the real reason at the PR step.
         blocked_reason: { type: string }
-      required: [intent]
+      required: [intent, blocked_reason]
 
   # This is the durable ownership record for every later public action in
   # delivery and inbound forge event. Consumers use this qualified identity,
