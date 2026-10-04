@@ -23,6 +23,8 @@ triage__triage:
   blocked_by: []
   summary: "stub: current evidence leaves the causal chain unresolved"
   report: { type: archon_artifact, run_id: "fixture-run", path: "triage.md" }
+# Stubbed so exec-code never builds a real Codanna index in the scratch worktree.
+inv__code-index: "stub: index built"
 inv__investigate:
   rooted: true
   summary: "stub: cause established — report at investigation.md"
