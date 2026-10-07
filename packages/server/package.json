@@ -64,6 +64,12 @@
       "src/services/resource-start-hosting.integration.test.ts"
     ],
     [
+      "src/services/run-follow-up-service.test.ts"
+    ],
+    [
+      "src/services/run-follow-up-service.integration.test.ts"
+    ],
+    [
       "src/adapters/web/transport.test.ts"
     ],
     [

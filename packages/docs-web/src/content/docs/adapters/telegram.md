@@ -50,6 +50,22 @@ For streaming mode details, see [Configuration](/getting-started/configuration/)
 
 `stream` sends a message for every text chunk and tool call, which can exceed Telegram's rate limit during long workflow runs. When Telegram rate-limits a send, the adapter waits the time Telegram asks for (up to 60 seconds) and retries once. A message that still fails is logged as `platform_message_send_failed`; if it was an approval gate's message, the gate fails instead of pausing. Use `batch` if you see `429: Too Many Requests` in the server log.
 
+## Run Follow-ups
+
+When the chat's AI starts a workflow run, with its run tool or with `archon workflow run` in its shell, the chat is told when that run finishes, fails, is cancelled, loses its process, or stops for a decision. The server checks those runs every 15 seconds and sends the chat's AI an automatic message marked `[Archon run update — automatic, not typed by the user]`; the AI then reports the result in its own words and carries on, or asks you. An automatic turn never approves, rejects, resumes, cancels, or abandons a run unless you already gave that decision in the chat.
+
+- Only runs started by this chat's AI are followed up. Runs started from a terminal, the Web UI, or the foreground of a chat message are not.
+- Each event is followed up once, also across server restarts. Runs that ended more than 24 hours ago are not picked up.
+- If the automatic turn itself fails, the chat gets a one-line note about the run instead; the follow-up is not retried.
+- If you send `/reset` after the run started, the chat gets one short note instead, and the new session is not woken. Runs that `/reset` itself cancelled get no message.
+- A background run that reaches an approval gate pauses and waits for your answer in the chat.
+
+To turn follow-ups off, set the variable below and restart the server:
+
+```ini
+TELEGRAM_RUN_FOLLOW_UP=false
+```
+
 ## Further Reading
 
 - [Configuration](/getting-started/configuration/)

@@ -43,6 +43,7 @@ const {
   listWorkflowEvents,
   listRecentEvents,
   persistWorkflowEventIfRunning,
+  getLatestWorkflowEvent,
 } = await import('./workflow-events');
 const { cancelWorkflowRun } = await import('./workflows');
 
@@ -217,5 +218,42 @@ describe('listWorkflowEventsSince — real SQLite (catches the C1 datetime misma
     const bad = rows.find(r => r.id === 'bad-evt');
     expect(bad).toBeDefined();
     expect(bad?.data).toEqual({});
+  });
+});
+
+describe('getLatestWorkflowEvent — real SQLite', () => {
+  test('returns the newest event of the given type, by insertion order when timestamps tie', async () => {
+    await db.query(
+      `INSERT INTO remote_agent_workflow_runs
+         (id, workflow_name, conversation_id, user_message, status, started_at)
+       VALUES ('run-latest', 'wf', 'conv-1', 'msg', 'running', datetime('now'))`,
+      []
+    );
+    expect(await getLatestWorkflowEvent('run-latest', 'workflow_started')).toBeNull();
+
+    await persistWorkflowEvent({
+      workflow_run_id: 'run-latest',
+      event_type: 'workflow_started',
+      data: { segment: 1 },
+    });
+    await persistWorkflowEvent({
+      workflow_run_id: 'run-latest',
+      event_type: 'workflow_started',
+      data: { segment: 2 },
+    });
+    await persistWorkflowEvent({
+      workflow_run_id: 'run-latest',
+      event_type: 'node_started',
+      step_name: 'later-other-type',
+    });
+    await db.query(
+      `UPDATE remote_agent_workflow_events SET created_at = '2026-01-01 00:00:01'
+       WHERE workflow_run_id = 'run-latest'`,
+      []
+    );
+
+    const latest = await getLatestWorkflowEvent('run-latest', 'workflow_started');
+    expect(latest?.event_type).toBe('workflow_started');
+    expect(latest?.data).toEqual({ segment: 2 });
   });
 });

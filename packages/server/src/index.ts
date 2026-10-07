@@ -93,6 +93,8 @@ import {
   workflowResumeConversationId,
   workflowResumeTargetForConversation,
 } from './services/workflow-resume-service';
+import { startRunFollowUpService, stopRunFollowUpService } from './services/run-follow-up-service';
+import { enableRunFollowUp } from '@archon/core/services/run-follow-up';
 import {
   handleMessage,
   pool,
@@ -1001,6 +1003,13 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
   } else if (!opts.skipPlatformAdapters) {
     getLog().info('telegram_adapter_skipped');
   }
+  if (telegram && process.env.TELEGRAM_RUN_FOLLOW_UP !== 'false') {
+    enableRunFollowUp(telegram.getPlatformType());
+    startRunFollowUpService({
+      platforms: new Map([[telegram.getPlatformType(), telegram]]),
+      lockManager,
+    });
+  }
 
   // Continuations can execute only after every credential provider and platform
   // adapter is initialized. Web background runs execute against a hidden worker
@@ -1042,6 +1051,7 @@ export async function startServer(opts: ServerOptions = {}): Promise<void> {
     getLog().info('server_shutting_down');
     stopCleanupScheduler();
     stopWorkflowContinuationScheduler();
+    stopRunFollowUpService();
     persistence.stopPeriodicFlush();
 
     // Flush all buffered messages before stopping adapters

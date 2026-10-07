@@ -1,4 +1,4 @@
-import { mock, describe, test, expect, beforeEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { createMockLogger } from '../test/mocks/logger';
 import { MockPlatformAdapter } from '../test/mocks/platform';
 import type { Conversation, Codebase } from '../types';
@@ -201,6 +201,8 @@ mock.module('@archon/isolation', () => ({
 mock.module('./prompt-builder', () => ({
   buildOrchestratorPrompt: mock(() => 'prompt'),
   buildProjectScopedPrompt: mock(() => 'prompt'),
+  // Linked through the run follow-up text the dispatch path imports.
+  formatPausedGateSection: mock(() => ''),
 }));
 
 mock.module('../utils/error-formatter', () => ({
@@ -325,6 +327,7 @@ mock.module('../services/title-generator', () => ({
 // ─── Import module under test AFTER all mocks ────────────────────────────────
 
 const { validateAndResolveIsolation, dispatchBackgroundWorkflow } = await import('./orchestrator');
+const { enableRunFollowUp, disableRunFollowUp } = await import('../services/run-follow-up');
 
 // ─── Test helpers ────────────────────────────────────────────────────────────
 
@@ -771,6 +774,151 @@ describe('dispatchBackgroundWorkflow', () => {
     await flushBackgroundExecution();
 
     expect(mockExecuteWorkflow.mock.calls[0]?.[7]).not.toHaveProperty('cutFromCommit');
+  });
+
+  describe('run follow-up', () => {
+    afterEach(() => {
+      disableRunFollowUp('telegram');
+    });
+
+    function telegramPlatform(): MockPlatformAdapter {
+      platform.getPlatformType.mockImplementation(() => 'telegram');
+      return platform;
+    }
+
+    async function dispatchWithCleanupNotice(): Promise<void> {
+      mockResolve.mockResolvedValueOnce(
+        resolvedIsolation({ type: 'created', autoCleanedCount: 2 })
+      );
+      await dispatchBackgroundWorkflow(makeRoutingCtx(), makeWorkflow());
+      await flushBackgroundExecution();
+    }
+
+    function engineCall(): Parameters<typeof WorkflowExecutor.executeWorkflow> {
+      const call = mockExecuteWorkflow.mock.calls[0];
+      if (!call) throw new Error('executeWorkflow was not called');
+      return call;
+    }
+
+    test('runs the engine silently, tells the chat about isolation, and stamps the chat', async () => {
+      enableRunFollowUp('telegram');
+      telegramPlatform();
+
+      await dispatchWithCleanupNotice();
+
+      const [, enginePlatform, , , , , , options] = engineCall();
+      expect(enginePlatform).not.toBe(platform);
+      expect(enginePlatform.getPlatformType()).toBe('telegram');
+      expect(enginePlatform.getStreamingMode()).toBe('batch');
+      const sentBefore = platform.sendMessage.mock.calls.length;
+      await enginePlatform.sendMessage('web-worker-x', 'gate message');
+      expect(platform.sendMessage.mock.calls.length).toBe(sentBefore);
+
+      expect(platform.sendMessage).toHaveBeenCalledWith(
+        'parent-conv',
+        'Cleaned up 2 merged worktree(s) to make room.'
+      );
+      const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0];
+      expect(runRow?.metadata?.follow_up).toEqual({ conversation_id: 'parent-db-id' });
+      expect(options?.followUpConversationId).toBe('parent-db-id');
+    });
+
+    test.each([
+      ['follow-up is off', false, 'telegram'],
+      ['the platform has no follow-up', true, 'mock'],
+      ['the run comes from the web console', true, 'web'],
+    ])('changes nothing when %s', async (_label, enabled, platformType) => {
+      if (enabled) enableRunFollowUp('telegram');
+      platform.getPlatformType.mockImplementation(() => platformType);
+      if (platformType === 'web') {
+        Object.assign(platform, {
+          sendStructuredEvent: mock(() => Promise.resolve()),
+          setConversationDbId: mock(() => undefined),
+          setupEventBridge: mock(() => () => undefined),
+          removeOutputCallback: mock(() => undefined),
+          emitLockEvent: mock(() => Promise.resolve()),
+        });
+      }
+
+      await dispatchWithCleanupNotice();
+
+      const [, enginePlatform, , , , , , options] = engineCall();
+      expect(enginePlatform).toBe(platform);
+      const cleanupNotice = platform.sendMessage.mock.calls.find(c =>
+        c[1].startsWith('Cleaned up')
+      );
+      expect(cleanupNotice?.[0]).toMatch(/^web-worker-/);
+      const runRow = mockCreateWorkflowRun.mock.calls[0]?.[0];
+      expect(runRow?.metadata).not.toHaveProperty('follow_up');
+      expect(options).not.toHaveProperty('followUpConversationId');
+    });
+
+    test.each([
+      ['a success summary', { success: true, summary: 'all done', workflowRunId: 'run-1' }],
+      ['a failure', { success: false, error: 'node broke', workflowRunId: 'run-1' }],
+    ] as const)('leaves %s to the follow-up instead of a result card', async (_label, result) => {
+      enableRunFollowUp('telegram');
+      telegramPlatform();
+      mockExecuteWorkflow.mockResolvedValueOnce(result);
+
+      await dispatchBackgroundWorkflow(
+        makeRoutingCtx(),
+        makeWorkflow({ worktree: { enabled: false } })
+      );
+      await flushBackgroundExecution();
+
+      const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+      expect(sent.some(m => m.includes('all done') || m.includes('node broke'))).toBe(false);
+    });
+
+    test('leaves a failure the run row records to the follow-up', async () => {
+      enableRunFollowUp('telegram');
+      telegramPlatform();
+      mockExecuteWorkflow.mockRejectedValueOnce(new Error('exec boom'));
+
+      await dispatchBackgroundWorkflow(
+        makeRoutingCtx(),
+        makeWorkflow({ worktree: { enabled: false } })
+      );
+      await flushBackgroundExecution();
+
+      expect(mockFailWorkflowRun).toHaveBeenCalledTimes(1);
+      const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+      expect(sent.some(m => m.includes('exec boom'))).toBe(false);
+    });
+
+    test.each([
+      [
+        'the compensating write fails',
+        () => {
+          mockExecuteWorkflow.mockRejectedValueOnce(new Error('exec boom'));
+          mockFailWorkflowRun.mockRejectedValueOnce(new Error('db down'));
+        },
+        'failed: exec boom',
+      ],
+      [
+        'the terminal write itself failed',
+        () => {
+          mockExecuteWorkflow.mockRejectedValueOnce(
+            new TerminalStatusWriteError(new Error('db is gone'))
+          );
+        },
+        'final status could not be saved',
+      ],
+    ])('still tells the chat when %s', async (_label, arrange, expected) => {
+      enableRunFollowUp('telegram');
+      telegramPlatform();
+      arrange();
+
+      await dispatchBackgroundWorkflow(
+        makeRoutingCtx(),
+        makeWorkflow({ worktree: { enabled: false } })
+      );
+      await flushBackgroundExecution();
+
+      const sent = platform.sendMessage.mock.calls.map(c => c[1]);
+      expect(sent.some(m => m.includes(expected))).toBe(true);
+    });
   });
 
   test('missing-worktree adoption materializes the exact branch for a background run', async () => {

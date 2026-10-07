@@ -2116,6 +2116,55 @@ describe('workflowRunCommand — resume with nothing completed (#3154)', () => {
   });
 });
 
+describe('workflowRunCommand — run follow-up chat', () => {
+  const followUpEnv = 'ARCHON_FOLLOW_UP_CONVERSATION_ID';
+  let consoleSpy: ReturnType<typeof spyOn>;
+
+  beforeEach(async () => {
+    consoleSpy = spyOn(console, 'log').mockImplementation(() => {});
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    (executeWorkflow as ReturnType<typeof mock>).mockClear();
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'bench' }, 'project')],
+      errors: [],
+    });
+    (executeWorkflow as ReturnType<typeof mock>).mockResolvedValueOnce({
+      success: true,
+      workflowRunId: 'run-follow-up',
+    });
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+    delete process.env[followUpEnv];
+  });
+
+  it('passes the chat from the AI shell to the executor and removes it from the environment', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+    process.env[followUpEnv] = 'chat-db-1';
+
+    await workflowRunCommand('/repo/root', 'bench', 'go', { noWorktree: true });
+
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      followUpConversationId?: string;
+    };
+    expect(opts.followUpConversationId).toBe('chat-db-1');
+    expect(process.env[followUpEnv]).toBeUndefined();
+  });
+
+  it('passes no follow-up chat without the variable', async () => {
+    const { executeWorkflow } = await import('@archon/workflows/executor');
+
+    await workflowRunCommand('/repo/root', 'bench', 'go', { noWorktree: true });
+
+    const opts = (executeWorkflow as ReturnType<typeof mock>).mock.calls[0][7] as {
+      followUpConversationId?: string;
+    };
+    expect(opts.followUpConversationId).toBeUndefined();
+  });
+});
+
 describe('workflowRunCommand — sparse model bindings (#2481)', () => {
   let consoleSpy: ReturnType<typeof spyOn>;
 
@@ -7758,6 +7807,73 @@ describe('workflowRunCommand — detach', () => {
     const parsed = JSON.parse(firstJsonPayload(stdoutSpy)) as Record<string, unknown>;
     expect(parsed.runId).toBe('run-paused');
     expect(mockCreateWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it('stamps the pre-created row with the follow-up chat and keeps it from the child', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const paths = await import('@archon/paths');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+    process.env.ARCHON_FOLLOW_UP_CONVERSATION_ID = 'chat-db-1';
+
+    let spawnOptions: DetachedSpawnOptions | undefined;
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', { detach: true });
+      await finishStartupWindow(commandPromise, spawnSpy);
+      spawnOptions = firstDetachedSpawnOptions(spawnSpy);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+      delete process.env.ARCHON_FOLLOW_UP_CONVERSATION_ID;
+    }
+
+    expect(mockCreateWorkflowRun).toHaveBeenCalledWith(
+      expect.objectContaining({
+        metadata: expect.objectContaining({ follow_up: { conversation_id: 'chat-db-1' } }),
+      })
+    );
+    expect(spawnOptions?.env).not.toHaveProperty('ARCHON_FOLLOW_UP_CONVERSATION_ID');
+  });
+
+  it('pre-creates the row without a follow-up chat when none is set', async () => {
+    const { discoverWorkflowsWithConfig } = await import('@archon/workflows/workflow-discovery');
+    const paths = await import('@archon/paths');
+    (discoverWorkflowsWithConfig as ReturnType<typeof mock>).mockResolvedValueOnce({
+      workflows: [makeTestWorkflowWithSource({ name: 'assist', description: 'Help' })],
+      errors: [],
+    });
+    (paths.getArchonHome as ReturnType<typeof mock>).mockImplementationOnce(() => {
+      throw new Error('no home in test');
+    });
+    mockCreateWorkflowRun.mockClear();
+
+    const child = createDetachedChildFixture();
+    const spawnSpy = spyOn(Bun, 'spawn').mockReturnValue(child.child);
+    const savedArgv = process.argv;
+    process.argv = ['bun', '/abs/cli.ts', 'workflow', 'run', 'assist', 'hello', '--detach'];
+    try {
+      const commandPromise = workflowRunCommand('/test/path', 'assist', 'hello', { detach: true });
+      await finishStartupWindow(commandPromise, spawnSpy);
+    } finally {
+      process.argv = savedArgv;
+      spawnSpy.mockRestore();
+    }
+
+    const created = mockCreateWorkflowRun.mock.calls[0]?.[0] as unknown as {
+      metadata: Record<string, unknown>;
+    };
+    expect(created.metadata).not.toHaveProperty('follow_up');
   });
 
   it('--detach --json emits a structured ack', async () => {

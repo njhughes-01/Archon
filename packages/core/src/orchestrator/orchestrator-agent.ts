@@ -31,6 +31,11 @@ import { safeDeactivateSession } from '../state/session-transitions';
 import { getProviderCapabilities } from '@archon/providers';
 import { getAgentProvider } from '../services/provider-admission';
 import { buildManageRunTool } from './manage-run-tool';
+import {
+  RUN_FOLLOW_UP_CONVERSATION_ENV,
+  RUN_FOLLOW_UP_PROMPT_SECTION,
+  isRunFollowUpEnabled,
+} from '../services/run-follow-up';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
 import {
@@ -2382,7 +2387,13 @@ export async function handleMessage(
         ? await resolveUserProviderEnvForChat(executionUserId)
         : {};
     const protectedEnvKeys = Object.keys(userProviderEnv);
-    const effectiveEnv = { ...(config.envVars ?? {}), ...dbEnvVars, ...userProviderEnv };
+    const followUpEnabled = isRunFollowUpEnabled(platform.getPlatformType());
+    const effectiveEnv = {
+      ...(config.envVars ?? {}),
+      ...dbEnvVars,
+      ...userProviderEnv,
+      ...(followUpEnabled ? { [RUN_FOLLOW_UP_CONVERSATION_ENV]: conversation.id } : {}),
+    };
 
     // Warn if provider doesn't support env injection but env vars are configured
     if (Object.keys(effectiveEnv).length > 0) {
@@ -2413,6 +2424,7 @@ export async function handleMessage(
     if (scopedCaps !== null && !scopedCaps.nativeTools) {
       systemAppend += `\n\n${buildRunManagementSection()}`;
     }
+    if (followUpEnabled) systemAppend += `\n\n${RUN_FOLLOW_UP_PROMPT_SECTION}`;
     const systemPrompt =
       providerKey === 'claude'
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemAppend }
@@ -2522,7 +2534,10 @@ export async function handleMessage(
               );
               return `Failed to start workflow "${wf.name}": ${err.message}`;
             }
-            return `Started workflow "${wf.name}" in the background — it'll appear in the runs list and the workflow dock shortly.`;
+            const started = `Started workflow "${wf.name}" in the background — it'll appear in the runs list and the workflow dock shortly.`;
+            return followUpEnabled
+              ? `${started} You will get an automatic message in this chat when it finishes, fails or needs input; do not poll it.`
+              : started;
           },
         }),
       ];

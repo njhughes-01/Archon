@@ -552,6 +552,32 @@ export function readRunDispatchMetadata(
 }
 
 /**
+ * Key under which a run records the chat whose AI started it, so the host can tell that
+ * chat when the run finishes or needs someone. Written once at creation of a top-level
+ * run, and only when the starting platform has run follow-up enabled.
+ *
+ * Deliberately not `parent_conversation_id`: that column also decides auto-resume after a
+ * web approval, which adapter a scheduled continuation resumes on, and what `/reset`
+ * cancels. A run the chat's AI launched from its shell must join none of those.
+ */
+export const RUN_FOLLOW_UP_METADATA_KEY = 'follow_up';
+
+export const runFollowUpMetadataSchema = z.object({
+  /** The chat's database conversation id. */
+  conversation_id: z.string().min(1),
+});
+
+export type RunFollowUpMetadata = z.infer<typeof runFollowUpMetadataSchema>;
+
+/** Typed view of the follow-up stamp; undefined when the run carries none this build can read. */
+export function readRunFollowUp(
+  metadata: Record<string, unknown> | undefined
+): RunFollowUpMetadata | undefined {
+  const parsed = runFollowUpMetadataSchema.safeParse(metadata?.[RUN_FOLLOW_UP_METADATA_KEY]);
+  return parsed.success ? parsed.data : undefined;
+}
+
+/**
  * Key under which a run records the executable SOURCE it was started from.
  *
  * A run reads its workflows, commands, and scripts from one directory and acts on

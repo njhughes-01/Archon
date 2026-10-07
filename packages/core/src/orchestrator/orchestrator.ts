@@ -69,7 +69,9 @@ import {
 import {
   SUBRUN_METADATA_KEYS,
   CONTINUATION_METADATA_KEY,
+  RUN_FOLLOW_UP_METADATA_KEY,
 } from '@archon/workflows/schemas/workflow-run';
+import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { ResolvedWorkflow, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import type { RunModelOverrides } from '@archon/workflows/model-validation';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
@@ -85,6 +87,7 @@ import { isPerUserGitHubEnabled } from '../github-auth/config';
 import { getUserGithubNoreplyEmail } from '../db/user-github-token-store';
 import { toBranchName } from '@archon/git';
 import { startRunLiveOwner } from '../services/run-live-owner';
+import { isRunFollowUpEnabled } from '../services/run-follow-up';
 
 type IsolationResolution =
   | { status: 'existing'; cwd: string; env: IsolationEnvironmentRow }
@@ -350,9 +353,10 @@ export interface WorkflowRoutingContext {
 }
 
 /**
- * Dispatch a workflow to run in a background worker conversation (web platform only).
- * Creates a hidden worker conversation, sets up event bridging from worker to parent,
- * and fires-and-forgets the workflow execution.
+ * Dispatch a workflow to run in a background worker conversation.
+ * Creates a hidden worker conversation, sets up event bridging from worker to parent
+ * on the web console, and fires-and-forgets the workflow execution. On a platform with
+ * run follow-up enabled, the chat hears about the run from the host's follow-up instead.
  */
 async function dispatchBackgroundWorkflowOwned(
   owner: CapturedSourceOwner,
@@ -381,6 +385,20 @@ async function dispatchBackgroundWorkflowOwned(
 
   // 1. Generate worker conversation ID
   const workerPlatformId = `web-worker-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+
+  // Only the web console can deliver to the hidden worker id. Elsewhere every engine send
+  // to it fails, and an undeliverable gate message fails the node instead of pausing it.
+  // With follow-up on, the engine sends nowhere, the gate pauses, and the host's follow-up
+  // tells the chat; isolation notices go to the chat that asked.
+  const followUp = isRunFollowUpEnabled(ctx.platform.getPlatformType());
+  const enginePlatform: IWorkflowPlatform = followUp
+    ? {
+        sendMessage: async () => undefined,
+        getStreamingMode: () => 'batch',
+        getPlatformType: () => ctx.platform.getPlatformType(),
+      }
+    : ctx.platform;
+  const isolationNoticeConversationId = followUp ? ctx.conversationId : workerPlatformId;
 
   // 2. Create worker conversation in DB; propagate userId so the worker
   // row has the same attribution as the parent (matters for "my runs" queries).
@@ -479,7 +497,7 @@ async function dispatchBackgroundWorkflowOwned(
         workerConv,
         codebase,
         ctx.platform,
-        workerPlatformId,
+        isolationNoticeConversationId,
         hints,
         false,
         ctx.userId
@@ -621,6 +639,9 @@ async function dispatchBackgroundWorkflowOwned(
               },
             }
           : {}),
+        ...(followUp
+          ? { [RUN_FOLLOW_UP_METADATA_KEY]: { conversation_id: ctx.conversationDbId } }
+          : {}),
       },
       parent_conversation_id: ctx.conversationDbId,
       user_id: ctx.userId,
@@ -647,7 +668,7 @@ async function dispatchBackgroundWorkflowOwned(
         // executor adopts for us there (see #2690). Until then a rename failure leaves
         // the staged directory un-adopted so the wrap reclaims it on the way out.
         const result = await engine.submit({
-          platform: ctx.platform,
+          platform: enginePlatform,
           conversationId: workerPlatformId,
           cwd: workerCwd,
           workflow,
@@ -658,6 +679,8 @@ async function dispatchBackgroundWorkflowOwned(
             issueContext: ctx.issueContext,
             isolationContext,
             parentConversationId: ctx.conversationDbId,
+            // Only consumed when pre-creation failed and the executor creates the row.
+            ...(followUp ? { followUpConversationId: ctx.conversationDbId } : {}),
             preCreatedRun,
             userId: ctx.userId,
             source: ctx.source,
@@ -687,8 +710,9 @@ async function dispatchBackgroundWorkflowOwned(
         });
         await closeRunLiveOwner();
         // Surface workflow output to parent conversation as a result card
-        if ('paused' in result) {
-          // Paused workflows (approval gates) — no result card yet
+        if ('paused' in result || followUp) {
+          // Paused workflows (approval gates) have no result card yet, and with follow-up
+          // on the chat's AI reports the result instead.
         } else if (result.success && result.summary) {
           try {
             await ctx.platform.sendMessage(ctx.conversationId, result.summary, {
@@ -733,15 +757,20 @@ async function dispatchBackgroundWorkflowOwned(
         // A rejected terminal write leaves the row saying `running`. Do not compensate
         // with a second failWorkflowRun over the write channel that just failed, and do
         // not tell the user the workflow "failed" — its real outcome is unknown.
+        let failureRecorded = false;
         if (preCreatedRun && !terminalWriteFailed) {
-          await workflowDeps.store
+          failureRecorded = await workflowDeps.store
             .failWorkflowRun(preCreatedRun.id, err.message, { exitReason: 'unhandled_error' })
-            .catch(dbError => {
-              getLog().error(
-                { err: toError(dbError), workflowRunId: preCreatedRun.id },
-                'background_workflow_fail_db_record_failed'
-              );
-            });
+            .then(
+              () => true,
+              (dbError: unknown) => {
+                getLog().error(
+                  { err: toError(dbError), workflowRunId: preCreatedRun.id },
+                  'background_workflow_fail_db_record_failed'
+                );
+                return false;
+              }
+            );
         }
         getLog().error(
           {
@@ -754,28 +783,32 @@ async function dispatchBackgroundWorkflowOwned(
             : 'background_workflow_failed'
         );
         await closeRunLiveOwner();
-        // Surface error to parent conversation — include workflowResult metadata when
-        // we have a pre-created run ID so the chat renders a result card with "View full logs"
-        const failureRunId = preCreatedRun?.id;
-        const failureMessage = terminalWriteFailed
-          ? `⚠️ Workflow **${workflow.name}** finished, but its final status could not be saved. ` +
-            'It may still show as running — check it before starting another.'
-          : `Workflow **${workflow.name}** failed: ${err.message}`;
-        await ctx.platform
-          .sendMessage(
-            ctx.conversationId,
-            failureMessage,
-            failureRunId
-              ? {
-                  category: 'workflow_result',
-                  segment: 'new',
-                  workflowResult: { workflowName: workflow.name, runId: failureRunId },
-                }
-              : undefined
-          )
-          .catch((sendErr: unknown) => {
-            getLog().error({ err: toError(sendErr) }, 'background_workflow_notify_failed');
-          });
+        // The follow-up reads the outcome off the row, so it can report this failure only
+        // when the row records it; otherwise the chat is told here.
+        if (!(followUp && failureRecorded)) {
+          // Surface error to parent conversation — include workflowResult metadata when
+          // we have a pre-created run ID so the chat renders a result card with "View full logs"
+          const failureRunId = preCreatedRun?.id;
+          const failureMessage = terminalWriteFailed
+            ? `⚠️ Workflow **${workflow.name}** finished, but its final status could not be saved. ` +
+              'It may still show as running — check it before starting another.'
+            : `Workflow **${workflow.name}** failed: ${err.message}`;
+          await ctx.platform
+            .sendMessage(
+              ctx.conversationId,
+              failureMessage,
+              failureRunId
+                ? {
+                    category: 'workflow_result',
+                    segment: 'new',
+                    workflowResult: { workflowName: workflow.name, runId: failureRunId },
+                  }
+                : undefined
+            )
+            .catch((sendErr: unknown) => {
+              getLog().error({ err: toError(sendErr) }, 'background_workflow_notify_failed');
+            });
+        }
       } finally {
         // Clean up event bridge
         if (unsubscribeBridge) {
