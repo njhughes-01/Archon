@@ -76,6 +76,7 @@ import { createChildWorktreeResolver } from '@archon/core/workflows/child-isolat
 import { findCodebaseForCheckoutPath } from '@archon/core/services/codebase-checkout-resolver';
 import { waitForRunAttention } from '@archon/core/services/run-attention-watch';
 import type { RunWaitResult } from '@archon/core/services/run-attention-watch';
+import { RUN_FOLLOW_UP_CONVERSATION_ENV } from '@archon/core/services/run-follow-up';
 import {
   startRunLiveOwner,
   RunLiveOwnerAlreadyOwnedError,
@@ -135,6 +136,7 @@ import {
   skipCauseSchema,
   SUBRUN_METADATA_KEYS,
   CONTINUATION_METADATA_KEY,
+  RUN_FOLLOW_UP_METADATA_KEY,
 } from '@archon/workflows/schemas/workflow-run';
 import type {
   WorkflowRun,
@@ -394,6 +396,12 @@ export interface WorkflowRunOptions {
    * no-adopter query. Provenance only — NO lane inheritance.
    */
   supersedesRunId?: string;
+  /**
+   * @internal The chat to follow up when a run this invocation creates finishes or needs
+   * someone, read from `RUN_FOLLOW_UP_CONVERSATION_ENV` at command entry. Stamped only on
+   * a row this process creates: the detached pre-created row, or the foreground run.
+   */
+  followUpConversationId?: string;
 }
 
 /**
@@ -2311,6 +2319,11 @@ async function runWorkflowWithOwnedSource(
             ...(continuationDeclaration
               ? { [CONTINUATION_METADATA_KEY]: { mode: continuationDeclaration.mode } }
               : {}),
+            ...(options.followUpConversationId
+              ? {
+                  [RUN_FOLLOW_UP_METADATA_KEY]: { conversation_id: options.followUpConversationId },
+                }
+              : {}),
           },
           ...(detachedUserId ? { user_id: detachedUserId } : {}),
           ...(continuationDeclaration
@@ -3245,6 +3258,9 @@ async function runWorkflowWithOwnedSource(
         // when IT creates the row, and this row already carries them.
         ...(detachedPreCreatedRun ? { preCreatedRun: detachedPreCreatedRun } : {}),
         ...(cutFromCommit !== undefined ? { cutFromCommit } : {}),
+        ...(options.followUpConversationId
+          ? { followUpConversationId: options.followUpConversationId }
+          : {}),
       };
       result = await engine.submit({
         platform: adapter,
@@ -3605,8 +3621,17 @@ export async function workflowRunCommand(
   // active-stop lease (`archon workflow cancel`) and detached failure exit code.
   const detachedProcessOwner = process.env[DETACHED_RUN_OWNER_ENV] === '1';
   if (detachedProcessOwner) Reflect.deleteProperty(process.env, DETACHED_RUN_OWNER_ENV);
+  // The follow-up chat is read once and removed for the same reason: it stamps the run
+  // this command creates, never a run that one of the workflow's own agents starts.
+  const followUpConversationId = process.env[RUN_FOLLOW_UP_CONVERSATION_ENV] || undefined;
+  Reflect.deleteProperty(process.env, RUN_FOLLOW_UP_CONVERSATION_ENV);
 
-  let attempt: WaitResumeAttempt = { cwd, workflowName, userMessage, options };
+  let attempt: WaitResumeAttempt = {
+    cwd,
+    workflowName,
+    userMessage,
+    options: followUpConversationId ? { ...options, followUpConversationId } : options,
+  };
   for (;;) {
     let pending: PendingWaitContinuation | undefined;
     try {
