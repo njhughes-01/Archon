@@ -504,6 +504,7 @@ The Copilot provider also reads `assistants.copilot.{model, modelReasoningEffort
 | `TELEGRAM_BOT_TOKEN` | Telegram bot token from @BotFather | -- |
 | `TELEGRAM_ALLOWED_USER_IDS` | Comma-separated Telegram user IDs for whitelist | Open access |
 | `TELEGRAM_STREAMING_MODE` | Streaming mode (`stream` or `batch`) | `stream` |
+| `TELEGRAM_RUN_FOLLOW_UP` | Set to `false` to stop telling a chat about workflow runs its AI started (see [Telegram](/adapters/telegram/#run-follow-ups)) | On |
 
 ### Platform Adapters -- Discord
 
