@@ -595,6 +595,12 @@ import {
   resolveTitleRequest,
   continueResolvedGateRun,
 } from './orchestrator-agent';
+import {
+  RUN_FOLLOW_UP_CONVERSATION_ENV,
+  RUN_FOLLOW_UP_PROMPT_SECTION,
+  disableRunFollowUp,
+  enableRunFollowUp,
+} from '../services/run-follow-up';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 
@@ -1779,6 +1785,56 @@ describe('discoverAllWorkflows — remote sync', () => {
     } finally {
       capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
     }
+  });
+
+  describe('run follow-up', () => {
+    afterEach(() => {
+      disableRunFollowUp('telegram');
+    });
+
+    function telegramPlatform(): ReturnType<typeof makePlatform> {
+      const platform = makePlatform();
+      platform.getPlatformType.mockImplementation(() => 'telegram');
+      return platform;
+    }
+
+    async function requestFor(
+      platform: ReturnType<typeof makePlatform>
+    ): Promise<{ env?: Record<string, string>; systemPrompt: { append: string } }> {
+      mockGetOrCreateConversation.mockReturnValueOnce(
+        Promise.resolve(makeConversation({ id: 'chat-db-1', ai_assistant_type: 'claude' }))
+      );
+      await handleMessage(platform, 'chat-1', 'Hello');
+      return mockSendQuery.mock.calls[0][3] as {
+        env?: Record<string, string>;
+        systemPrompt: { append: string };
+      };
+    }
+
+    test('hands the chat id to the AI shell and tells the AI it will be woken when enabled', async () => {
+      enableRunFollowUp('telegram');
+
+      const requestOptions = await requestFor(telegramPlatform());
+
+      expect(requestOptions.env).toEqual({ [RUN_FOLLOW_UP_CONVERSATION_ENV]: 'chat-db-1' });
+      expect(requestOptions.systemPrompt.append).toContain(RUN_FOLLOW_UP_PROMPT_SECTION);
+    });
+
+    test('changes nothing for a platform without follow-up', async () => {
+      enableRunFollowUp('telegram');
+
+      const requestOptions = await requestFor(makePlatform());
+
+      expect(requestOptions.env).toBeUndefined();
+      expect(requestOptions.systemPrompt.append).toBe('orchestrator system append');
+    });
+
+    test('changes nothing while follow-up is off', async () => {
+      const requestOptions = await requestFor(telegramPlatform());
+
+      expect(requestOptions.env).toBeUndefined();
+      expect(requestOptions.systemPrompt.append).toBe('orchestrator system append');
+    });
   });
 });
 
