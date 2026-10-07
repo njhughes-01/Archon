@@ -188,13 +188,20 @@ async function chatResetSince(conversationId: string, since: Date): Promise<bool
   );
 }
 
+/** When the chat's last AI turn began, which `handleMessage` records just before the AI call. */
+async function lastChatTurnAt(conversationDbId: string): Promise<number | null> {
+  const at = (await conversationDb.getConversationById(conversationDbId))?.last_activity_at;
+  return at ? toHydratedTimestamp(at).getTime() : null;
+}
+
 function queueWake(
   candidate: RunFollowUpCandidate,
   segment: string | null,
   adapter: IPlatformAdapter,
-  chatId: string,
+  chat: { dbId: string; platformId: string },
   lockManager: ConversationLockManager
 ): void {
+  const chatId = chat.platformId;
   queuedWakes.add(candidate.ownerRunId);
   void lockManager.acquireLock(chatId, async () => {
     // Set once the mark is written: from then on this follow-up is never retried.
@@ -213,9 +220,21 @@ function queueWake(
       if (!(await writeMark(current, 'wake', segment))) return;
       const input: RunFollowUpInput = { run: current.run, event: current.event, surface: adapter };
       marked = input;
+      const turnBefore = await lastChatTurnAt(chat.dbId);
       await handleMessage(adapter, chatId, formatRunFollowUpWake(input), {
         isolationHints: { workflowType: 'thread', workflowId: chatId },
       });
+      // `handleMessage` answers some states itself (a working directory or project that no
+      // longer exists) and returns before any AI turn. The chat then heard about that
+      // state and nothing about the run, so it gets the plain note as well.
+      if ((await lastChatTurnAt(chat.dbId)) === turnBefore) {
+        await adapter.sendMessage(chatId, formatRunFollowUpNote(input));
+        log.info(
+          { runId: current.run.id, ownerRunId: current.ownerRunId, attention: current.event.kind },
+          'run_follow_up.noted_without_turn'
+        );
+        return;
+      }
       log.info(
         { runId: current.run.id, ownerRunId: current.ownerRunId, attention: current.event.kind },
         'run_follow_up.woke'
@@ -285,7 +304,13 @@ async function followUpRun(
     );
     return;
   }
-  queueWake(candidate, segment, adapter, chatId, options.lockManager);
+  queueWake(
+    candidate,
+    segment,
+    adapter,
+    { dbId: conversation.id, platformId: chatId },
+    options.lockManager
+  );
 }
 
 /** Stamped runs that are active, or ended inside the follow-up window. */

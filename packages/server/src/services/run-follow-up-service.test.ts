@@ -17,7 +17,11 @@ let sessions: Session[] = [];
 let conversationPlatform = 'telegram';
 const attentionOverrides = new Map<string, RunWaitResult>();
 
-const mockHandleMessage = mock(async (..._args: unknown[]) => undefined);
+// A chat turn that reaches the AI touches the conversation; one stopped by a guard does not.
+let lastActivityAt = new Date(NOW);
+const mockHandleMessage = mock(async (..._args: unknown[]) => {
+  lastActivityAt = new Date(lastActivityAt.getTime() + 1_000);
+});
 const mockListWorkflowRuns = mock(async (options?: { status?: string[] }) =>
   [...runs.values()].filter(
     run => run.parent_run_id === null && (options?.status ?? []).includes(run.status)
@@ -40,7 +44,12 @@ mock.module('@archon/core/db/workflow-events', () => ({
 mock.module('@archon/core/db/conversations', () => ({
   getConversationById: async (id: string) =>
     id === CHAT_DB_ID
-      ? { id, platform_type: conversationPlatform, platform_conversation_id: CHAT_ID }
+      ? {
+          id,
+          platform_type: conversationPlatform,
+          platform_conversation_id: CHAT_ID,
+          last_activity_at: lastActivityAt,
+        }
       : null,
 }));
 mock.module('@archon/core/db/sessions', () => ({
@@ -337,6 +346,23 @@ describe('runFollowUpTick', () => {
     expect(adapterSendMessage.mock.calls[0]).toEqual([
       CHAT_ID,
       'Run run-1 (build-feature) that this chat started has finished. Details: /workflow status',
+    ]);
+    expect(marks()).toHaveLength(1);
+  });
+
+  test('sends the short note too when the wake never reached the AI', async () => {
+    putRun({ id: 'run-1', status: 'completed' });
+    // A guard (a missing working directory, say) answers the chat and returns early.
+    mockHandleMessage.mockImplementationOnce(async () => undefined);
+
+    await ticks(3);
+
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+    expect(adapterSendMessage.mock.calls).toEqual([
+      [
+        CHAT_ID,
+        'Run run-1 (build-feature) that this chat started has finished. Details: /workflow status',
+      ],
     ]);
     expect(marks()).toHaveLength(1);
   });
