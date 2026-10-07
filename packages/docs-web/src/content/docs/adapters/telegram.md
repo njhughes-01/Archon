@@ -56,6 +56,7 @@ When the chat's AI starts a workflow run, with its run tool or with `archon work
 
 - Only runs started by this chat's AI are followed up. Runs started from a terminal, the Web UI, or the foreground of a chat message are not.
 - Each event is followed up once, also across server restarts. Runs that ended more than 24 hours ago are not picked up.
+- If the automatic turn itself fails, the chat gets a one-line note about the run instead; the follow-up is not retried.
 - If you send `/reset` after the run started, the chat gets one short note instead, and the new session is not woken. Runs that `/reset` itself cancelled get no message.
 - A background run that reaches an approval gate pauses and waits for your answer in the chat.
 

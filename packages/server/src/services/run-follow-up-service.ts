@@ -197,6 +197,8 @@ function queueWake(
 ): void {
   queuedWakes.add(candidate.ownerRunId);
   void lockManager.acquireLock(chatId, async () => {
+    // Set once the mark is written: from then on this follow-up is never retried.
+    let marked: RunFollowUpInput | undefined;
     try {
       // The chat may have been busy for a while: wake only for what is still true.
       const current = await describeRun(candidate.run);
@@ -210,6 +212,7 @@ function queueWake(
       }
       if (!(await writeMark(current, 'wake', segment))) return;
       const input: RunFollowUpInput = { run: current.run, event: current.event, surface: adapter };
+      marked = input;
       await handleMessage(adapter, chatId, formatRunFollowUpWake(input), {
         isolationHints: { workflowType: 'thread', workflowId: chatId },
       });
@@ -219,6 +222,18 @@ function queueWake(
       );
     } catch (error) {
       log.error({ err: error as Error, runId: candidate.run.id }, 'run_follow_up.wake_failed');
+      // The mark stands, so a failed wake would otherwise be the silence this service
+      // exists to remove: tell the chat with the plain note instead.
+      if (marked) {
+        await adapter
+          .sendMessage(chatId, formatRunFollowUpNote(marked))
+          .catch((sendError: unknown) => {
+            log.error(
+              { err: sendError as Error, runId: candidate.run.id },
+              'run_follow_up.wake_fallback_failed'
+            );
+          });
+      }
     } finally {
       queuedWakes.delete(candidate.ownerRunId);
     }

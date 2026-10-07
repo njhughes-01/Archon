@@ -324,6 +324,23 @@ describe('runFollowUpTick', () => {
     expect(marks()[0]?.data).toMatchObject({ mode: 'note' });
   });
 
+  test('falls back to the short note when the wake turn fails', async () => {
+    putRun({ id: 'run-1', status: 'completed' });
+    mockHandleMessage.mockImplementationOnce(async () => {
+      throw new Error('provider down');
+    });
+
+    await ticks(3);
+
+    expect(mockHandleMessage).toHaveBeenCalledTimes(1);
+    expect(adapterSendMessage).toHaveBeenCalledTimes(1);
+    expect(adapterSendMessage.mock.calls[0]).toEqual([
+      CHAT_ID,
+      'Run run-1 (build-feature) that this chat started has finished. Details: /workflow status',
+    ]);
+    expect(marks()).toHaveLength(1);
+  });
+
   test('a reset before the run started still wakes the chat', async () => {
     putRun({ id: 'run-1', status: 'completed' });
     sessions = [{ ended_reason: 'reset-requested', ended_at: new Date(NOW - 120_000) } as Session];
