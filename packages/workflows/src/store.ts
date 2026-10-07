@@ -185,6 +185,11 @@ export const WORKFLOW_EVENT_TYPES = [
   // #2512 — audit snapshot of a composed fan-out's ordered instance set (identity +
   // item per ordinal), written before the first instance schedules.
   'fan_out_instances',
+  // The server told the chat recorded under `follow_up` metadata about this run, once
+  // per execution segment. `data.covers` is the id of the run's latest `workflow_started`
+  // event at the time, so a resume (a newer `workflow_started`) re-arms the follow-up.
+  // `data.mode` is 'wake' | 'note' | 'skipped'; `data.attention` names what happened.
+  'chat_follow_up_sent',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

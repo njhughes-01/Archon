@@ -189,8 +189,10 @@ import type {
 } from './schemas';
 import {
   RUN_DISPATCH_METADATA_KEY,
+  RUN_FOLLOW_UP_METADATA_KEY,
   RUN_METADATA_KEYS,
   readRunDispatchMetadata,
+  readRunFollowUp,
   workflowDefinitionSchema,
 } from './schemas';
 import type { WorkflowRunConfigMetadata } from './schemas/run-config';
@@ -401,6 +403,43 @@ describe('executeWorkflow', () => {
         preCreatedRun.id,
         expect.objectContaining({ metadata: expect.objectContaining(owner) })
       );
+    });
+  });
+
+  describe('run follow-up stamp', () => {
+    it('records the follow-up chat on a run it creates', async () => {
+      const store = makeStore();
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1',
+        { followUpConversationId: 'chat-db-1' }
+      );
+      const created = (store.createWorkflowRun as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+        metadata: Record<string, unknown>;
+      };
+      expect(readRunFollowUp(created.metadata)).toEqual({ conversation_id: 'chat-db-1' });
+    });
+
+    it('records no follow-up key without the option', async () => {
+      const store = makeStore();
+      await executeWorkflow(
+        makeDeps(store),
+        makePlatform(),
+        'conv-1',
+        '/tmp',
+        makeWorkflow(),
+        'msg',
+        'db-conv-1'
+      );
+      const created = (store.createWorkflowRun as ReturnType<typeof mock>).mock.calls[0]?.[0] as {
+        metadata: Record<string, unknown>;
+      };
+      expect(created.metadata).not.toHaveProperty(RUN_FOLLOW_UP_METADATA_KEY);
     });
   });
 

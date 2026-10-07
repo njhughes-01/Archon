@@ -43,6 +43,7 @@ import {
   CONTINUATION_METADATA_KEY,
   readContinuationMode,
   RUN_DISPATCH_METADATA_KEY,
+  RUN_FOLLOW_UP_METADATA_KEY,
   readRunDispatchMetadata,
   WORKFLOW_SOURCE_METADATA_KEY,
   readWorkflowSourceState,
@@ -640,6 +641,11 @@ export type ExecuteWorkflowOptions = ResumePayload & {
   parseWarnings?: readonly string[];
   /** Parent conversation ID — enables approve/reject auto-resume from chat. */
   parentConversationId?: string;
+  /**
+   * Database id of the chat to follow up when this run finishes or needs someone.
+   * Stamped as `RUN_FOLLOW_UP_METADATA_KEY` only on a row this call creates.
+   */
+  followUpConversationId?: string;
   /**
    * Archon user UUID for attribution on the workflow_run row. Resolved by
    * chat/forge adapters via findOrCreateUserByPlatformIdentity. Web/CLI paths
@@ -1828,6 +1834,7 @@ export async function executeWorkflow(
     issueContext,
     isolationContext,
     parentConversationId,
+    followUpConversationId,
     preCreatedRun,
     priorCompletedNodes,
     priorUsage,
@@ -2279,6 +2286,9 @@ export async function executeWorkflow(
           [RUN_DISPATCH_METADATA_KEY]: dispatchMetadata,
           ...(runConfigMetadata ? { [WORKFLOW_RUN_CONFIG_METADATA_KEY]: runConfigMetadata } : {}),
           [EXECUTION_OWNER_METADATA_KEY]: executionOwner,
+          ...(followUpConversationId
+            ? { [RUN_FOLLOW_UP_METADATA_KEY]: { conversation_id: followUpConversationId } }
+            : {}),
         },
         parent_conversation_id: parentConversationId,
         user_id: userId,

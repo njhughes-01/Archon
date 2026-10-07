@@ -21,6 +21,7 @@ import {
   NODE_LIFECYCLE_EVENT_TYPES,
   NODE_STATE_EVENT_TYPES,
   type NodeStateEventType,
+  type WorkflowEventType,
   type NodeLifecycleEventType,
   type DagResumeSnapshot,
   type PersistedNodeOutput,
@@ -179,6 +180,30 @@ export async function listWorkflowEvents(workflowRunId: string): Promise<Workflo
   } catch (error) {
     getLog().error({ err: error as Error, runId: workflowRunId }, 'db.workflow_events_list_failed');
     throw new Error(`Failed to list workflow events: ${(error as Error).message}`);
+  }
+}
+
+/** The run's newest event of `eventType` in lifecycle order, or null when it has none. */
+export async function getLatestWorkflowEvent(
+  workflowRunId: string,
+  eventType: WorkflowEventType
+): Promise<WorkflowEventRow | null> {
+  try {
+    const result = await pool.query<WorkflowEventRow>(
+      `SELECT * FROM remote_agent_workflow_events
+       WHERE workflow_run_id = $1 AND event_type = $2
+       ORDER BY created_at DESC, COALESCE(event_order, 0) DESC, id DESC
+       LIMIT 1`,
+      [workflowRunId, eventType]
+    );
+    const row = result.rows[0];
+    return row ? parseEventRow(row) : null;
+  } catch (error) {
+    getLog().error(
+      { err: error as Error, runId: workflowRunId, eventType },
+      'db.workflow_event_latest_failed'
+    );
+    throw new Error(`Failed to read latest workflow event: ${(error as Error).message}`);
   }
 }
 
