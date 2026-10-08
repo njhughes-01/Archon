@@ -1,0 +1,13 @@
+{
+  "question": "Does this code decide whether a caller is who they claim to be, by checking a password, session, token, signature or API key and rejecting one that is wrong, expired or not allowed?",
+  "paths": [],
+  "relevant": {
+    "services/api/auth/session.ts": "Verifies a session cookie's signature and expiry.",
+    "services/api/middleware/require-auth.js": "Rejects requests whose bearer token is missing, revoked, expired or under-scoped.",
+    "services/api/auth/password.py": "Compares a candidate password with the stored digest and enforces the lockout.",
+    "services/gateway/authn.go": "Checks an identity assertion's subject, audience, issuer and validity window.",
+    "services/worker/api_key_guard.rb": "Turns away job submissions without the tenant's shared key.",
+    "lib/security/TokenVerifier.java": "Verifies a signed link's HMAC and expiry.",
+    "services/api/utils/helpers.ts": "ensureCallerAllowed, buried mid-file among unrelated helpers, rejects a missing, disabled or stale API key."
+  }
+}
