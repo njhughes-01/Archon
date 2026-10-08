@@ -581,6 +581,25 @@ describe('redactEvidence', () => {
     expect(redact(line)).toBe(line);
   });
 
+  // Evidence is whatever a failing command printed. The patterns bound how far a
+  // name or a URL scheme may run, so none of these shapes costs time quadratic in the
+  // text; a pattern that did would take far longer than this allows.
+  it('stays fast on long runs of text that almost match a pattern', () => {
+    const size = 72_000;
+    const runs = [
+      'a.'.repeat(size / 2),
+      'a-'.repeat(size / 2),
+      'x://'.repeat(size / 4),
+      'password'.repeat(size / 8),
+      '-----BEGIN PRIVATE KEY-----\n'.repeat(size / 28),
+    ];
+
+    const started = performance.now();
+    for (const text of runs) redact(text);
+
+    expect(performance.now() - started).toBeLessThan(5000);
+  });
+
   it('removes the exact value of a secret-named variable, wherever it is echoed', () => {
     const text = 'request to /v1 failed with header x-auth: abcd1234efgh';
     expect(redact(text, { UPSTREAM_API_KEY: 'abcd1234efgh' })).not.toContain('abcd1234efgh');

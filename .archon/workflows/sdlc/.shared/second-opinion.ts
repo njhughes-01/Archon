@@ -159,8 +159,11 @@ const KEY_BLOCK_START = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY[\s\S]*$/;
 const AUTHORIZATION =
   /\b((?:proxy-)?authorization["']?[ \t]*[:=][ \t]*["']?)(?:(?:bearer|basic|token|digest|negotiate)[ \t]+[^\s"',;]+|[A-Za-z0-9._~+/=-]{16,})/gi;
 const BEARER = /\b(bearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}/gi;
-/** The user and password in front of a URL's host. */
-const URL_USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
+/**
+ * The user and password in front of a URL's host. Both lengths are bounded so a long run
+ * of dotted or hyphenated text cannot make the search quadratic.
+ */
+const URL_USERINFO = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@]{1,512}@/gi;
 
 /**
  * A value assigned to a secret-named key, in the shapes logs print them: `KEY=value`,
