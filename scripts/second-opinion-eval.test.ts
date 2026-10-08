@@ -6,12 +6,18 @@ import { trackTempRoots } from '@archon/paths/test-utils';
 import type { Fetch } from '../.archon/workflows/sdlc/.shared/jev-client.ts';
 import type { SecondOpinion } from '../.archon/workflows/sdlc/.shared/second-opinion.ts';
 import {
+  recordedOutput,
+  renderValidationRecord,
+} from '../.archon/workflows/sdlc/.shared/validation-record.ts';
+import {
   ACCURACY_FLOOR,
+  CLASS_ACCURACY_FLOOR,
   EVAL_FIXTURE,
   formatReport,
   main,
   readCheckpoint,
   readLabelledLogs,
+  recordFor,
   runEval,
   scoreOutcomes,
   type Checkpoint,
@@ -95,6 +101,7 @@ function labelled(labels: readonly string[]): LabelledLog[] {
   return labels.map((expected, index) => ({
     name: `${String(index + 1).padStart(2, '0')}.txt`,
     expected,
+    check: 'tests',
     text: `$ run the gate\nLABEL=${expected}\nexit 1`,
   }));
 }
@@ -150,43 +157,68 @@ describe('scoreOutcomes', () => {
       ['environment_failure-3.txt', 'environment_failure', 'code_defect'],
     ]);
     expect(score.wronglyBlamedOnCode).toEqual(['environment_failure-3.txt']);
+    expect(score.intermittentCalledDefect).toEqual([]);
+    expect(score.belowClassFloor).toEqual(['code_defect', 'flaky_test', 'environment_failure']);
     expect(score.pass).toBe(false);
   });
 
-  it('passes exactly at the floor when no machine or dependency failure was blamed on code', () => {
-    // Ten logs, eight right; both mistakes are between other classes.
+  const right = (name: string, count: number): string[] =>
+    Array.from({ length: count }, () => name);
+
+  it('passes exactly at both floors when no machine or dependency failure was blamed on code', () => {
+    // Twenty logs, sixteen right, four of five in every class.
     const score = scoreOutcomes(CLASSES, [
-      ...outcomes('code_defect', ['code_defect', 'code_defect', 'flaky_test']),
-      ...outcomes('flaky_test', ['flaky_test', 'flaky_test']),
-      ...outcomes('dependency_failure', ['dependency_failure', 'environment_failure']),
+      ...outcomes('code_defect', [...right('code_defect', 4), 'flaky_test']),
+      ...outcomes('flaky_test', [...right('flaky_test', 4), 'environment_failure']),
+      ...outcomes('dependency_failure', [...right('dependency_failure', 4), 'environment_failure']),
       ...outcomes('environment_failure', [
-        'environment_failure',
-        'environment_failure',
-        'environment_failure',
+        ...right('environment_failure', 4),
+        'dependency_failure',
       ]),
     ]);
 
     expect(ACCURACY_FLOOR).toBe(0.8);
+    expect(CLASS_ACCURACY_FLOOR).toBe(0.7);
     expect(score.accuracy).toBe(0.8);
+    expect(score.belowClassFloor).toEqual([]);
     expect(score.wronglyBlamedOnCode).toEqual([]);
     expect(score.pass).toBe(true);
   });
 
-  it('fails one answer below the floor', () => {
+  it('fails one answer below the overall floor, with every class above its own', () => {
     const score = scoreOutcomes(CLASSES, [
-      ...outcomes('code_defect', ['code_defect', 'flaky_test', 'flaky_test']),
-      ...outcomes('flaky_test', ['flaky_test', 'flaky_test']),
-      ...outcomes('dependency_failure', ['dependency_failure', 'environment_failure']),
-      ...outcomes('environment_failure', [
-        'environment_failure',
-        'environment_failure',
-        'environment_failure',
+      ...outcomes('code_defect', [...right('code_defect', 7), ...right('flaky_test', 3)]),
+      ...outcomes('flaky_test', [...right('flaky_test', 8), ...right('environment_failure', 2)]),
+    ]);
+
+    expect(score.accuracy).toBe(0.75);
+    expect(score.belowClassFloor).toEqual([]);
+    expect(score.wronglyBlamedOnCode).toEqual([]);
+    expect(score.pass).toBe(false);
+  });
+
+  it('fails when one class is below its floor, however good the overall figure', () => {
+    const score = scoreOutcomes(CLASSES, [
+      ...outcomes('code_defect', right('code_defect', 20)),
+      ...outcomes('dependency_failure', [
+        ...right('dependency_failure', 3),
+        ...right('environment_failure', 2),
       ]),
     ]);
 
-    expect(score.accuracy).toBe(0.7);
+    expect(score.accuracy).toBe(23 / 25);
+    expect(score.perClass.dependency_failure.accuracy).toBe(0.6);
+    expect(score.belowClassFloor).toEqual(['dependency_failure']);
     expect(score.wronglyBlamedOnCode).toEqual([]);
     expect(score.pass).toBe(false);
+  });
+
+  it('holds a class with no logs to no floor', () => {
+    const score = scoreOutcomes(CLASSES, outcomes('code_defect', right('code_defect', 5)));
+
+    expect(score.perClass.flaky_test.accuracy).toBeNull();
+    expect(score.belowClassFloor).toEqual([]);
+    expect(score.pass).toBe(true);
   });
 
   it.each(['dependency_failure', 'environment_failure'])(
@@ -210,17 +242,15 @@ describe('scoreOutcomes', () => {
     }
   );
 
-  it('does not count a flaky test called a code defect as the forbidden mistake', () => {
+  it('counts a timing-dependent test called a code defect, without failing the run for it', () => {
     const score = scoreOutcomes(CLASSES, [
-      ...outcomes(
-        'code_defect',
-        Array.from({ length: 9 }, () => 'code_defect')
-      ),
-      ...outcomes('flaky_test', ['code_defect']),
+      ...outcomes('code_defect', right('code_defect', 10)),
+      ...outcomes('flaky_test', [...right('flaky_test', 8), ...right('code_defect', 2)]),
     ]);
 
     expect(score.accuracy).toBe(0.9);
     expect(score.wronglyBlamedOnCode).toEqual([]);
+    expect(score.intermittentCalledDefect).toEqual(['flaky_test-9.txt', 'flaky_test-10.txt']);
     expect(score.pass).toBe(true);
   });
 
@@ -287,6 +317,82 @@ describe('runEval', () => {
     expect(report.wronglyBlamedOnCode).toEqual(['04.txt']);
     expect(report.charsSent).toBeGreaterThan(5 * 'LABEL=code_defect'.length);
     expect(report.pass).toBe(false);
+  });
+
+  it('sends each log inside the record the check runner writes', async () => {
+    const sent: string[] = [];
+    const recording: Fetch = (_input, init) => {
+      const body = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as {
+        state: { evidence: string };
+        questions: Record<string, unknown>;
+      };
+      sent.push(body.state.evidence);
+      return Promise.resolve(
+        Response.json({
+          answers: {
+            [Object.keys(body.questions)[0]]: {
+              type: 'choice',
+              choice: 'code_defect',
+              confidence: 1,
+              probabilities: Object.fromEntries(
+                CLASSES.map(name => [name, name === 'code_defect' ? 1 : 0])
+              ),
+            },
+          },
+        })
+      );
+    };
+    const log: LabelledLog = {
+      name: 'one.txt',
+      expected: 'code_defect',
+      check: 'unit tests',
+      text: '$ bun run test\nFAIL src/cart.test.ts\nexpected 3, received 4\n',
+    };
+
+    await runEval({ checkpoint: CHECKPOINT, logs: [log], env: ENV, fetch: recording });
+
+    expect(sent).toHaveLength(1);
+    // Exactly what the runner's renderer writes for one failing check, less the final
+    // line break the second opinion trims.
+    expect(sent[0]).toBe(
+      renderValidationRecord({
+        notes: '',
+        quarantined: [],
+        kept: [],
+        checks: [
+          {
+            name: 'unit tests',
+            argv: ['bun run test'],
+            outcome: { kind: 'failed', exitCode: 1, signal: null },
+            seconds: 12,
+            output: 'FAIL src/cart.test.ts\nexpected 3, received 4',
+            log: 'validation/1.log',
+          },
+        ],
+      }).trimEnd()
+    );
+    expect(sent[0]).toStartWith(
+      '# Validation\n\n## 1. unit tests\n\n`bun run test` failed (exit 1) after 12s.'
+    );
+    expect(recordedOutput(sent[0])).toBe('FAIL src/cart.test.ts\nexpected 3, received 4');
+    expect(recordFor(log).trimEnd()).toBe(sent[0]);
+  });
+
+  it('is not scored when a log holds no output to judge', async () => {
+    const classifier = answeringBy(label => label);
+
+    const report = await runEval({
+      checkpoint: CHECKPOINT,
+      logs: [
+        { name: 'empty.txt', expected: 'code_defect', check: 'tests', text: '$ bun run test\n' },
+      ],
+      env: ENV,
+      fetch: classifier.fetch,
+    });
+
+    expect(classifier.calls()).toBe(0);
+    expect(report.scored).toBe(false);
+    expect(report.notScoredReason).toBe('empty.txt: insufficient_evidence');
   });
 
   it('stops at the first log the classifier cannot answer, and is not scored', async () => {
@@ -379,9 +485,56 @@ describe('formatReport', () => {
     expect(text).toContain('confidence: 0.60  (mean over 4 answers)');
     expect(text).toMatch(/environment_failure\s+0\.00\s+\(0 of 1\)/);
     expect(text).toContain('04.txt: labelled environment_failure, classified code_defect (0.60)');
+    expect(text).toMatch(/^sent: {7}[\d,]+ characters in 4 requests$/m);
+    expect(text).toContain(
+      'flaky_test classified code_defect: 0  (counted, does not fail the run)'
+    );
     const last = text.split('\n').at(-1) ?? '';
     expect(last).toStartWith('RESULT: FAIL.');
     expect(last).toContain('1 log(s) labelled dependency_failure or environment_failure');
+  });
+
+  it('names every timing-dependent log that was called a code defect, on a run that passes', async () => {
+    // Eight timing logs; the classifier reads the last one as a defect.
+    const classifier = answeringBy(label => (label === 'misread' ? 'code_defect' : label));
+    const logs = labelled([
+      ...Array.from({ length: 8 }, () => 'code_defect'),
+      ...Array.from({ length: 8 }, () => 'flaky_test'),
+    ]);
+    const last = logs[logs.length - 1];
+    last.text = last.text.replace('LABEL=flaky_test', 'LABEL=misread');
+
+    const report = await runEval({
+      checkpoint: CHECKPOINT,
+      logs,
+      env: ENV,
+      fetch: classifier.fetch,
+    });
+    const text = formatReport(report);
+
+    expect(report.pass).toBe(true);
+    expect(report.intermittentCalledDefect).toEqual(['16.txt']);
+    expect(text).toContain(
+      'flaky_test classified code_defect: 1 (16.txt)  (counted, does not fail the run)'
+    );
+    expect(text.split('\n').at(-1)).toStartWith('RESULT: PASS.');
+  });
+
+  it('says which class fell below its floor when the overall figure passed', async () => {
+    const classifier = answeringBy(label =>
+      label === 'dependency_failure' ? 'environment_failure' : label
+    );
+    const report = await runEval({
+      checkpoint: CHECKPOINT,
+      logs: labelled([...Array.from({ length: 9 }, () => 'code_defect'), 'dependency_failure']),
+      env: ENV,
+      fetch: classifier.fetch,
+    });
+
+    expect(report.accuracy).toBe(0.9);
+    expect(formatReport(report).split('\n').at(-1)).toBe(
+      'RESULT: FAIL. Accuracy 0.90, but dependency_failure is below the per-class floor of 0.70.'
+    );
   });
 
   it('labels every result line of a dry run as dry', async () => {
@@ -392,10 +545,16 @@ describe('formatReport', () => {
       dry: true,
     });
 
-    const last = formatReport(report).split('\n').at(-1) ?? '';
+    const text = formatReport(report);
+    const last = text.split('\n').at(-1) ?? '';
     expect(last).toStartWith(
       'RESULT (dry run: the answers came from the answer key, not from a classifier): PASS.'
     );
+    // Nothing was sent, and no line may read as if something had been.
+    expect(text).toMatch(
+      /^sent: {7}nothing \(dry run; a live run would send [\d,]+ characters in 4 requests\)$/m
+    );
+    expect(text).not.toMatch(/^sent: {7}[\d,]/m);
   });
 
   it('says NOT SCORED, with the reason, and prints no figures', async () => {
@@ -429,10 +588,12 @@ describe('the shipped fixture', () => {
     }
     for (const log of logs) {
       // validation.md records the last 60 lines of a failing check's output.
-      expect({ log: log.name, lines: log.text.trimEnd().split('\n').length <= 60 }).toEqual({
+      // So the record holds the log whole, as its one failing check's output.
+      expect({ log: log.name, whole: recordedOutput(recordFor(log)) }).toEqual({
         log: log.name,
-        lines: true,
+        whole: log.text.split('\n').slice(1).join('\n').trimEnd(),
       });
+      expect(log.text.trimEnd().split('\n').length - 1).toBeLessThanOrEqual(60);
       // A log that names its own label would be answering the question for the classifier.
       // A runner's own word for a retried test is evidence, not a label, and stays.
       expect({
@@ -479,17 +640,21 @@ describe('readLabelledLogs', () => {
     for (const [name, text] of Object.entries(logs)) writeFileSync(join(dir, 'logs', name), text);
     return dir;
   }
-  const label = (name: string): { class: string; why: string } => ({ class: name, why: 'because' });
+  const label = (name: string): { class: string; check: string; why: string } => ({
+    class: name,
+    check: 'tests',
+    why: 'because',
+  });
 
   it('reads every log with its label, in name order', async () => {
     const dir = fixture(
       { logs: { 'b.txt': label('flaky_test'), 'a.txt': label('code_defect') } },
-      { 'a.txt': 'first', 'b.txt': 'second' }
+      { 'a.txt': '$ first', 'b.txt': '$ second' }
     );
 
     expect(await readLabelledLogs(dir, CLASSES)).toEqual([
-      { name: 'a.txt', expected: 'code_defect', text: 'first' },
-      { name: 'b.txt', expected: 'flaky_test', text: 'second' },
+      { name: 'a.txt', expected: 'code_defect', check: 'tests', text: '$ first' },
+      { name: 'b.txt', expected: 'flaky_test', check: 'tests', text: '$ second' },
     ]);
   });
 
@@ -507,6 +672,18 @@ describe('readLabelledLogs', () => {
       { logs: { 'a.txt': label('code_defect'), 'gone.txt': label('flaky_test') } },
       { 'a.txt': 'x' },
       'gone.txt',
+    ],
+    [
+      'gives a log no check name',
+      { logs: { 'a.txt': { class: 'code_defect', why: 'because' } } },
+      { 'a.txt': '$ x' },
+      'a.txt has no "check" name',
+    ],
+    [
+      'labels a log that does not start with its command',
+      { logs: { 'a.txt': label('code_defect') } },
+      { 'a.txt': 'no command line' },
+      'does not start with its command',
     ],
     [
       'leaves a log unlabelled',
@@ -540,7 +717,7 @@ describe('main', () => {
         state: { evidence: string };
         questions: Record<string, unknown>;
       };
-      const log = logs.find(candidate => candidate.text.trim() === body.state.evidence.trim());
+      const log = logs.find(candidate => recordFor(candidate).trim() === body.state.evidence);
       if (log === undefined) return Promise.resolve(new Response('unknown log', { status: 400 }));
       const choice = mistake(log.expected);
       const probabilities = Object.fromEntries(

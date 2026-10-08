@@ -19,6 +19,9 @@
  * the answer key instead of a classifier: no key, nothing sent. It proves the pipeline and
  * the arithmetic, not the classifier.
  *
+ * Each log is sent the way a run sends it: as the output of a failing check inside the
+ * record the check runner writes (`validation.md`), rendered by the runner's own code.
+ *
  * What it does not measure: whether an agent that is handed the opinion makes fewer
  * unnecessary edits. That takes paired workflow runs; the pack README describes them.
  *
@@ -26,8 +29,9 @@
  *   bun run scripts/second-opinion-eval.ts [--dry] [--json] [--fixture <dir>]
  *
  * Exit codes:
- *   0  scored, and it passed: accuracy at or above the floor, and no log labelled as a
- *      dependency or environment failure classified as a code defect
+ *   0  scored, and it passed: accuracy at or above the floor overall and in every class,
+ *      and no log labelled as a dependency or environment failure classified as a code
+ *      defect
  *   1  scored, and it did not pass
  *   2  not scored: the classifier was unavailable or did not answer every log, the
  *      evaluation could not be set up (answer key, logs, workflow file), or bad usage
@@ -43,6 +47,11 @@ import {
   readOpinionSettings,
   type SecondOpinion,
 } from '../.archon/workflows/sdlc/.shared/second-opinion.ts';
+import {
+  outputTail,
+  recordedOutput,
+  renderValidationRecord,
+} from '../.archon/workflows/sdlc/.shared/validation-record.ts';
 
 export const EVAL_FIXTURE = resolve(
   import.meta.dir,
@@ -59,12 +68,25 @@ const CHECKPOINT_NODE = 'failure-class';
 export const ACCURACY_FLOOR = 0.8;
 
 /**
+ * The lowest share any one class may reach and still pass. Lower than the overall floor,
+ * because one class is a quarter of the logs and a single log moves its figure a long way.
+ * Without it a classifier could fail a whole class and pass on the strength of the rest.
+ */
+export const CLASS_ACCURACY_FLOOR = 0.7;
+
+/**
  * The mistake that fails a run whatever the accuracy: a failure the machine or a package
  * caused, called a defect in the code. It is the one that sends an agent to edit code
  * that was never wrong, which is what the checkpoint exists to prevent.
  */
 const BLAMES_CODE = 'code_defect';
 const NOT_THE_CODE: readonly string[] = ['dependency_failure', 'environment_failure'];
+/**
+ * The mistake that is reported on its own line and does not fail a run: a timing- or
+ * order-dependent test called a defect. It also sends an agent to edit correct code, but a
+ * log often cannot show that a failure is intermittent, so it is counted, not forbidden.
+ */
+const INTERMITTENT = 'flaky_test';
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -113,19 +135,48 @@ export async function readCheckpoint(workflowPath = VALIDATE_WORKFLOW): Promise<
   return { question, choices };
 }
 
-/** One seeded failure log and the class the answer key gives it. */
+/** One seeded failure log and what the answer key says about it. */
 export interface LabelledLog {
   /** File name under the fixture's `logs/` directory. */
   name: string;
   expected: string;
+  /** The name `discover` would give the check, such as `tests` or `lint`. */
+  check: string;
+  /** The log: a first line `$ <command>`, then everything the command printed. */
   text: string;
+}
+
+const COMMAND_PROMPT = '$ ';
+
+/**
+ * The log as a run would send it: the record the check runner writes for one failing
+ * check with this command and this output. Rendered by the runner's own code, so the
+ * evaluation and a run cannot drift apart.
+ */
+export function recordFor(log: LabelledLog): string {
+  const [first, ...rest] = log.text.split('\n');
+  return renderValidationRecord({
+    notes: '',
+    quarantined: [],
+    kept: [],
+    checks: [
+      {
+        name: log.check,
+        argv: [first.slice(COMMAND_PROMPT.length)],
+        outcome: { kind: 'failed', exitCode: 1, signal: null },
+        seconds: 12,
+        output: outputTail(rest.join('\n')),
+        log: 'validation/1.log',
+      },
+    ],
+  });
 }
 
 /**
  * Every log under `<fixtureDir>/logs`, labelled by `<fixtureDir>/answer-key.json`.
  *
- * The key maps each log's file name to `{ class, why }`; `why` is for whoever audits the
- * label. A key and a directory that disagree are refused before anything is spent: a log
+ * The key maps each log's file name to `{ class, check, why }`; `why` is for whoever
+ * audits the label. A key and a directory that disagree are refused before anything is spent: a log
  * with no label would silently go unmeasured, and a label with no log or with a class the
  * workflow does not offer would count as a miss forever.
  */
@@ -162,7 +213,13 @@ export async function readLabelledLogs(
           classes.join(', ')
       );
     }
-    logs.push({ name, expected, text: await Bun.file(join(logsDir, name)).text() });
+    const check = isRecord(label) && typeof label.check === 'string' ? label.check.trim() : '';
+    if (check === '') throw new Error(`${keyPath}: ${name} has no "check" name`);
+    const text = await Bun.file(join(logsDir, name)).text();
+    if (!text.startsWith(COMMAND_PROMPT)) {
+      throw new Error(`${join(logsDir, name)} does not start with its command ("$ <command>")`);
+    }
+    logs.push({ name, expected, check, text });
   }
   return logs;
 }
@@ -173,7 +230,10 @@ export interface Outcome {
   /** What the answer key says. */
   expected: string;
   opinion: SecondOpinion;
-  /** Characters in the request sent for this log: question, criteria and evidence, as JSON. */
+  /**
+   * Characters in the request for this log: question, criteria and evidence, as JSON. On a
+   * dry run it is built the same way and handed to the answer key instead of being sent.
+   */
   charsSent: number;
 }
 
@@ -212,7 +272,14 @@ export interface Score {
   misclassified: Miss[];
   /** Logs labelled as a dependency or environment failure that were called a code defect. */
   wronglyBlamedOnCode: string[];
-  /** Scored, accuracy at or above `ACCURACY_FLOOR`, and nothing wrongly blamed on code. */
+  /** Logs labelled as a timing- or order-dependent test that were called a code defect. */
+  intermittentCalledDefect: string[];
+  /** Classes whose own accuracy is under `CLASS_ACCURACY_FLOOR`. */
+  belowClassFloor: string[];
+  /**
+   * Scored, accuracy at or above `ACCURACY_FLOOR`, every class at or above
+   * `CLASS_ACCURACY_FLOOR`, and nothing wrongly blamed on code.
+   */
   pass: boolean;
 }
 
@@ -260,6 +327,10 @@ export function scoreOutcomes(classes: readonly string[], outcomes: readonly Out
   const wronglyBlamedOnCode = misclassified
     .filter(miss => miss.predicted === BLAMES_CODE && NOT_THE_CODE.includes(miss.expected))
     .map(miss => miss.log);
+  const belowClassFloor = classes.filter(name => {
+    const classAccuracy = perClass[name].accuracy;
+    return classAccuracy !== null && classAccuracy < CLASS_ACCURACY_FLOOR;
+  });
   return {
     scored,
     notScoredReason,
@@ -272,7 +343,15 @@ export function scoreOutcomes(classes: readonly string[], outcomes: readonly Out
     charsSent: outcomes.reduce((sum, outcome) => sum + outcome.charsSent, 0),
     misclassified,
     wronglyBlamedOnCode,
-    pass: accuracy !== null && accuracy >= ACCURACY_FLOOR && wronglyBlamedOnCode.length === 0,
+    intermittentCalledDefect: misclassified
+      .filter(miss => miss.predicted === BLAMES_CODE && miss.expected === INTERMITTENT)
+      .map(miss => miss.log),
+    belowClassFloor,
+    pass:
+      accuracy !== null &&
+      accuracy >= ACCURACY_FLOOR &&
+      belowClassFloor.length === 0 &&
+      wronglyBlamedOnCode.length === 0,
   };
 }
 
@@ -369,7 +448,8 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
     const opinion = await askSecondOpinion({
       question: run.checkpoint.question,
       choices: run.checkpoint.choices,
-      evidence: { text: log.text },
+      evidence: { text: recordFor(log) },
+      judged: recordedOutput,
       env,
       fetch: counting,
     });
@@ -377,6 +457,14 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
     if (opinion.status !== 'ok') break;
   }
   return report(scoreOutcomes(classes, outcomes));
+}
+
+/** A dry run builds every request and sends none, and must not read as if it had. */
+function sentLine(report: EvalReport): string {
+  const size = `${report.charsSent.toLocaleString('en-US')} characters in ${String(report.answered)} requests`;
+  return report.dry
+    ? `sent:       nothing (dry run; a live run would send ${size})`
+    : `sent:       ${size}`;
 }
 
 function ratio(value: number | null): string {
@@ -413,7 +501,7 @@ export function formatReport(report: EvalReport): string {
   lines.push(
     `accuracy:   ${ratio(report.accuracy)}  (${String(report.correct)} of ${String(report.answered)} logs classified as labelled)`,
     `confidence: ${ratio(report.meanConfidence)}  (mean over ${String(report.answered)} answers)`,
-    `sent:       ${report.charsSent.toLocaleString('en-US')} characters in ${String(report.answered)} requests`,
+    sentLine(report),
     '',
     'per class:'
   );
@@ -436,23 +524,36 @@ export function formatReport(report: EvalReport): string {
       `  ${miss.log}: labelled ${miss.expected}, classified ${miss.predicted} (${miss.confidence.toFixed(2)})`
     );
   }
+  // Reported whether or not the run passes: each one is an agent sent to edit correct code.
+  const intermittent = report.intermittentCalledDefect;
+  lines.push(
+    '',
+    `${INTERMITTENT} classified ${BLAMES_CODE}: ${String(intermittent.length)}` +
+      (intermittent.length === 0 ? '' : ` (${intermittent.join(', ')})`) +
+      '  (counted, does not fail the run)'
+  );
   lines.push('');
 
   const accuracy = ratio(report.accuracy);
   const blamed = report.wronglyBlamedOnCode.length;
   if (report.pass) {
     lines.push(
-      `${result} PASS. Accuracy ${accuracy}, at or above the floor of ${ACCURACY_FLOOR.toFixed(2)}, and no ` +
-        `${NOT_THE_CODE.join(' or ')} log was classified ${BLAMES_CODE}.`
+      `${result} PASS. Accuracy ${accuracy}, at or above the floor of ${ACCURACY_FLOOR.toFixed(2)}, every class at or ` +
+        `above ${CLASS_ACCURACY_FLOOR.toFixed(2)}, and no ${NOT_THE_CODE.join(' or ')} log was classified ${BLAMES_CODE}.`
     );
   } else if (blamed > 0) {
     lines.push(
       `${result} FAIL. ${String(blamed)} log(s) labelled ${NOT_THE_CODE.join(' or ')} were classified ` +
         `${BLAMES_CODE}: ${report.wronglyBlamedOnCode.join(', ')}. Accuracy ${accuracy}.`
     );
-  } else {
+  } else if (report.accuracy !== null && report.accuracy < ACCURACY_FLOOR) {
     lines.push(
       `${result} FAIL. Accuracy ${accuracy} is below the floor of ${ACCURACY_FLOOR.toFixed(2)}.`
+    );
+  } else {
+    lines.push(
+      `${result} FAIL. Accuracy ${accuracy}, but ${report.belowClassFloor.join(', ')} is below the ` +
+        `per-class floor of ${CLASS_ACCURACY_FLOOR.toFixed(2)}.`
     );
   }
   return lines.join('\n');

@@ -19,8 +19,8 @@ repository ignores `*.log`:
   environment variable, a full disk, a denied permission, a process killed for
   memory, an unreachable registry.
 
-`answer-key.json` gives every log its class and one line saying why, so a label
-can be audited without rereading the log. A log with no label, a label with no
+`answer-key.json` gives every log its class, the name its check would have, and
+one line saying why, so a label can be audited without rereading the log. A log with no label, a label with no
 log, and a class the workflow does not offer each fail the run before anything is
 sent, so the key cannot drift from the directory or from the workflow.
 
@@ -30,11 +30,12 @@ replaces the classifier with the answer key and needs no key or network. See
 
 ## What these logs are and are not
 
-Every log is at most sixty lines, the length of the output tail `validation.md`
-records for a failing check, and each is sent whole as text. A real run sends the
-tail of `validation.md` itself, which wraps that output in a few lines of
-Markdown: the check's name, its command and its exit status. The evaluation does
-not reproduce that wrapper.
+Every log is a first line `$ <command>` and then at most sixty lines of output,
+the length of the output tail `validation.md` records for a failing check. The
+evaluation sends each one as a run would: as the output of one failing check,
+inside the record the check runner's own code renders, under the check name
+`answer-key.json` gives it. A real record can also hold checks that passed
+before the failing one and checks that never ran after it; these hold one.
 
 Each log holds what the command itself printed and nothing added afterwards: no
 diagnosis, no shell commands run after the failure, no note about earlier runs.
