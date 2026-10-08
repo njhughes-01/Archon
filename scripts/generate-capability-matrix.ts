@@ -111,6 +111,37 @@ const CAVEATS: readonly { provider: string; key: keyof ProviderCapabilities; not
       'Wired from the SDK typings and not yet verified against a running OpenCode; a server ' +
       'that answers without the rule is logged as `opencode.file_write_restriction_unconfirmed`.',
   },
+  {
+    provider: 'claude',
+    key: 'toolActionGate',
+    note:
+      'Through a `PreToolUse` hook that answers `deny`. Verified with real runs: a denied call ' +
+      'does not run and its reason reaches the model.',
+  },
+  {
+    provider: 'codex',
+    key: 'toolActionGate',
+    note:
+      "Through Codex's `PreToolUse` command hook, on macOS and Linux only and with Codex CLI " +
+      '0.157.0 or newer. A gated turn runs without TTY sessions, and with hooks forced on under ' +
+      "the trust bypass, so the user's own configured hooks run too. Hosted tools (web search) " +
+      'never reach the hook. If Codex does not run the hook, the turn is stopped at the first ' +
+      'tool call with `codex_tool_gate_inactive`.',
+  },
+  {
+    provider: 'pi',
+    key: 'toolActionGate',
+    note:
+      "Every tool Archon builds for the turn is wrapped. Tools from the user's own Pi extensions " +
+      "are not, and with the gate on the built tool set replaces the user's `defaultTools`.",
+  },
+  {
+    provider: 'copilot',
+    key: 'toolActionGate',
+    note:
+      'Through the `onPreToolUse` hook. Verified against the SDK typings and the runtime bundle ' +
+      'only, not with a real run.',
+  },
 ];
 
 /**

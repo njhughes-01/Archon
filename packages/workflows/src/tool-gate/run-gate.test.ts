@@ -17,6 +17,7 @@ import {
   assertProviderHonoursToolGate,
   createRunToolGate,
   emptyToolGateRoot,
+  providerHonoursToolGate,
   workflowToolGateRecorder,
   type RunToolGateInput,
 } from './run-gate';
@@ -377,6 +378,16 @@ describe('assertProviderHonoursToolGate', () => {
     expect(() => {
       assertProviderHonoursToolGate(ON, 'some-provider', capabilities);
     }).toThrow(/provider 'some-provider'.*toolActionGate/s);
+  });
+
+  test('providerHonoursToolGate answers the same question without throwing', () => {
+    expect(providerHonoursToolGate(undefined, {})).toBe(true);
+    expect(providerHonoursToolGate({ ...ON, enabled: false }, { toolActionGate: false })).toBe(
+      true
+    );
+    expect(providerHonoursToolGate(ON, { toolActionGate: true })).toBe(true);
+    expect(providerHonoursToolGate(ON, { toolActionGate: false })).toBe(false);
+    expect(providerHonoursToolGate(ON, {})).toBe(false);
   });
 
   test('the refusal says both ways out: another provider, or how to switch the gate off', () => {

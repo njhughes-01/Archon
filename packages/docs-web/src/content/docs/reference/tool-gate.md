@@ -58,7 +58,7 @@ A chat that is not scoped to a project works in the workspaces directory, which 
 - the fixed deny rules apply as usual;
 - every shell command is flagged (`risk.cwd_outside_root`), because none runs inside the root. With no classifier it runs and is recorded as `fallback`; with one, each distinct command is one classifier request per turn.
 
-Adding a project from such a chat (a `git clone` into the workspaces directory) is therefore not something to rely on while the gate is on: the clone is flagged at best and denied as a write at worst, and the denial tells the agent what to pass on. Clone the repository in a terminal and register it with `/register-project <name> <path>` or **Add Project** in the web console, or switch the gate off for the setup. Neither `/register-project` nor `/setproject` is a tool call, so the gate does not affect them.
+Adding a project from such a chat does not work while the gate is on: the target of the `git clone` is a write, and nothing is writable, so the clone is denied (`deny.path_outside_root`). The denial tells the agent what to pass on. Clone the repository in a terminal and register it with `/register-project <name> <path>` or **Add Project** in the web console, or switch the gate off for the setup. Neither `/register-project` nor `/setproject` is a tool call, so the gate does not affect them.
 
 The rules run in a fixed order. A script is judged command by command and the worst verdict wins, so `git status && rm -rf /` is denied.
 
@@ -68,18 +68,18 @@ No classifier can lower one of these.
 
 | Rule | What it stops |
 | --- | --- |
-| `deny.path_outside_root` | A write, move or removal that resolves outside the checkout and the run's own directories |
-| `deny.path_unresolvable` | A target the gate cannot place: a symlink loop, a path through a file, an unreadable directory |
-| `deny.rm_recursive_root` | Recursive removal of `/`, the home directory, `.`, `..`, the checkout or a run directory itself, or a bare glob in one of them |
+| `deny.path_outside_root` | A write, move or removal that resolves outside the checkout and the run's own directories. The target of a `git clone` or `git worktree add` counts as a write |
+| `deny.path_unresolvable` | A target the gate cannot place: a symlink loop, a path through a file, an unreadable directory, a path relative to a running process (`/proc/self/cwd/...`) |
+| `deny.rm_recursive_root` | Recursive removal of `/`, the home directory, the checkout, its `.git`, its parent or a run directory itself, or a bare glob in one of them |
 | `deny.git_force_push` | `git push` with the force flag, a `+refspec`, or `--mirror` |
-| `deny.git_force_push_protected` | `git push --force-with-lease` onto a protected branch, or without naming its branch literally |
+| `deny.git_force_push_protected` | A push that rewrites or deletes a protected branch, and a `--force-with-lease` push whose branch cannot be read from the command or the checkout. A lease push of the checked-out, unprotected branch (bare, or `origin HEAD`) is not denied |
 | `deny.git_reset_hard` | `git reset --hard` |
-| `deny.git_clean_force` | `git clean` that removes untracked directories |
-| `deny.secret_write` | A write to an env file, a key or a credential store (`.env*`, `*.pem`, `~/.ssh`, `credentials.*`, `.npmrc`, ...), or to a credential file Archon delivered for the run |
-| `deny.secret_read` | Printing the contents of such a file (`cat .env`) |
-| `deny.secret_exfiltration` | Sending the environment or a secret file to a network client (`printenv \| curl ...`, `scp .env host:`) |
-| `deny.pipe_to_shell` | Downloading a script and running it in the same step (`curl ... \| sh`) |
-| `deny.unreadable_request` | A call that reached the gate without its command text, write target or working directory |
+| `deny.git_clean_force` | `git clean` that deletes untracked files or directories (a dry run is not denied) |
+| `deny.secret_write` | A write to an env file, a key or a credential store (`.env*`, `*.pem`, `~/.ssh`, `credentials.*`, `.npmrc`, provider login files, ...), or to a credential file Archon delivered for the run. Templates such as `.env.example` are not secrets |
+| `deny.secret_read` | Reading, copying, loading or printing such a file (`cat .env`, `cp .env copy.txt`, `source .env`), by any command that does more than look at its metadata |
+| `deny.secret_exfiltration` | Sending the environment or a secret file off the machine, or into a program that can (`printenv \| curl ...`, `scp .env host:`, `curl -F f=@id_rsa ...`) |
+| `deny.pipe_to_shell` | Downloading a script and running it in the same step (`curl ... \| sh`, `bash <(curl ...)`, download-then-run), with any fetcher and any shell or interpreter on the receiving end |
+| `deny.unreadable_request` | A call that reached the gate without its command text, write target, a known kind or an absolute working directory |
 
 ### 2. Flagged: the escalation band
 
@@ -87,12 +87,13 @@ A risk signal does not deny a call. It marks it as one the rules cannot settle.
 
 | Signal | What raises it |
 | --- | --- |
-| `risk.mutation_verb` | `rm`, `mv`, `dd`, `shred`, `docker`, `podman`, `kubectl`, `psql`, `mysql`, `mongosh`, `sudo`, `mkfs*`, recursive `chmod`/`chown`, `git push`, `git rebase`, `git branch -D`, `git tag -d`, a package `publish`, and `gh` commands that change something (`create`, `merge`, `close`, `delete`, `comment`, `edit`, ...) |
+| `risk.mutation_verb` | `rm`, `mv`, `dd`, `shred`, `docker`, `podman`, `kubectl`, `psql`, `mysql`, `mongosh`, `sudo`, `mkfs*`, recursive `chmod`/`chown`, `git push`, `git rebase`, `git branch -D`, `git tag -d`, `git rm`, git commands that discard work (`checkout -- .`, `restore .`, `stash drop`, ...), `rsync --delete`, a package `publish`, and `gh` commands that change something on GitHub (`create`, `merge`, `close`, `delete`, `comment`, `edit`, `run`, `cancel`, `archive`, ...) |
 | `risk.network_request` | A network client with a method or a body (`curl -X POST`, `wget --post-data`, `gh api -f ...`), and remote clients such as `ssh` and `scp` |
 | `risk.kind_network` / `risk.kind_mcp` | Any network tool or MCP tool call |
+| `risk.environment_dump` | Printing the whole environment to the agent (`env`, `printenv`, `set`, `export -p`, `declare -p`). Sending it anywhere is a denial, above |
 | `risk.secret_path_argument` | A secret-shaped path handed to a command that does not print it |
 | `risk.cwd_outside_root` | A working directory, `cd` or `git -C` outside the checkout |
-| `risk.opaque_shell` | Text the gate cannot read: `$(...)`, backticks, `eval`, `bash -c` strings, heredocs fed to an interpreter, `find -exec`, a variable or glob where a target should be |
+| `risk.opaque_shell` | Text the gate cannot read: `$(...)`, backticks, `eval`, `bash -c` strings, heredocs fed to an interpreter, `find -exec`, a variable or glob where a target should be, a variable prefix that makes a read-only command run something (`GIT_EXTERNAL_DIFF=...`, `PAGER=...`). Where the hidden text is a literal it is read too, so a destructive command inside is still denied |
 
 What happens to a flagged call depends on the classifier:
 
@@ -152,12 +153,12 @@ Identical calls made at the same moment are judged once and produce one record, 
 The gate reads a tool call's text. It does not run a shell, and it is not told what a tool does after it starts.
 
 - **A script written and then run.** `./run.sh`, `bash run.sh`, `source x`. The write is judged; what the script does is not.
-- **Interpreter programs.** `python -c`, `node -e`, `perl -e`. The program text is never read.
+- **Interpreter programs.** In `python -c`, `node -e` or `perl -e` code the gate looks only for quoted shell strings and secret paths. Anything else the program does (a file write, a spawn, a network call) is unseen.
 - **Indirection.** `make`, package scripts (`bun run build`), git hooks, and aliases or functions from the user's shell or git config.
 - **Run-time values.** What a variable, a glob, brace expansion or an `xargs` input becomes. A destructive flag kept in a variable is at best flagged, never denied.
-- **Unknown wrappers and unmodelled syntax.** A wrapper the reader does not know hides the command it runs. `case` patterns, extended globs and non-POSIX shells (PowerShell, cmd) mostly match nothing.
+- **Unmodelled syntax.** `case` patterns, extended globs, `[[ ]]` internals and non-POSIX shells (PowerShell, cmd) mostly match nothing. A destructive command behind a wrapper the gate does not know is still found, but nothing else about what that wrapper does is.
 - **MCP tools.** The gate sees the tool's name and input, not what the server does with them. Without a classifier every MCP call is allowed.
-- **Provider gaps.** Which of a provider's tools reach the gate is that provider's translation. Tools from user-owned Pi extensions are not wrapped. See the caveats in the [Provider Capability Matrix](/reference/provider-capabilities/).
+- **Provider gaps.** Which of a provider's tools reach the gate is that provider's translation, and each has limits of its own. They are the *Tool action gate* caveats in the [Provider Capability Matrix](/reference/provider-capabilities/).
 - **Reads outside the checkout.** Only writes are held to the root. A read anywhere is allowed unless the path is secret-shaped.
 - **Scratch files in `/tmp`.** These are denied like any other write outside the root. Agents should use `$ARTIFACTS_DIR`.
 

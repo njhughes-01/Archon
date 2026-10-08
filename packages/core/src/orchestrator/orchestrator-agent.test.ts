@@ -12,7 +12,7 @@
  * Mock setup MUST occur before any import of the module under test.
  */
 
-import { mock, describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdir, mkdtemp, realpath, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -7241,26 +7241,18 @@ describe('chat turn tool gate', () => {
       });
     });
 
-    test('gate on: a clone the gate does not let through is denied with the way to add a project', async () => {
-      // Whichever way it is stopped (the classifier here; a write rule would do the
-      // same), the agent is told what the user can do instead.
-      process.env.JEV_API_KEY = 'test-key';
-      const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () =>
-        Response.json({
-          answers: {
-            risk: { type: 'score', score: 2.4, probabilities: { '0': 1 }, confidence: 0.9 },
-            external_state: { type: 'noul', noul: 0.2 },
-          },
-        })) as unknown as typeof fetch);
-      try {
-        const gate = await gateOfTurn();
-        const clone = `git clone https://github.com/acme/widgets ${join(workspaces, 'acme', 'widgets', 'source')}`;
-        const decision = await gate(from(shell(clone)));
-        expect(decision.action).toBe('deny');
+    test('gate on: cloning a new project is denied as a write, with the way to add one instead', async () => {
+      // A clone's target is a write target, and here nothing is writable.
+      const target = join(workspaces, 'acme', 'widgets', 'source');
+      for (const command of [
+        `git clone https://github.com/acme/widgets ${target}`,
+        `cd ${workspaces} && git clone https://github.com/acme/widgets acme/widgets/source`,
+      ]) {
+        const decision = await (await gateOfTurn())(from(shell(command)));
+        expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.path_outside_root' });
         if (decision.action !== 'deny') throw new Error('unreachable');
         expect(decision.reason).toContain(SETUP_ADVICE);
-      } finally {
-        fetchSpy.mockRestore();
+        expect(decision.reason).toContain('switch the gate off');
       }
     });
   });

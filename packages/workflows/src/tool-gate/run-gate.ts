@@ -171,6 +171,18 @@ export async function emptyToolGateRoot(): Promise<string> {
 }
 
 /**
+ * Whether a provider may run a step under this config: always when the gate is
+ * off, and only with the `toolActionGate` capability when it is on. The
+ * question a caller choosing between providers asks before it picks one.
+ */
+export function providerHonoursToolGate(
+  config: ToolGateConfig | undefined,
+  capabilities: Pick<ProviderCapabilities, 'toolActionGate'>
+): boolean {
+  return config?.enabled !== true || capabilities.toolActionGate === true;
+}
+
+/**
  * Refuses a provider that would run tools without asking while the gate is on.
  * Called where a step is dispatched, with the provider it resolved to.
  */
@@ -179,7 +191,7 @@ export function assertProviderHonoursToolGate(
   provider: string,
   capabilities: Pick<ProviderCapabilities, 'toolActionGate'>
 ): void {
-  if (config?.enabled !== true || capabilities.toolActionGate === true) return;
+  if (providerHonoursToolGate(config, capabilities)) return;
   throw new Error(
     `The tool gate is on, but provider '${provider}' cannot ask it before running a tool ` +
       '(toolActionGate capability), so its tool calls would run unchecked. Either run this on a ' +

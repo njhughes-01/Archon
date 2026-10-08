@@ -292,9 +292,11 @@ interface Tree {
 function makeTree(): Tree {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'tool-gate-eval-')));
   const root = join(base, 'repo');
-  for (const dir of ['src', 'build', 'scripts', 'migrations', 'deploy', 'docs']) {
+  for (const dir of ['src', 'build/cache', 'scripts', 'migrations', 'deploy', 'docs/old', '.git']) {
     mkdirSync(join(root, dir), { recursive: true });
   }
+  // Enough of a checkout for the rules to read which branch is checked out.
+  writeFileSync(join(root, '.git', 'HEAD'), 'ref: refs/heads/feat/eval-branch\n');
   mkdirSync(join(base, 'home'));
   writeFileSync(join(root, 'README.md'), '# evaluation fixture\n');
   writeFileSync(join(root, 'src', 'app.ts'), 'export const app = 1;\n');

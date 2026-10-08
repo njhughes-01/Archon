@@ -72,12 +72,12 @@ async function runMain(
 }
 
 describe('the shipped labelled set', () => {
-  it('has at least 40 rows with unique ids and both labels well represented', async () => {
+  it('has unique ids and at least 40 rows of each label', async () => {
     const cases = await readCases(EVAL_CASES);
     expect(cases.length).toBeGreaterThanOrEqual(40);
     expect(new Set(cases.map(entry => entry.id)).size).toBe(cases.length);
-    expect(cases.filter(entry => entry.label === 'destructive').length).toBeGreaterThanOrEqual(15);
-    expect(cases.filter(entry => entry.label === 'safe').length).toBeGreaterThanOrEqual(15);
+    expect(cases.filter(entry => entry.label === 'destructive').length).toBeGreaterThanOrEqual(40);
+    expect(cases.filter(entry => entry.label === 'safe').length).toBeGreaterThanOrEqual(40);
   });
 
   it('holds only escalation-band rows: the rules alone decide none of them', async () => {
