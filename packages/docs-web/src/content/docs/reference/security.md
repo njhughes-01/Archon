@@ -52,6 +52,10 @@ nodes:
 - These are mutually exclusive per node. If both are set, `allowed_tools` takes precedence.
 - Tool restrictions are currently supported for the Claude provider only. Codex nodes with `denied_tools` will log a warning; `allowed_tools` is not supported by the Codex SDK.
 
+## Tool Action Gate
+
+Tool restrictions decide which tools a node has. The [Tool Action Gate](/reference/tool-gate/) decides what a tool call may do: with `toolGate.enabled: true` in config, every state-changing tool call of a workflow agent or chat turn is checked against fixed rules before it runs (writes outside the checkout, forced pushes, hard resets, recursive removal of a root, secret files, download-and-run), and an optional classifier judges the calls the rules could only flag. It is off by default, and it is defence in depth rather than a sandbox: it reads the text of a call and cannot see what a script or an MCP tool does once it runs.
+
 ## Data Privacy and Logging
 
 Archon uses structured logging (Pino) with explicit rules about what is and is not recorded.
