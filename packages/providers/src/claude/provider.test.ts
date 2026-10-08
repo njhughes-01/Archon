@@ -3096,6 +3096,27 @@ describe('sendQuery decomposition behaviors', () => {
       expect(options.tools).toEqual([]);
     });
 
+    test('a direct-chat denial reaches the SDK as disallowedTools and stays a chat call', async () => {
+      // Direct chat sends `denied_tools` with no nodeId so the agent cannot
+      // write files itself. The denial has to arrive, and it must not turn the
+      // call into a workflow node (which would strip ambient skills and MCP).
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('chat', workflowCwd, undefined, {
+        nodeConfig: { denied_tools: ['Write', 'Edit', 'NotebookEdit'], effort: 'high' },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.disallowedTools).toEqual(['Write', 'Edit', 'NotebookEdit']);
+      expect(options.tools).toBeUndefined();
+      expect(options.skills).toBeUndefined();
+      expect(options.strictMcpConfig).toBeUndefined();
+    });
+
     test('does not grant Skill to a non-workflow call that carries skills', async () => {
       // The `options.skills` narrowing is gated on the workflow path. Granting
       // the Skill tool outside that gate would expose the whole ambient catalog

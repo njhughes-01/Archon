@@ -30,7 +30,11 @@ import type { Session } from '../schemas/session';
 import type { WorkflowDefinition } from '@archon/workflows/schemas/workflow';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import { toBranchName } from '@archon/git';
-import type { IAgentProvider, ProviderCapabilities } from '@archon/providers/types';
+import type {
+  IAgentProvider,
+  ProviderCapabilities,
+  SendQueryOptions,
+} from '@archon/providers/types';
 import type * as Git from '@archon/git';
 import type * as ConfigLoader from '../config/config-loader';
 import type * as ConversationDb from '../db/conversations';
@@ -50,6 +54,7 @@ import type * as UserProviderKeyStore from '../db/user-provider-key-store';
 import type * as Paths from '@archon/paths';
 import type * as RunLiveOwnerModule from '../services/run-live-owner';
 import { captureWorkflowSource } from '../../../workflows/src/workflow-source';
+import { CLAUDE_CAPABILITIES } from '../../../providers/src/claude/capabilities';
 import { trackTempRoots } from '@archon/paths/test-utils';
 
 const trackTempRoot = trackTempRoots();
@@ -1102,6 +1107,98 @@ describe('parseOrchestratorCommands', () => {
 
       // findWorkflow does exact match, so 'assist' must match workflow.name === 'assist'
       expect(result.workflowInvocation?.workflowName).toBe('assist');
+    });
+  });
+
+  // ─── /invoke-workflow lines that start nothing ───────────────────────────────
+
+  describe('failed /invoke-workflow lines', () => {
+    test('reports a line without --project as malformed', () => {
+      const result = parseOrchestratorCommands(
+        "I'll fix that.\n\n/invoke-workflow assist",
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocation).toBeNull();
+      expect(result.workflowInvocationFailure).toEqual({
+        reason: 'malformed',
+        precedingText: "I'll fix that.",
+      });
+    });
+
+    test('reports --prompt before --project as malformed (the parser needs --project first)', () => {
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow assist --prompt "do it" --project my-project',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure).toEqual({ reason: 'malformed', precedingText: '' });
+    });
+
+    test('reports an unknown workflow with the name the agent wrote', () => {
+      const result = parseOrchestratorCommands(
+        'Starting it now.\n/invoke-workflow nonexistent-workflow --project my-project --prompt "x"',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocation).toBeNull();
+      expect(result.workflowInvocationFailure).toEqual({
+        reason: 'unknown_workflow',
+        workflowName: 'nonexistent-workflow',
+        precedingText: 'Starting it now.',
+      });
+    });
+
+    test('reports an unknown project with the name the agent wrote', () => {
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow assist --project nonexistent-project',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocation).toBeNull();
+      expect(result.workflowInvocationFailure).toEqual({
+        reason: 'unknown_project',
+        workflowName: 'assist',
+        projectName: 'nonexistent-project',
+        precedingText: '',
+      });
+    });
+
+    test('a bold-wrapped failing line is still reported', () => {
+      const result = parseOrchestratorCommands(
+        '**/invoke-workflow nonexistent-workflow --project my-project**',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure?.reason).toBe('unknown_workflow');
+    });
+
+    test('no failure when the command starts a workflow', () => {
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow assist --project my-project',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocation).not.toBeNull();
+      expect(result.workflowInvocationFailure).toBeNull();
+    });
+
+    test('no failure when the reply has no line starting with /invoke-workflow', () => {
+      // A mid-line mention is prose, not a command the agent tried to run.
+      for (const response of [
+        'Here is my answer.',
+        'You can type /invoke-workflow assist --project my-project yourself.',
+        '/invoke-workflo assist --project my-project',
+      ]) {
+        const result = parseOrchestratorCommands(response, codebases, workflows);
+        expect(result.workflowInvocationFailure).toBeNull();
+      }
     });
   });
 
@@ -5239,6 +5336,184 @@ describe('handleMessage — multi-chunk command accumulation (regression)', () =
   });
 });
 
+// ─── /invoke-workflow that starts nothing: the user is told, never left guessing ──
+
+describe('handleMessage — /invoke-workflow that starts nothing', () => {
+  const INVOKE_FAILED_EVENT = 'orchestrator.workflow_invoke_failed';
+
+  beforeEach(() => {
+    mockSendQuery.mockReset();
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockListCodebases.mockImplementation(() =>
+      Promise.resolve([makeNamedCodebase('my-project'), makeNamedCodebase('other-project')])
+    );
+    mockDiscoverWorkflowsWithConfig.mockReset();
+    mockDiscoverWorkflowsWithConfig.mockImplementation(() =>
+      Promise.resolve({ workflows: [makeTestWorkflowWithSource({ name: 'assist' })], errors: [] })
+    );
+    mockDispatchBackgroundWorkflow.mockClear();
+    mockExecuteWorkflow.mockClear();
+    mockGetRecentWorkflowResultMessages.mockReset();
+    mockGetRecentWorkflowResultMessages.mockImplementation(() => Promise.resolve([]));
+    mockLoadConfig.mockReset();
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
+    mockGetPausedWorkflowRun.mockReset();
+    mockGetPausedWorkflowRun.mockImplementation(() => Promise.resolve(null));
+    mockFindResumableRunByParentConversation.mockReset();
+    mockFindResumableRunByParentConversation.mockImplementation(() => Promise.resolve(null));
+    mockParseCommand.mockReset();
+    mockAddMessage.mockReset();
+    mockAddMessage.mockImplementation((conversationId, role, content) =>
+      Promise.resolve(makeMessage({ conversation_id: conversationId, role, content }))
+    );
+    mockCaptureChatTurn.mockClear();
+    mockLogger.warn.mockClear();
+  });
+
+  async function runTurn(
+    mode: 'batch' | 'stream',
+    chunks: string[],
+    platformType = 'web'
+  ): Promise<{ sent: string[]; platform: ReturnType<typeof makePlatform> }> {
+    mockSendQuery.mockImplementationOnce(async function* () {
+      for (const content of chunks) yield { type: 'assistant', content };
+      yield { type: 'result', sessionId: 'sess-1' };
+    });
+    const platform = makePlatform();
+    (platform.getStreamingMode as ReturnType<typeof mock>).mockReturnValue(mode);
+    (platform.getPlatformType as ReturnType<typeof mock>).mockReturnValue(platformType);
+    await handleMessage(platform, 'conv-1', 'please fix the login bug');
+    const calls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as unknown as [
+      string,
+      string,
+    ][];
+    return { sent: calls.map(([, text]) => text), platform };
+  }
+
+  function failureLog(): Record<string, unknown> | undefined {
+    const call = mockLogger.warn.mock.calls.find(c => c[1] === INVOKE_FAILED_EVENT) as
+      | [Record<string, unknown>, string]
+      | undefined;
+    return call?.[0];
+  }
+
+  const cases: {
+    name: string;
+    command: string;
+    reason: string;
+    notice: string;
+  }[] = [
+    {
+      name: 'missing --project',
+      command: '/invoke-workflow assist --prompt "Fix the login bug"',
+      reason: 'malformed',
+      notice:
+        'Workflow not started: the launch command was malformed (it needs a workflow name, then --project <name>). Nothing ran — please ask again.',
+    },
+    {
+      name: 'unknown workflow',
+      command: '/invoke-workflow fix-everything --project my-project --prompt "Fix the login bug"',
+      reason: 'unknown_workflow',
+      notice:
+        'Workflow not started: there is no workflow named "fix-everything". Use `/workflow list` to see the available workflows.',
+    },
+    {
+      name: 'unknown project',
+      command: '/invoke-workflow assist --project ghost-project --prompt "Fix the login bug"',
+      reason: 'unknown_project',
+      notice:
+        'Workflow not started: no registered project matches "ghost-project". Registered projects: my-project, other-project.',
+    },
+  ];
+
+  for (const { name, command, reason, notice } of cases) {
+    test(`batch mode — ${name}: one-line notice replaces the raw command`, async () => {
+      const { sent } = await runTurn('batch', [`I'll get that fixed.\n\n${command}`]);
+
+      // The explanation survives; the command line that did nothing does not.
+      expect(sent).toEqual([`I'll get that fixed.\n\n${notice}`]);
+      expect(notice).not.toContain('\n');
+      expect(sent.some(text => text.includes('/invoke-workflow'))).toBe(false);
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      expect(failureLog()).toMatchObject({ conversationId: 'conv-1', reason });
+    });
+
+    test(`stream mode — ${name}: the notice arrives as an extra message`, async () => {
+      const { sent } = await runTurn('stream', ["I'll get that fixed.\n\n", command]);
+
+      // The first chunk was already streamed; the command chunk never was, so the
+      // notice is the only thing left to say.
+      expect(sent).toEqual(["I'll get that fixed.\n\n", notice]);
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+      expect(mockExecuteWorkflow).not.toHaveBeenCalled();
+      expect(failureLog()).toMatchObject({ conversationId: 'conv-1', reason });
+    });
+  }
+
+  test('the warn event names the workflow and project but never the prompt text', async () => {
+    await runTurn('batch', [
+      '/invoke-workflow fix-everything --project my-project --prompt "Fix the login bug"',
+    ]);
+
+    expect(failureLog()).toEqual({
+      conversationId: 'conv-1',
+      reason: 'unknown_workflow',
+      workflowName: 'fix-everything',
+    });
+    expect(JSON.stringify(mockLogger.warn.mock.calls)).not.toContain('Fix the login bug');
+  });
+
+  test('a reply that is only a failing command still tells the user (stream, single chunk)', async () => {
+    // Before the fix this turn delivered nothing at all: the command chunk is
+    // withheld from the stream and the unparsed command was then dropped.
+    const { sent } = await runTurn('stream', [
+      '/invoke-workflow assist --project ghost-project --prompt "Fix the login bug"',
+    ]);
+
+    expect(sent).toEqual([
+      'Workflow not started: no registered project matches "ghost-project". Registered projects: my-project, other-project.',
+    ]);
+  });
+
+  test('batch mode persists what was delivered, not the raw command (non-web)', async () => {
+    await runTurn('batch', ["I'll get that fixed.\n\n/invoke-workflow assist"], 'github');
+
+    const assistantRow = mockAddMessage.mock.calls.find(c => c[1] === 'assistant');
+    expect(assistantRow?.[2]).toContain('Workflow not started');
+    expect(assistantRow?.[2]).not.toContain('/invoke-workflow');
+  });
+
+  test('stream mode persists the streamed text plus the notice (non-web)', async () => {
+    await runTurn('stream', ["I'll get that fixed.\n\n", '/invoke-workflow assist'], 'telegram');
+
+    const assistantRow = mockAddMessage.mock.calls.find(c => c[1] === 'assistant');
+    expect(assistantRow?.[2]).toStartWith("I'll get that fixed.");
+    expect(assistantRow?.[2]).toContain('Workflow not started');
+    expect(assistantRow?.[2]).not.toContain('/invoke-workflow');
+  });
+
+  test('the turn is still counted once as a completed chat turn', async () => {
+    await runTurn('batch', ['/invoke-workflow assist']);
+
+    expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
+    expect(mockCaptureChatTurn.mock.calls[0]?.[0]).toMatchObject({ outcome: 'completed' });
+  });
+
+  test('a valid command is unaffected — it dispatches and logs no failure', async () => {
+    const { sent } = await runTurn('batch', [
+      'On it.\n\n/invoke-workflow assist --project my-project --prompt "Fix the login bug"',
+    ]);
+
+    expect(mockDispatchBackgroundWorkflow).toHaveBeenCalled();
+    expect(failureLog()).toBeUndefined();
+    expect(sent.some(text => text.includes('Workflow not started'))).toBe(false);
+  });
+});
+
 // ─── resolveUserProviderEnvForChat — per-user credential injection ────────────
 
 describe('resolveUserProviderEnvForChat — chat env injection', () => {
@@ -6219,6 +6494,190 @@ describe('per-user AI prefs in chat + tier-fallback nudge', () => {
   });
 });
 
+// ─── Chat turns cannot write files: chat talks, workflows build ───────────────
+
+describe('chat turn tool restriction', () => {
+  // The real Claude vocabulary rather than a copy: if an SDK bump renames one of
+  // the denied tools, the provider's audited list changes and this suite fails
+  // instead of the denial quietly shrinking.
+  const claudeLikeCaps: ProviderCapabilities = {
+    ...DEFAULT_PROVIDER_CAPS,
+    toolRestrictions: true,
+    knownToolNames: CLAUDE_CAPABILITIES.knownToolNames,
+  };
+  let capsMock: ReturnType<typeof mock>;
+
+  beforeEach(async () => {
+    const providers = await import('@archon/providers');
+    capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+    mockGetOrCreateConversation.mockReset();
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+    mockLoadConfig.mockReset();
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
+    mockGetUserAiPrefsDb.mockReset();
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
+    mockParseCommand.mockReturnValue({ command: '', args: [] });
+    mockGenerateAndSetTitle.mockClear();
+  });
+
+  afterEach(() => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+  });
+
+  async function chatRequestOptions(): Promise<SendQueryOptions> {
+    await handleMessage(makePlatform(), 'conv-1', 'Hello');
+    return mockSendQuery.mock.calls[0][3] as SendQueryOptions;
+  }
+
+  test('a Claude chat turn runs with the file-writing tools denied and Bash kept', async () => {
+    capsMock.mockReturnValue(claudeLikeCaps);
+
+    const options = await chatRequestOptions();
+
+    expect(options.nodeConfig?.denied_tools).toEqual(['Write', 'Edit', 'NotebookEdit']);
+    // Project setup clones with Bash and research reads with it.
+    expect(options.nodeConfig?.denied_tools).not.toContain('Bash');
+    // No nodeId: the turn must not be mistaken for a workflow node, which would
+    // strip the chat's ambient skills and MCP servers.
+    expect(options.nodeConfig?.nodeId).toBeUndefined();
+  });
+
+  test('a tier effort and the denial share nodeConfig without overwriting each other', async () => {
+    capsMock.mockReturnValue(claudeLikeCaps);
+    mockLoadConfig.mockImplementation(() =>
+      Promise.resolve(
+        makeConfig({ tiers: { large: { provider: 'claude', model: 'opus', effort: 'high' } } })
+      )
+    );
+
+    const options = await chatRequestOptions();
+
+    expect(options.nodeConfig).toEqual({
+      denied_tools: ['Write', 'Edit', 'NotebookEdit'],
+      effort: 'high',
+    });
+  });
+
+  test('a provider without tool restrictions gets no denial (Codex: the prompt rule is the only control)', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, toolRestrictions: false });
+
+    const options = await chatRequestOptions();
+
+    expect(options.nodeConfig).toBeUndefined();
+  });
+
+  test('a provider that restricts tools but declares no vocabulary is not sent Claude tool names', async () => {
+    // Pi, OpenCode and Copilot: `toolRestrictions` without `knownToolNames`.
+    // Sending them Claude's names would either change their tool set (Pi) or
+    // be ignored while looking like protection.
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, toolRestrictions: true });
+
+    const options = await chatRequestOptions();
+
+    expect(options.nodeConfig).toBeUndefined();
+  });
+
+  test('title generation is not given the denial', async () => {
+    capsMock.mockReturnValue(claudeLikeCaps);
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(makeConversation({ title: null }))
+    );
+
+    await chatRequestOptions();
+
+    const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6];
+    expect(titleOptions).toBeDefined();
+    expect(titleOptions?.nodeConfig).toBeUndefined();
+  });
+});
+
+// ─── chatTier: the install's tier for the main chat turn ──────────────────────
+
+describe('chatTier config in a chat turn', () => {
+  beforeEach(() => {
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+    mockGetOrCreateConversation.mockReset();
+    mockLoadConfig.mockReset();
+    mockGetUserAiPrefsDb.mockReset();
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
+    mockParseCommand.mockReturnValue({ command: '', args: [] });
+    mockGenerateAndSetTitle.mockClear();
+  });
+
+  afterEach(() => {
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig()));
+  });
+
+  function sentTexts(platform: ReturnType<typeof makePlatform>): string[] {
+    const calls = (platform.sendMessage as ReturnType<typeof mock>).mock.calls as unknown as [
+      string,
+      string,
+    ][];
+    return calls.map(([, text]) => text);
+  }
+
+  test('a Telegram turn runs on the medium tier while the title stays on small', async () => {
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({ id: 'conv-tier-tg', platform_type: 'telegram', title: null })
+      )
+    );
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig({ chatTier: 'medium' })));
+
+    const platform = makePlatform();
+    (platform.getPlatformType as ReturnType<typeof mock>).mockReturnValue('telegram');
+    // The sender is the Telegram identity's user row; it has no prefs of its own.
+    await handleMessage(platform, 'conv-1', 'Hello', { userId: 'telegram-user' });
+
+    const chatOptions = mockSendQuery.mock.calls[0][3] as SendQueryOptions;
+    expect(chatOptions.model).toBe('sonnet');
+    const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6];
+    expect(titleOptions?.model).toBe('haiku');
+    // An exact medium match is not a fallback: no nudge.
+    expect(sentTexts(platform).some(text => text.includes("isn't configured"))).toBe(false);
+  });
+
+  test('the fallback nudge names the tier the chat asked for', async () => {
+    // 'unknownprov' has no built-in tiers and only `small` is configured, so a
+    // medium request falls back.
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(
+        makeConversation({
+          id: 'conv-tier-nudge',
+          platform_conversation_id: 'conv-tier-nudge',
+          ai_assistant_type: 'unknownprov',
+        })
+      )
+    );
+    mockLoadConfig.mockImplementation(() =>
+      Promise.resolve(
+        makeConfig({
+          chatTier: 'medium',
+          tiers: { small: { provider: 'claude', model: 'haiku' } },
+        })
+      )
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-tier-nudge', 'Hello');
+
+    const nudges = sentTexts(platform).filter(text => text.includes("isn't configured"));
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0]).toContain("Model tier 'medium' isn't configured — using the 'small' preset");
+    expect(nudges[0]).toContain('archon ai tier set medium <provider> <model>');
+  });
+});
+
 // ─── Message persistence for non-web platforms (regression for #1182) ────────
 
 describe('message persistence for non-web platforms', () => {
@@ -6516,6 +6975,96 @@ describe('resolveChatModelRequest', () => {
       { assistants: { claude: {}, codex: {} }, tiers }
     );
     expect(req.model).toBe('sonnet');
+  });
+
+  // ─── chatTier: install-level tier for the main chat turn ───────────────────
+
+  test('reports the tier it asked for so a fallback can be named', () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(profile, 'claude', {}, emptyConfig);
+    expect(req.requestedTier).toBe('large');
+  });
+
+  test("chatTier 'medium' resolves the chat turn to the medium tier", () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      { ...emptyConfig, chatTier: 'medium' }
+    );
+    expect(req.provider).toBe('claude');
+    expect(req.model).toBe('sonnet');
+    expect(req.matchedTier).toBe('medium');
+    expect(req.requestedTier).toBe('medium');
+  });
+
+  test('chatTier follows a CONFIGURED medium tier, including its effort preset', () => {
+    const tiers = {
+      large: { provider: 'claude', model: 'claude-opus-5-5', effort: 'high' as const },
+      medium: { provider: 'claude', model: 'claude-sonnet-5-5' },
+    };
+    const profile = buildAiProfile('claude', { repoTiers: tiers });
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      { assistants: { claude: {}, codex: {} }, tiers, chatTier: 'medium' }
+    );
+    expect(req.model).toBe('claude-sonnet-5-5');
+    expect(req.preset?.effort).toBeUndefined();
+  });
+
+  test('an explicit chatTier outranks install assistants.<p>.model', () => {
+    // assistants.<p>.model only stands in for the IMPLICIT large default. Letting
+    // it override a tier the operator chose would make chatTier a silent no-op.
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      { assistants: { claude: { model: 'opus' }, codex: {} }, tiers: undefined, chatTier: 'medium' }
+    );
+    expect(req.model).toBe('sonnet');
+  });
+
+  test("an explicit chatTier of 'large' also outranks install assistants.<p>.model", () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      {},
+      {
+        assistants: { claude: { model: 'sonnet' }, codex: {} },
+        tiers: undefined,
+        chatTier: 'large',
+      }
+    );
+    expect(req.model).toBe('opus');
+  });
+
+  test('user default_model still outranks chatTier (highest layer)', () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      { defaultProvider: 'claude', defaultModel: 'haiku' },
+      { ...emptyConfig, chatTier: 'medium' }
+    );
+    expect(req.model).toBe('haiku');
+    expect(req.requestedTier).toBeUndefined();
+  });
+
+  test('a user default_model that is itself a tier reports that tier as requested', () => {
+    const profile = buildAiProfile('claude');
+    const req = resolveChatModelRequest(
+      profile,
+      'claude',
+      { defaultProvider: 'claude', defaultModel: 'small' },
+      emptyConfig
+    );
+    expect(req.model).toBe('haiku');
+    expect(req.requestedTier).toBe('small');
   });
 });
 

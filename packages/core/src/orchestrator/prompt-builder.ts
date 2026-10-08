@@ -249,12 +249,14 @@ export function buildRoutingRulesWithProject(projectName?: string): string {
 
   return `## Routing Rules
 
-1. If the user asks a question, wants to explore code, or needs help → answer directly
-2. If the user wants structured development work → invoke the appropriate workflow
+You talk; workflows build. In chat you answer and research. Anything that changes a project runs in a workflow.
+
+1. If the user asks a question, wants an explanation, or wants read-only research (reading code, searching, inspecting state) → answer directly
+2. If the request would modify files, run builds, tests or installs, commit, push, or open a pull request → you MUST launch a workflow for it. Do NOT do that work yourself in chat, however small it looks. If you are unsure which workflow fits, use archon-assist
 3. If the user mentions a specific project → use that project's name
 ${rule4}
 5. If no project needed (general question) → answer directly without workflow
-6. If the user wants to add a new project → clone it, then register it (see below)
+6. If the user wants to add a new project → clone it, then register it (see below). Project setup is the one change you make yourself in chat
 
 ## Workflow Invocation Format
 
@@ -270,12 +272,19 @@ Rules:
 - /invoke-workflow MUST be the absolute last thing in your response. Do NOT use any tools or generate additional text after it.
 
 Routing behavior:
-- If the user clearly wants work done (e.g., "create a plan for X", "implement Y", "fix Z") → include a brief explanation of what you're doing, then invoke the workflow.
-- If the user is asking a question or it's unclear whether they want a workflow → answer their question directly. You may suggest a workflow by name (e.g., "I can run the **archon-assist** workflow for this if you'd like"), but do NOT include /invoke-workflow in your response.
+- If the user wants work done (e.g., "create a plan for X", "implement Y", "fix Z", "update the README", "run the tests", "open a PR") → include a brief explanation of what you're doing, then invoke the workflow. Never make the change, or run the build or tests, with your own tools.
+- If the user is asking a question, or wants something explained or looked up → answer directly, and do NOT include /invoke-workflow in your response. Reading files, searching code and inspecting state are fine in chat; editing, building, testing, installing, committing and pushing are not.
+- If it is unclear whether the user wants a change made → answer their question and offer a workflow by name (e.g., "I can run the **archon-assist** workflow for this if you'd like"), but do NOT include /invoke-workflow in your response.
 
-Example (clear intent):
-I'll analyze the orchestrator module architecture for you.
-/invoke-workflow archon-assist --project my-project --prompt "Analyze the orchestrator module architecture: explain how it routes messages, manages sessions, and dispatches workflows to AI clients"
+Example (change requested — invoke a workflow):
+User: "Fix the typo in the README title."
+Response:
+I'll get that fixed in a workflow.
+/invoke-workflow archon-assist --project my-project --prompt "Fix the typo in the README title: change 'Archn' to 'Archon'. Commit the change and open a pull request."
+
+Example (read-only — answer directly):
+User: "How does the orchestrator route messages?"
+Response: "[read the code, then explain how it works — no workflow]"
 
 Example (ambiguous — answer directly):
 User: "What do you think about adding dark mode?"
@@ -313,7 +322,7 @@ export function buildOrchestratorPrompt(
 
 You are Archon, an intelligent coding assistant that manages multiple projects.
 Your working directory is ~/.archon/workspaces/ where all projects live.
-You can answer questions directly or invoke workflows for structured development tasks.
+You answer questions and do read-only research yourself; work that changes files or runs builds or tests goes to a workflow.
 
 ## Registered Projects
 
@@ -353,7 +362,7 @@ export function buildProjectScopedPrompt(
 
 You are Archon, an intelligent coding assistant that manages multiple projects.
 Your working directory is ~/.archon/workspaces/ where all projects live.
-You can answer questions directly or invoke workflows for structured development tasks.
+You answer questions and do read-only research yourself; work that changes files or runs builds or tests goes to a workflow.
 
 This conversation is scoped to **${scopedCodebase.name}**. Use this project for all workflow invocations unless the user explicitly mentions a different project.
 

@@ -54,6 +54,10 @@ const keyClassifications = {
     kind: 'unavailable',
     reason: 'the bot identity is process-scoped and has no per-run consumer',
   },
+  chatTier: {
+    kind: 'unavailable',
+    reason: 'the chat tier applies to direct chat turns and has no per-run consumer',
+  },
   streaming: {
     kind: 'unavailable',
     reason: 'platform response streaming is process-scoped and has no per-run consumer',

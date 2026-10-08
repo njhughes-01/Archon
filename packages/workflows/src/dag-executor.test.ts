@@ -1988,6 +1988,10 @@ describe('executeDagWorkflow -- tool restrictions', () => {
     const optionsArg = mockSendQueryDag.mock.calls[0][3] as Record<string, unknown>;
     const nodeConfig = optionsArg?.nodeConfig as Record<string, unknown>;
     expect(nodeConfig?.allowed_tools).toEqual(['Read', 'Grep']);
+    // A node carries only the restrictions its YAML declares. The direct-chat
+    // denial of file-writing tools is chat policy and must never reach a node,
+    // or no workflow could edit a file.
+    expect(nodeConfig?.denied_tools).toBeUndefined();
   });
 
   it('passes settingSources to sendQuery nodeConfig for Claude node', async () => {

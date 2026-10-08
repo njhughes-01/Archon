@@ -491,6 +491,43 @@ streaming:
       await expect(loadConfig()).rejects.toThrow(/not a registered provider/);
     });
 
+    test('chatTier is unset by default so chat keeps its large-tier behaviour', async () => {
+      mockFsReadFile.mockResolvedValue('defaultAssistant: claude\n');
+
+      const config = await loadConfig();
+      expect(config.chatTier).toBeUndefined();
+    });
+
+    test('chatTier from global config reaches the merged config', async () => {
+      mockFsReadFile.mockResolvedValue('chatTier: medium\n');
+
+      const config = await loadConfig();
+      expect(config.chatTier).toBe('medium');
+    });
+
+    test('throws on a chatTier that is not a tier name', async () => {
+      // A typo here would otherwise leave chat on the large tier with no sign
+      // that the setting was ignored.
+      mockFsReadFile.mockResolvedValue('chatTier: sonnet\n');
+
+      await expect(loadConfig()).rejects.toThrow(
+        /chatTier: 'sonnet' in global config .* must be one of: small, medium, large/
+      );
+    });
+
+    test('chatTier is install-level: a repo config cannot set it', async () => {
+      mockFsReadFile.mockImplementation(async (path: string) => {
+        const normalized = path.replace(/\\/g, '/');
+        if (normalized.includes('/tmp/test-repo/.archon/config.yaml')) {
+          return 'chatTier: small';
+        }
+        return 'chatTier: medium';
+      });
+
+      const config = await loadConfig('/tmp/test-repo');
+      expect(config.chatTier).toBe('medium');
+    });
+
     test('throws on unknown assistant in repo config', async () => {
       mockFsReadFile.mockImplementation(async (path: string) => {
         const normalized = path.replace(/\\/g, '/');

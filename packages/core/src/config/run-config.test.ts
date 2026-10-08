@@ -84,6 +84,7 @@ describe('workflow run config', () => {
       'worktree',
       'container',
       'botName',
+      'chatTier',
       'streaming',
       'paths',
       'concurrency',

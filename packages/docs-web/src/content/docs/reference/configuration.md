@@ -113,11 +113,15 @@ workflows:
   quotaDeadlineMs: 86400000
 
 # Model tiers — optional cross-provider presets used by bundled workflows,
-# custom workflows, direct chat (`large`), and title generation (`small`).
+# custom workflows, direct chat (`chatTier`, default `large`), and title
+# generation (`small`).
 tiers:
   large: { provider: claude, model: opus }
   medium: { provider: codex, model: gpt-5.6-terra, effort: high }
   small: { provider: pi, model: minimax-m3 }
+
+# Tier the chat agent runs on: small, medium or large. Default: large.
+# chatTier: medium
 
 # Model aliases — optional custom refs for project workflows.
 aliases:
@@ -126,6 +130,8 @@ aliases:
 ```
 
 The `tiers:` block above is no longer hand-edit-only -- you can also set the `small`/`medium`/`large` presets from the console **AI Settings** -> **Model Tiers** panel, or from the CLI with [`archon ai tier set`](/reference/cli/#ai). Connecting your own provider API key or subscription is covered in [Per-user credentials and AI Settings](/getting-started/ai-assistants/#per-user-credentials-and-ai-settings).
+
+`chatTier` picks the tier the chat agent's own turns run on, on every chat surface (Web UI, Telegram, Slack, Discord, forge comments). It changes chat only: workflow nodes keep the tiers they name, and conversation titles stay on `small`. It is read from `~/.archon/config.yaml` only -- a repository config cannot set it -- and a value other than `small`, `medium` or `large` stops the config from loading. A user's own default chat model ([`archon ai default <provider> <model> --scope user`](/reference/cli/#ai)) still wins for that user; a per-user default applies to the identity that set it, so one set from the CLI or the Web UI does not reach that person's Telegram or Slack turns. When `chatTier` is set, `assistants.<provider>.model` no longer stands in for an unconfigured tier in chat.
 
 These files are persistent layers. For one invocation, use repeatable [`workflow run --model <name>=<spec>`](/reference/cli/#workflow-run-name-message), [`workflow run --config <path>`](/reference/cli/#per-run-config-files), or the run API's inline `config`, `tiers`, and `aliases` fields. Each run layer is sparse and sits above user, repository, global, and built-in values without editing a persistent config file.
 
@@ -176,7 +182,7 @@ Run config accepts settings whose consumers still execute after the run is dispa
 
 - `commands` and `defaults` already affected workflow and command discovery.
 - `worktree` and `container` already affected isolation.
-- `botName`, `streaming`, `paths`, and `concurrency` are process-scoped or have no per-run consumer.
+- `botName`, `chatTier`, `streaming`, `paths`, and `concurrency` are process-scoped or have no per-run consumer.
 - `recommendedWorkflows` is listing-only.
 - `assistants.pi.env` and `assistants.pi.maxConcurrent` mutate process-lifetime Pi state rather than one request.
 

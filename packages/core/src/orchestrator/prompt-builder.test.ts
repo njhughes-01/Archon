@@ -38,6 +38,60 @@ describe('buildRoutingRulesWithProject', () => {
 
     expect(rules).toContain('NO knowledge of the conversation history');
   });
+
+  // "Chat talks, workflows build": the chat agent used to decide alone whether
+  // to do the work itself. These pin the contract, not the full prose.
+  test('questions, explanation and read-only research are answered directly', () => {
+    const rules = buildRoutingRulesWithProject();
+
+    expect(rules).toContain(
+      '1. If the user asks a question, wants an explanation, or wants read-only research (reading code, searching, inspecting state) → answer directly'
+    );
+  });
+
+  test('work that changes anything must launch a workflow and is never done in chat', () => {
+    const rules = buildRoutingRulesWithProject();
+
+    expect(rules).toContain(
+      '2. If the request would modify files, run builds, tests or installs, commit, push, or open a pull request → you MUST launch a workflow for it. Do NOT do that work yourself in chat, however small it looks'
+    );
+    // The old wording left the choice to the agent.
+    expect(rules).not.toContain('structured development work');
+    expect(rules).not.toContain('wants to explore code, or needs help');
+  });
+
+  test('an unclear workflow choice falls back to archon-assist', () => {
+    const rules = buildRoutingRulesWithProject();
+
+    expect(rules).toContain('If you are unsure which workflow fits, use archon-assist');
+  });
+
+  test('the invoke example is a change request, not read-only analysis', () => {
+    const rules = buildRoutingRulesWithProject();
+
+    // Analysing code is read-only research under rule 1, so it cannot be the
+    // example of when to invoke.
+    expect(rules).not.toContain('Analyze the orchestrator module architecture');
+    expect(rules).toContain('Example (change requested — invoke a workflow):');
+    expect(rules).toContain('Example (read-only — answer directly):');
+  });
+
+  test('project setup stays a chat task despite the no-changes rule', () => {
+    const rules = buildRoutingRulesWithProject();
+
+    expect(rules).toContain(
+      '6. If the user wants to add a new project → clone it, then register it (see below). Project setup is the one change you make yourself in chat'
+    );
+  });
+
+  test('the project-scoped variant keeps the same routing contract', () => {
+    const rules = buildRoutingRulesWithProject('my-project');
+
+    expect(rules).toContain('you MUST launch a workflow for it');
+    expect(rules).toContain(
+      '4. If ambiguous which project → use **my-project** (the active project)'
+    );
+  });
 });
 
 describe('formatWorkflowContextSection', () => {
@@ -148,6 +202,16 @@ describe('buildOrchestratorSystemAppend', () => {
       workflows
     );
     expect(result).toContain('## Registered Projects');
+  });
+
+  test('both prompt intros describe the chat role the routing rules enforce', () => {
+    const intro =
+      'You answer questions and do read-only research yourself; work that changes files or runs builds or tests goes to a workflow.';
+    const scoped = buildOrchestratorSystemAppend(makeConversation('cb-1'), codebases, workflows);
+    const unscoped = buildOrchestratorSystemAppend(makeConversation(null), codebases, workflows);
+
+    expect(scoped).toContain(intro);
+    expect(unscoped).toContain(intro);
   });
 
   test('does NOT include the run-management section (orchestrator gates it per-provider)', () => {
