@@ -21,7 +21,8 @@ Between the last two, on a red gate only, `failure-class` (script) may ask a
 classifier which kind of failure the record shows. It is optional and advisory:
 with no classifier configured it reports `unavailable` and `classify` works as it
 always has. With one, `classify` gets the answer as a hypothesis to check against
-the log, and the result carries it as `advisory_failure_class` beside
+the log, says in its `summary` what the classifier chose and whether the log bore
+it out, and the result carries the class as `advisory_failure_class` beside
 `red_cause`. That field never decides anything; see
 [Second opinion](../README.md#second-opinion) for what is sent and how to turn it
 off.

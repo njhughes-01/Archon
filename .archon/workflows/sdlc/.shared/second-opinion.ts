@@ -33,6 +33,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { isSecretPath } from './context-scout.ts';
 import { askJevChoice, type Fetch } from './jev-client.ts';
 import { readJevAccess, type JevAccess } from './jev-settings.ts';
+import { REDACTED, REDACTED_KEY, redactSecrets } from './redaction.ts';
 
 export interface OpinionSettings extends JevAccess {
   /** Longest the one classifier request may take. */
@@ -45,13 +46,28 @@ export type OpinionAvailability =
   | { available: true; settings: OpinionSettings }
   | { available: false; reason: string };
 
-/** Every numeric setting: its variable and its default. Each must be a positive integer. */
+/**
+ * The request timeout must be shorter than this. It is the longest a checkpoint's node
+ * waits for this script (its `timeout:` in the workflow file), and a request allowed to
+ * outlast its node would be stopped by the engine instead of ending as an `unavailable`
+ * result. A test holds each checkpoint node's timeout to this value.
+ */
+export const OPINION_TIMEOUT_LIMIT_MS = 120_000;
+
+type Check = (value: number) => boolean;
+const positiveInteger: Check = value => Number.isInteger(value) && value > 0;
+
+/** Every numeric setting: its variable, its default, and what makes a value usable. */
 const NUMBERS = {
-  timeoutMs: ['JEV_OPINION_TIMEOUT_MS', 30_000],
+  timeoutMs: [
+    'JEV_OPINION_TIMEOUT_MS',
+    30_000,
+    (value): boolean => positiveInteger(value) && value < OPINION_TIMEOUT_LIMIT_MS,
+  ],
   // A failing check's recorded output tail is sixty lines, which this holds with room to
   // spare, and it stays far inside what one classifier request accepts.
-  maxEvidenceChars: ['JEV_OPINION_MAX_EVIDENCE_CHARS', 16_000],
-} as const satisfies Record<string, readonly [string, number]>;
+  maxEvidenceChars: ['JEV_OPINION_MAX_EVIDENCE_CHARS', 16_000, positiveInteger],
+} as const satisfies Record<string, readonly [string, number, Check]>;
 
 /**
  * The second opinion's settings, or why it is off.
@@ -68,10 +84,10 @@ export function readOpinionSettings(env: NodeJS.ProcessEnv): OpinionAvailability
 
   const unusable: string[] = [];
   const number = (key: keyof typeof NUMBERS): number => {
-    const [variable, fallback] = NUMBERS[key];
+    const [variable, fallback, usable] = NUMBERS[key];
     const raw = env[variable]?.trim() ?? '';
     const value = raw === '' ? fallback : Number(raw);
-    if (!Number.isInteger(value) || value <= 0) unusable.push(variable);
+    if (!usable(value)) unusable.push(variable);
     return value;
   };
   const settings: OpinionSettings = {
@@ -141,115 +157,6 @@ export function parseChoices(raw: string): Record<string, string> {
   return Object.fromEntries(entries);
 }
 
-const REDACTED = '[REDACTED]';
-const REDACTED_KEY = '[REDACTED PRIVATE KEY]';
-
-/** An armored private key, whole. */
-const KEY_BLOCK =
-  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g;
-/** The end of a key whose start lies before the text: everything up to it may be key. */
-const KEY_BLOCK_END = /^[\s\S]*-----END [A-Z0-9 ]*PRIVATE KEY-----/;
-/** The start of a key whose end lies after the text. */
-const KEY_BLOCK_START = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY[\s\S]*$/;
-
-/**
- * An `Authorization` header's value: a scheme and its credential, or one long token. A
- * word after the colon (`Authorization: denied`) is prose and stays.
- */
-const AUTHORIZATION =
-  /\b((?:proxy-)?authorization["']?[ \t]*[:=][ \t]*["']?)(?:(?:bearer|basic|token|digest|negotiate)[ \t]+[^\s"',;]+|[A-Za-z0-9._~+/=-]{16,})/gi;
-const BEARER = /\b(bearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}/gi;
-/**
- * The user and password in front of a URL's host. Both lengths are bounded so a long run
- * of dotted or hyphenated text cannot make the search quadratic.
- */
-const URL_USERINFO = /\b([a-z][a-z0-9+.-]{0,31}:\/\/)[^\s/@]{1,512}@/gi;
-
-/**
- * A value assigned to a secret-named key, in the shapes logs print them: `KEY=value`,
- * `key: value`, `"key": "value"`, `?key=value&`. The name must end in the secret word and
- * be followed by a single `=` or `:`, so a comparison (`token == x`), a path
- * (`auth::token::verify`, `test_token.py::test_x`) and prose (`password authentication
- * failed`) are left alone. The name's length is bounded so a long run of hyphenated text
- * cannot make the search quadratic.
- */
-const SECRET_ASSIGNMENT =
-  /\b([A-Za-z0-9_-]{0,64}(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credentials?)["']?[ \t]*(?:=(?![=>])|:(?![:=]))[ \t]*)("[^"\n]*"|'[^'\n]*'|[^\s"',;&]+)/gi;
-
-/** Credentials recognisable by their own shape, wherever they appear. */
-const TOKEN_SHAPES: readonly RegExp[] = [
-  /\bsk-[A-Za-z0-9_-]{16,}/g,
-  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
-  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
-  /\bxox[abeprs]-[A-Za-z0-9-]{10,}/g,
-  /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
-  /\bnpm_[A-Za-z0-9]{30,}/g,
-  /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g,
-];
-
-/** A variable whose name has one of these parts holds a credential. */
-const SECRET_NAME_PARTS = new Set([
-  'KEY',
-  'APIKEY',
-  'TOKEN',
-  'SECRET',
-  'SECRETS',
-  'PASSWORD',
-  'PASSWD',
-  'PASS',
-  'CREDENTIAL',
-  'CREDENTIALS',
-  'AUTH',
-  'DSN',
-]);
-
-/**
- * The shortest value removed by exact match. Below this a value is as likely to be a flag
- * as a credential, and removing every `1` or `true` from a log would leave nothing to read.
- */
-const MIN_SECRET_VALUE_CHARS = 8;
-
-/** The values of this process's secret-named variables, longest first. */
-function secretValues(env: NodeJS.ProcessEnv): string[] {
-  const values = new Set<string>();
-  for (const [name, value] of Object.entries(env)) {
-    const secret = value?.trim() ?? '';
-    if (secret.length < MIN_SECRET_VALUE_CHARS) continue;
-    const parts = name.toUpperCase().split(/[^A-Z0-9]+/);
-    if (parts.some(part => SECRET_NAME_PARTS.has(part))) values.add(secret);
-  }
-  return [...values].sort((left, right) => right.length - left.length);
-}
-
-/**
- * `text` with recognisable secrets replaced by a marker.
- *
- * Two kinds of match. Exact: the value of every secret-named variable in `env`, the
- * classifier key among them, wherever a failing command echoed it. By shape: private-key
- * blocks, `Authorization` and bearer credentials, the user and password of a URL, values
- * assigned to secret-named keys, and well-known token formats.
- *
- * This is a filter, not a guarantee. A credential in a shape none of these describe is
- * sent as it is; the documentation says so, and says what to do where that matters.
- */
-export function redactEvidence(text: string, env: NodeJS.ProcessEnv): string {
-  let redacted = text;
-  for (const value of secretValues(env)) redacted = redacted.replaceAll(value, REDACTED);
-  redacted = redacted
-    .replace(KEY_BLOCK, REDACTED_KEY)
-    .replace(KEY_BLOCK_END, REDACTED_KEY)
-    .replace(KEY_BLOCK_START, REDACTED_KEY)
-    .replace(AUTHORIZATION, `$1${REDACTED}`)
-    .replace(BEARER, `$1${REDACTED}`)
-    .replace(URL_USERINFO, `$1${REDACTED}@`)
-    .replace(SECRET_ASSIGNMENT, (_match, assigned: string, value: string) => {
-      const quote = value.startsWith('"') || value.startsWith("'") ? value[0] : '';
-      return `${assigned}${quote}${REDACTED}${quote}`;
-    });
-  for (const shape of TOKEN_SHAPES) redacted = redacted.replace(shape, REDACTED);
-  return redacted;
-}
-
 /**
  * How much more than the cap is read before redacting. Redaction runs on more text than is
  * sent, so the cut that follows lands in text that is already clean and a secret is never
@@ -270,11 +177,24 @@ function refused(reason: string): Refused {
   return { refused: reason };
 }
 
-/** Text that starts partway through a longer one, without its cut first line. */
-function withoutPartialFirstLine(text: string): string {
+/**
+ * The most of a cut that starting on a whole line may cost. Past it the line the cut landed
+ * in is the evidence, not a remnant: a long assertion line followed by two short ones
+ * must not be dropped for the sake of the two.
+ */
+const MAX_ALIGNMENT_LOSS = 0.5;
+
+/**
+ * Text that starts partway through a longer one, without the part the cut damaged: its
+ * first line, or when that line is most of the text, only the word the cut landed in. The
+ * text has not been redacted yet, and half a word can be half a secret.
+ */
+function withoutCutStart(text: string): string {
   const newline = text.indexOf('\n');
-  // One line longer than the window has no whole line to start from.
-  return newline === -1 ? text : text.slice(newline + 1);
+  if (newline !== -1 && newline < text.length * MAX_ALIGNMENT_LOSS) return text.slice(newline + 1);
+  const space = text.search(/\s/);
+  // One unbroken run longer than everything read has no better place to start.
+  return space === -1 ? text : text.slice(space + 1);
 }
 
 /**
@@ -344,31 +264,47 @@ function readEvidenceFile(
   }
   if (bytes.includes(0)) return refused('evidence_binary');
   const text = new TextDecoder('utf-8').decode(bytes);
-  return { text: cut ? withoutPartialFirstLine(text) : text };
+  return { text: cut ? withoutCutStart(text) : text };
 }
 
 /**
- * The last `maxChars` characters of `text`, starting on a whole line when one fits. A
- * single line longer than the cap is cut where the cap falls.
+ * The last `maxChars` characters of `text`, starting on a whole line unless that would
+ * give up more than `MAX_ALIGNMENT_LOSS` of them. The text is already redacted, so a cut
+ * inside a line splits nothing that matters.
  */
 function keepTail(text: string, maxChars: number): string {
   if (text.length <= maxChars) return text;
   const start = text.length - maxChars;
   if (text[start - 1] === '\n') return text.slice(start);
   const newline = text.indexOf('\n', start);
-  return newline === -1 || newline === text.length - 1
+  if (newline === -1 || newline === text.length - 1) return text.slice(start);
+  return newline + 1 - start > maxChars * MAX_ALIGNMENT_LOSS
     ? text.slice(start)
     : text.slice(newline + 1);
+}
+
+/**
+ * Fewer characters than this is nothing to judge: an empty output, or one that was all
+ * secrets. Whitespace and the redaction's own markers do not count.
+ */
+const MIN_JUDGED_CHARS = 5;
+
+function judgedChars(text: string): number {
+  return text.replaceAll(REDACTED_KEY, '').replaceAll(REDACTED, '').replace(/\s+/g, '').length;
 }
 
 /** Evidence given as text, or as the path of a file inside the run's artifacts directory. */
 export type OpinionEvidence = { text: string } | { path: string };
 
-/** What is sent: read, redacted, then cut to the cap, in that order. */
+/**
+ * What is sent: read, redacted, then cut to the cap, in that order. Refused when what is
+ * left holds nothing to judge.
+ */
 function prepareEvidence(
   evidence: OpinionEvidence,
   env: NodeJS.ProcessEnv,
-  maxEvidenceChars: number
+  maxEvidenceChars: number,
+  judged: (evidence: string) => string
 ): { text: string } | Refused {
   const size = windowSize(maxEvidenceChars);
   let window: string;
@@ -378,10 +314,13 @@ function prepareEvidence(
     window = read.text;
   } else {
     const { text } = evidence;
-    window = text.length > size ? withoutPartialFirstLine(text.slice(-size)) : text;
+    window = text.length > size ? withoutCutStart(text.slice(-size)) : text;
   }
-  const text = keepTail(redactEvidence(window, env).trimEnd(), maxEvidenceChars).trim();
-  return text === '' ? refused('no_evidence') : { text };
+  const text = keepTail(redactSecrets(window, env).trimEnd(), maxEvidenceChars).trim();
+  if (text === '') return refused('no_evidence');
+  return judgedChars(judged(text)) < MIN_JUDGED_CHARS
+    ? refused('insufficient_evidence')
+    : { text };
 }
 
 /** Jev accepts up to 255 options on one choice question; fewer than two is no question. */
@@ -402,6 +341,12 @@ export interface SecondOpinionRequest {
   /** Option name to the criterion for choosing it: what in the evidence indicates it. */
   choices: Readonly<Record<string, string>>;
   evidence: OpinionEvidence;
+  /**
+   * The part of the evidence the question is about, when the rest is framing: given what
+   * will be sent, returns what in it is to be judged. All of the evidence is still sent;
+   * this only decides whether there is enough in it to ask. Defaults to all of it.
+   */
+  judged?: (evidence: string) => string;
   /** Settings, the artifacts directory (`ARTIFACTS_DIR`), and the values to redact. */
   env: NodeJS.ProcessEnv;
   /** Replaces the network. Tests inject it. */
@@ -429,7 +374,12 @@ export async function askSecondOpinion(request: SecondOpinionRequest): Promise<S
       return unavailable('invalid_choices');
     }
 
-    const evidence = prepareEvidence(request.evidence, request.env, settings.maxEvidenceChars);
+    const evidence = prepareEvidence(
+      request.evidence,
+      request.env,
+      settings.maxEvidenceChars,
+      request.judged ?? ((text: string): string => text)
+    );
     if ('refused' in evidence) return unavailable(evidence.refused);
 
     const answered = await askJevChoice({

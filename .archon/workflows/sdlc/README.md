@@ -214,21 +214,30 @@ Three rules hold it together:
   it is right.
 - **Without a classifier it costs one script start, and it never fails the run
   on purpose.** No `JEV_API_KEY`, `JEV_ENABLED` or `JEV_OPINION_ENABLED` off, an
-  unusable setting, evidence it may not read, a timeout, an HTTP error or an
-  answer that is not one of the choices: each is a result with
-  `status: unavailable` and the reason, and the script exits 0. No AI turn is
-  spent either way, which is why no gate node stands in front of it as one does
-  in front of the scout. The node's own timeout skips rather than fails, and
-  `classify` reads its `if_skipped` value. It is still an ordinary node: a crash
-  the script does not catch would fail the run like any other.
+  unusable setting, evidence it may not read, a record with no failing output in
+  it to judge, a timeout, an HTTP error or an answer that is not one of the
+  choices: each is a result with `status: unavailable` and the reason, and the
+  script exits 0. No AI turn is spent either way, which is why no gate node
+  stands in front of it as one does in front of the scout. The node's own
+  timeout skips rather than fails, `classify` reads its `if_skipped` value, and
+  a request timeout that would outlast the node is refused as an unusable
+  setting. The wrapper loads the pack's modules inside a `try`, so even a module
+  that fails to load ends as `unavailable`. It is still an ordinary node, and
+  the engine has none that is optional: a failure the script cannot catch, such
+  as Bun itself not starting, fails the run like any other.
 - **What is sent is bounded and filtered, and only that.** One request to
   `JEV_API_BASE` per red gate: the question, the criteria, and the last
   `JEV_OPINION_MAX_EVIDENCE_CHARS` characters of `validation.md`, which is the
-  failing check's recorded output tail. Before the cut, recognisable secrets are
-  replaced with a marker: the value of every secret-named variable in the
-  script's environment (the classifier key among them), private-key blocks,
-  `Authorization` and bearer credentials, the user and password in a URL, values
-  assigned to secret-named keys, and well-known token formats. A path given as
+  failing check's recorded output tail. The cut starts on a whole line unless
+  that would give up more than half of it, so one long assertion line is never
+  dropped in favour of the two short lines after it. Before the cut,
+  [`.shared/redaction.ts`](.shared/redaction.ts) replaces recognisable secrets
+  with a marker: the value of every secret-named variable in the script's
+  environment (the classifier key among them), private keys, values assigned to
+  secret-named keys or passed after secret-named flags, cookies,
+  `Authorization` and bearer credentials, the password in a URL, and well-known
+  token formats. It takes a value to the end of its line unless the end is
+  certain, and it keeps the name. A path given as
   evidence must be a regular file inside the run's artifacts directory, never a
   link and never a secret-shaped name; the secret-path vocabulary is the scout's
   `isSecretPath`, and there is no second list. The filter is a filter: a
@@ -236,11 +245,19 @@ Three rules hold it together:
   matters, leave the opinion off or point `JEV_API_BASE` at a service you host.
   Neither the evidence nor the key is ever printed.
 
-Every fixture that reaches `failure-class` stubs it. A fixture run inherits the
-operator's environment, key included, so an unstubbed one would send its log to
-the live classifier. `second-opinion-script.test.ts` is what proves the authored
-node reaches its script: it builds the node's environment from the workflow
-file's own `with:` values and runs the real wrapper against a local stand-in.
+Every fixture that can reach `failure-class` stubs it, including the ones whose
+checks pass today. A fixture run inherits the operator's environment, key
+included, so an unstubbed one would send its log to the live classifier from
+`archon workflow test`. `sdlc-fixture-stubs.test.ts` fails when a fixture stubs
+validate's `run` red, or lets the real runner decide, without stubbing this
+node. `second-opinion-script.test.ts` is what proves the authored node reaches
+its script: it builds the node's environment from the workflow file's own
+`with:` values and runs the real wrapper against a local stand-in.
+
+[`.shared/validation-record.ts`](.shared/validation-record.ts) owns the layout of
+`validation.md`. The check runner renders through it, and the wrapper and the
+evaluation read a failing check's output back out through it, so a change to
+the record cannot leave a reader behind.
 
 [`.shared/jev-settings.ts`](.shared/jev-settings.ts) reads the key, the endpoint,
 the model and the switches for both this and the scout, so the defaults have one
@@ -249,12 +266,16 @@ owner.
 ### What is measured, and what is not
 
 `bun run second-opinion-eval` asks the workflow's own question about seeded
-failure logs of every class, across several languages and test runners, and
-reports accuracy overall and per class, the confusion matrix, mean confidence
-and characters sent. It passes at or above its accuracy floor (`ACCURACY_FLOOR`
-in the script) with no log labelled as a dependency or environment failure
-classified as a code defect, which is the one mistake that sends an agent to
-edit code that was never wrong. It calls the real
+failure logs of every class, across several languages and test runners, each
+sent inside the record the check runner writes, as a run sends it. It reports
+accuracy overall and per class, the confusion matrix, mean confidence and
+characters sent. It passes at or above its accuracy floors, overall and in every
+class (`ACCURACY_FLOOR` and `CLASS_ACCURACY_FLOOR` in the script), with no log
+labelled as a dependency or environment failure classified as a code defect.
+That mistake sends an agent to edit code that was never wrong, so one of them
+fails the run. A timing-dependent test called a code defect does the same harm
+and is counted on its own line, but does not fail the run: a log often cannot
+show that a failure is intermittent. It calls the real
 classifier, so it needs `JEV_API_KEY` and is not part of the test suite; `--dry`
 answers from the answer key and sends nothing. See
 [`scripts/second-opinion-eval.ts`](../../../scripts/second-opinion-eval.ts).
@@ -264,12 +285,14 @@ not measure whether the opinion leads to fewer unnecessary edits, and no unit
 test or classifier evaluation can: that is a property of whole runs.
 
 It is also a property the bundled workflows only reach indirectly. The opinion
-is read by `classify`, which edits nothing. No agent that edits code reads it in
-the same run: in `archon-deliver`, validation is the last local gate, an
-`introduced` red stops the run there, and the corrections that follow CI work
-from CI's results. The opinion's one route to an edit is through the
-`red_cause` and `summary` that `classify` writes, which the operator or the next
-run acts on. So the measurement has two halves, run by hand:
+is read by `classify`, which edits nothing, and no agent that edits code reads
+the opinion itself. Its route to an edit is the `red_cause` and `summary` that
+`classify` writes: the prompt requires the summary to name the kind the
+classifier chose and whether the log confirmed or contradicted it. In
+`archon-deliver`, validation is the last local gate. An `introduced` red stops
+the run there and the summary goes to the operator; when the red was passed as
+`inherited` or `environment` and CI then fails, the CI correction's work order
+carries that summary as context. So the measurement has two halves, run by hand:
 
 1. Prepare a small repository with a passing gate, and four or more seeded
    reds that need no code change: a port another process holds, a database that

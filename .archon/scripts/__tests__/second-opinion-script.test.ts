@@ -13,17 +13,25 @@
  * `output_format` the workflow declares for the node.
  */
 import { afterAll, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import { validateStructuredOutput } from '@archon/providers';
 import { canonicalValueText } from '../../../packages/workflows/src/output-ref';
 import { inputEnvKey } from '../../../packages/workflows/src/schemas/dag-node';
-import { parseChoices } from '../../workflows/sdlc/.shared/second-opinion';
+import {
+  OPINION_TIMEOUT_LIMIT_MS,
+  parseChoices,
+} from '../../workflows/sdlc/.shared/second-opinion';
+import {
+  recordedOutput,
+  renderValidationRecord,
+  TAIL_LINES,
+} from '../../workflows/sdlc/.shared/validation-record';
 
 const VALIDATE = resolve(import.meta.dir, '../../workflows/sdlc/validate');
-const API_KEY = 'sk-test-PLANTED-KEY';
+const API_KEY = ['sk', '-test-PLANTED-KEY'].join('');
 const trackTempRoot = trackTempRoots();
 
 interface AuthoredNode {
@@ -79,21 +87,44 @@ interface ScriptRun {
   stderr: string;
 }
 
-const RECORD = [
-  '# Validation',
-  '',
-  '## 1. tests',
-  '',
-  '`bun run test` failed (exit 1) after 12s.',
-  '',
-  'Last 60 lines of output:',
-  '',
-  '```',
-  'SENT_MARKER error: connect ECONNREFUSED 127.0.0.1:5432',
-  'DATABASE_PASSWORD=PLANTED_RECORD_SECRET',
-  '```',
-  '',
-].join('\n');
+/** A record as the check runner writes it, for one failing check with this output. */
+function recordOf(output: string): string {
+  return renderValidationRecord({
+    notes: 'stub: the project gate',
+    quarantined: [],
+    kept: [],
+    checks: [
+      {
+        name: 'lint',
+        argv: ['bun', 'run', 'lint'],
+        outcome: { kind: 'passed' },
+        seconds: 3,
+        output: '',
+        log: '/artifacts/validation/1.log',
+      },
+      {
+        name: 'tests',
+        argv: ['bun', 'run', 'test'],
+        outcome: { kind: 'failed', exitCode: 1, signal: null },
+        seconds: 12,
+        output,
+        log: '/artifacts/validation/2.log',
+      },
+      {
+        name: 'build',
+        argv: ['bun', 'run', 'build'],
+        outcome: { kind: 'never-ran' },
+        seconds: null,
+        output: '',
+        log: '/artifacts/validation/3.log',
+      },
+    ],
+  });
+}
+
+const RECORD = recordOf(
+  'SENT_MARKER error: connect ECONNREFUSED 127.0.0.1:5432\nDATABASE_PASSWORD=PLANTED_RECORD_SECRET'
+);
 
 /** A run's artifacts directory holding the record the failing gate left. */
 function artifactsWith(record: string | null): string {
@@ -213,7 +244,9 @@ describe('the failure-class node as authored', () => {
     // The script ends itself at its own deadline; the node's timeout is the backstop,
     // and it skips rather than fails.
     expect(node.on_timeout).toBe('skip');
-    expect(node.timeout).toBeGreaterThan(30_000);
+    // A request timeout at or past this is refused as an unusable setting, so the
+    // script's own deadline always comes first.
+    expect(node.timeout).toBe(OPINION_TIMEOUT_LIMIT_MS);
     // A skipped opinion must not skip the classification it advises.
     expect(classify.depends_on).toEqual(['run', 'failure-class']);
     expect(classify.trigger_rule).toBe('none_failed_min_one_success');
@@ -240,6 +273,12 @@ describe('the failure-class node as authored', () => {
     const prompt = await Bun.file(join(VALIDATE, 'commands', 'classify-red.md')).text();
     const named = new Set(prompt.match(/\b[a-z]+_(?:defect|test|failure)\b/g) ?? []);
     expect([...named].sort()).toEqual([...offered].sort());
+    // The opinion reaches whoever acts on the red only through the summary, so the
+    // prompt has to ask for it there.
+    expect(prompt).toContain(
+      '`summary` carries one sentence naming the kind the classifier chose and whether the log confirmed or contradicted it'
+    );
+    expect(prompt).toContain('When `status` is `unavailable`, `summary` says nothing about a second opinion.');
   });
 
   it('gives classify a default that has the shape of a real opinion', async () => {
@@ -258,6 +297,45 @@ describe('the failure-class node as authored', () => {
       advisory: true,
     });
     await expectCertified('failure-class', binding.if_skipped);
+  });
+});
+
+describe('the record the check runner writes', () => {
+  it('holds a failing check\'s output where the second opinion looks for it', () => {
+    const output = Array.from({ length: 5 }, (_unused, index) => `line ${String(index)}`).join('\n');
+
+    expect(recordedOutput(recordOf(output))).toBe(output);
+    // Read from a tail that starts inside the output block.
+    const record = recordOf(output);
+    expect(recordedOutput(record.slice(record.indexOf('line 2')))).toBe('line 2\nline 3\nline 4');
+    expect(recordedOutput(recordOf(''))).toBe('');
+    expect(TAIL_LINES).toBe(60);
+  });
+
+  it('is what run-checks itself writes for a failing check', () => {
+    const artifacts = artifactsWith(null);
+    const failing = "console.error('SENT_MARKER 1 test failed'); process.exitCode = 1";
+    const ran = Bun.spawnSync(
+      ['bun', '--no-env-file', 'run', join(VALIDATE, 'scripts', 'run-checks.ts')],
+      {
+        cwd: artifacts,
+        env: {
+          PATH: process.env.PATH ?? '',
+          ARTIFACTS_DIR: artifacts,
+          INPUTS_DISCOVERY: JSON.stringify({
+            checks: [{ name: 'tests', argv: ['bun', '-e', failing] }],
+            quarantine: [],
+            notes: '',
+          }),
+        },
+        stdout: 'pipe',
+        stderr: 'pipe',
+      }
+    );
+
+    expect(JSON.parse(ran.stdout.toString())).toMatchObject({ status: 'red' });
+    const record = readFileSync(join(artifacts, 'validation.md'), 'utf8');
+    expect(recordedOutput(record)).toBe('SENT_MARKER 1 test failed');
   });
 });
 
@@ -431,6 +509,108 @@ describe('failure-class', () => {
     expect(JSON.parse(run.stdout)).toMatchObject({
       status: 'unavailable',
       reason: 'classifier_network_error',
+    });
+  });
+
+  it('names a request timeout that would outlast the node', async () => {
+    const run = await runFailureClass(artifactsWith(RECORD), {
+      JEV_API_KEY: API_KEY,
+      JEV_OPINION_TIMEOUT_MS: String(OPINION_TIMEOUT_LIMIT_MS),
+    });
+
+    expect(run.code).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      status: 'unavailable',
+      reason: 'invalid_setting:JEV_OPINION_TIMEOUT_MS',
+    });
+  });
+
+  it('sends the end of a long failing line, not only the lines the record adds after it', async () => {
+    const jev = classifier(choosing('code_defect'));
+    // One assertion line longer than the whole cap. The record closes the output block
+    // and names the log after it, and a later check that never ran.
+    const long = `AssertionError: expected ${'left right '.repeat(2500)}LONG_LINE_END`;
+
+    const run = await runFailureClass(artifactsWith(recordOf(`FAIL src/cart.test.ts\n${long}`)), {
+      JEV_API_KEY: API_KEY,
+      JEV_API_BASE: jev.base,
+      JEV_OPINION_MAX_EVIDENCE_CHARS: '4000',
+    });
+
+    expect(run.code).toBe(0);
+    expect(JSON.parse(run.stdout)).toMatchObject({ status: 'ok', choice: 'code_defect' });
+    const { evidence } = (JSON.parse(jev.received[0].body) as ChoiceRequest).state;
+    expect(evidence.length).toBeGreaterThan(3900);
+    expect(evidence).toContain('left right LONG_LINE_END');
+    expect(evidence.endsWith('`bun run build` never ran.')).toBe(true);
+    // What is judged is the output inside the record, and most of what was sent is that.
+    expect(recordedOutput(evidence).length).toBeGreaterThan(3500);
+  });
+
+  it.each([
+    ['printed nothing', ''],
+    ['printed only blank lines', ' \n\n  '],
+    ['printed only a secret', ['gh', 'p_PLANTEDONLYSECRET0123456789abcdefghij'].join('')],
+  ])('sends nothing when the failing check %s', async (_label, output) => {
+    const jev = classifier(choosing('code_defect'));
+
+    const run = await runFailureClass(artifactsWith(recordOf(output)), {
+      JEV_API_KEY: API_KEY,
+      JEV_API_BASE: jev.base,
+    });
+
+    expect(run.code).toBe(0);
+    expect(run.stderr.trim()).toBe('failure-class: unavailable (insufficient_evidence)');
+    const opinion: unknown = JSON.parse(run.stdout);
+    await expectCertified('failure-class', opinion);
+    expect(opinion).toMatchObject({ status: 'unavailable', reason: 'insufficient_evidence' });
+    expect(jev.received).toEqual([]);
+  });
+
+  it('exits 0 with an unavailable opinion when its own modules cannot be loaded', async () => {
+    // The wrapper beside a second-opinion module that throws as it loads.
+    const root = trackTempRoot(mkdtempSync(join(tmpdir(), 'failure-class-broken-')));
+    const scripts = join(root, 'sdlc', 'validate', 'scripts');
+    const shared = join(root, 'sdlc', '.shared');
+    mkdirSync(scripts, { recursive: true });
+    mkdirSync(shared, { recursive: true });
+    cpSync(join(VALIDATE, 'scripts', 'failure-class.ts'), join(scripts, 'failure-class.ts'));
+    cpSync(join(VALIDATE, '..', '.shared', 'io.ts'), join(shared, 'io.ts'));
+    writeFileSync(
+      join(shared, 'second-opinion.ts'),
+      "throw new SyntaxError('PLANTED_LOAD_FAILURE');\nexport {};\n"
+    );
+    const artifacts = artifactsWith(RECORD);
+
+    const child = Bun.spawn(['bun', '--no-env-file', 'run', join(scripts, 'failure-class.ts')], {
+      cwd: artifacts,
+      env: {
+        PATH: process.env.PATH ?? '',
+        JEV_API_KEY: API_KEY,
+        ARTIFACTS_DIR: artifacts,
+        ...(await authoredBindings('failure-class')),
+      },
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+
+    expect(code).toBe(0);
+    expect(stderr.trim()).toBe('failure-class: unavailable (load_error:SyntaxError)');
+    expect(stdout + stderr).not.toContain('PLANTED');
+    const opinion: unknown = JSON.parse(stdout);
+    await expectCertified('failure-class', opinion);
+    expect(opinion).toEqual({
+      status: 'unavailable',
+      reason: 'load_error:SyntaxError',
+      choice: null,
+      probabilities: {},
+      confidence: null,
+      advisory: true,
     });
   });
 

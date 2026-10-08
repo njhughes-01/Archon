@@ -650,19 +650,31 @@ When a project gate goes red in `archon-validate`, a classifier can say which ki
 
 The second opinion is on when `JEV_API_KEY` is set. To turn it off and keep the key, set `JEV_OPINION_ENABLED=0`; `JEV_ENABLED=0` turns it off along with every other Jev feature. Without a key, or with either switch off, nothing is sent and validation runs as it always has. It spends no AI turn in either state: the step is a script. A [container run](#container-runs-and-run-output) does not inherit the host's environment, so there it is off unless the project's own environment variables supply the key.
 
-With a key set, a red gate adds one classifier request before the agent starts, bounded by `JEV_OPINION_TIMEOUT_MS`. Every way the classifier cannot answer -- a timeout, an HTTP error, an answer that is not one of the four classes, an unusable setting -- gives the agent an `unavailable` result naming the reason, and the agent works without an opinion. The step does not fail the run on those.
+With a key set, a red gate adds one classifier request before the agent starts, bounded by `JEV_OPINION_TIMEOUT_MS`. Every way the classifier cannot answer -- a timeout, an HTTP error, an answer that is not one of the four classes, an unusable setting, a failing check that printed nothing to judge -- gives the agent an `unavailable` result naming the reason, and the agent works without an opinion. The step does not fail the run on those.
 
-**What leaves the machine.** One request to `JEV_API_BASE` per red gate, carrying the question, the four criteria, and the end of `validation.md` from the run's artifacts: the failing check's name, command, exit status and the last lines of its output. At most `JEV_OPINION_MAX_EVIDENCE_CHARS` characters of it are sent, starting on a whole line. Before that cut, recognisable secrets are replaced with `[REDACTED]`: the exact value of every secret-named variable in the step's environment (a name with `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL`, `AUTH` or `DSN` as one of its underscore-separated parts, and a value of eight characters or more), private-key blocks, `Authorization` and bearer credentials, the user and password in a URL, values assigned to secret-named keys (`password=...`, `"client_secret": "..."`), and well-known token formats. This is a filter over known shapes, not a guarantee: a credential that a failing command printed in some other shape is sent as it is. For a project where that matters, leave the second opinion off or point `JEV_API_BASE` at a service you host. Neither the record nor the key is written to the run's output.
+**What leaves the machine.** One request to `JEV_API_BASE` per red gate, carrying the question, the four criteria, and the end of `validation.md` from the run's artifacts: the failing check's name, command, exit status and the last lines of its output. At most `JEV_OPINION_MAX_EVIDENCE_CHARS` characters of it are sent, starting on a whole line unless that would drop more than half of them.
+
+Before that cut, recognisable secrets are replaced with `[REDACTED]`:
+
+- the exact value of every secret-named variable in the step's environment, when it is eight characters or longer;
+- private keys, including encrypted and PGP ones and a key printed on one line;
+- values assigned to secret-named keys (`DB_PASS=...`, `signing_key: ...`, `"client_secret": "..."`, a YAML value on the lines under such a key), taken to the end of the line unless they are quoted or sit in a query string;
+- values passed after secret-named flags (`--token ...`), and a MySQL client's `-p...`;
+- `Cookie`, `Set-Cookie`, `Authorization` and bearer credentials;
+- the password in a URL (`scheme://user:password@host`), and a token in front of a host;
+- well-known token formats, among them OpenAI, GitHub, GitLab, Slack, Stripe, Google, SendGrid, Twilio and npm tokens, AWS key ids, and JSON Web Tokens.
+
+A name counts as secret when one of its parts is `PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`, `COOKIE`, `AUTH`, `SIGNATURE`, `SIG` or `DSN`, or when `KEY`, `PASS` or `PWD` appears inside a longer name. This is a filter over known shapes, not a guarantee: a credential that a failing command printed in some other shape is sent as it is. For a project where that matters, leave the second opinion off or point `JEV_API_BASE` at a service you host. Neither the record nor the key is written to the run's output.
 
 | Variable | Description | Default |
 | --- | --- | --- |
 | `JEV_OPINION_ENABLED` | Set to `0` or `false` to turn only the second opinion off | on when the key is set |
-| `JEV_OPINION_TIMEOUT_MS` | Longest the one classifier request may take | `30000` |
+| `JEV_OPINION_TIMEOUT_MS` | Longest the one classifier request may take. Must be under `120000`, the step's own time limit. | `30000` |
 | `JEV_OPINION_MAX_EVIDENCE_CHARS` | Most characters of the failing check's record sent. The end of the record is what is kept. | `16000` |
 
 `JEV_API_KEY`, `JEV_ENABLED`, `JEV_API_BASE` and `JEV_MODEL` are shared with the scout and listed above. An unusable number makes the step report `unavailable` and name the variable; it never falls back to the default.
 
-Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it, and has not been measured: no agent that edits code reads the opinion in the same run, so its effect reaches an edit only through the cause and summary the classifying agent writes. The SDLC pack's README describes the paired runs that would measure it.
+Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it, and has not been measured. No agent that edits code reads the opinion itself. Its effect reaches an edit only through the cause and summary the classifying agent writes: the summary states the class the classifier chose and whether the log bore it out, and `archon-deliver` hands that summary to its CI correction step as context. The SDLC pack's README describes the paired runs that would measure it.
 
 ### Telemetry
 

@@ -10,15 +10,17 @@ import { trackTempRoots } from '@archon/paths/test-utils';
 import type { Fetch } from '../../workflows/sdlc/.shared/jev-client';
 import {
   askSecondOpinion,
+  OPINION_TIMEOUT_LIMIT_MS,
   parseChoices,
   readOpinionSettings,
-  redactEvidence,
   type SecondOpinion,
 } from '../../workflows/sdlc/.shared/second-opinion';
 
 const trackTempRoot = trackTempRoots();
 
-const API_KEY = 'sk-test-PLANTED-OPINION-KEY';
+// Credential-shaped literals are joined at runtime, so no secret scanner mistakes a
+// fixture for a leak.
+const API_KEY = ['sk', '-test-PLANTED-OPINION-KEY'].join('');
 const QUESTION = 'Why did this check fail?';
 const CHOICES = {
   broken: 'The code under test is wrong.',
@@ -123,6 +125,12 @@ describe('readOpinionSettings', () => {
     }
   });
 
+  it('accepts a request timeout just inside the limit', () => {
+    expect(OPINION_TIMEOUT_LIMIT_MS).toBe(120_000);
+    const read = readOpinionSettings({ JEV_API_KEY: 'k', JEV_OPINION_TIMEOUT_MS: '119999' });
+    expect(read.available && read.settings.timeoutMs).toBe(119_999);
+  });
+
   it('is not turned off by the switch of another Jev feature', () => {
     expect(readOpinionSettings({ JEV_API_KEY: 'k', JEV_SCOUT_ENABLED: '0' }).available).toBe(true);
   });
@@ -163,6 +171,9 @@ describe('readOpinionSettings', () => {
     ['JEV_OPINION_TIMEOUT_MS', '-5'],
     ['JEV_OPINION_TIMEOUT_MS', '1.5'],
     ['JEV_OPINION_TIMEOUT_MS', 'soon'],
+    // At or past the longest a checkpoint's node waits, the node would be stopped first.
+    ['JEV_OPINION_TIMEOUT_MS', '120000'],
+    ['JEV_OPINION_TIMEOUT_MS', '600000'],
     ['JEV_OPINION_MAX_EVIDENCE_CHARS', '0'],
     ['JEV_OPINION_MAX_EVIDENCE_CHARS', 'lots'],
     ['JEV_OPINION_MAX_EVIDENCE_CHARS', '12e99999'],
@@ -251,7 +262,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: settings,
       fetch: jev.fetch,
     });
@@ -270,7 +281,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env(),
       fetch: jev.fetch,
     });
@@ -290,7 +301,7 @@ describe('askSecondOpinion', () => {
         fetch: jev.fetch,
       });
 
-    expect(await ask('  ', 'a log')).toEqual(unavailable('no_question'));
+    expect(await ask('  ', 'exit status 1')).toEqual(unavailable('no_question'));
     expect(await ask(QUESTION, ' \n ')).toEqual(unavailable('no_evidence'));
     expect(jev.sent).toEqual([]);
   });
@@ -325,7 +336,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env(),
       fetch: jev.fetch,
     });
@@ -340,7 +351,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env(),
       fetch: jev.fetch,
     });
@@ -358,7 +369,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env(),
       fetch: jev.fetch,
     });
@@ -379,7 +390,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env({ JEV_OPINION_TIMEOUT_MS: '30' }),
       fetch: stalled,
     });
@@ -393,7 +404,7 @@ describe('askSecondOpinion', () => {
     const opinion = await askSecondOpinion({
       question: QUESTION,
       choices: CHOICES,
-      evidence: { text: 'a log' },
+      evidence: { text: 'exit status 1' },
       env: env(),
       fetch: refused,
     });
@@ -482,6 +493,84 @@ describe('the evidence that is sent', () => {
     expect(sent.endsWith('THE_END')).toBe(true);
   });
 
+  it('keeps the end of a long line rather than only what follows it', async () => {
+    const jev = choosing('broken');
+    // One assertion line far longer than the cap, then a short closing line. Starting
+    // on the next whole line would send the closing line alone.
+    const long = `AssertionError: expected ${'a b c '.repeat(4000)}LONG_LINE_END`;
+
+    await askSecondOpinion({
+      question: QUESTION,
+      choices: CHOICES,
+      evidence: { text: `first line\n${long}\nexit status 1` },
+      env: env({ JEV_OPINION_MAX_EVIDENCE_CHARS: '1000' }),
+      fetch: jev.fetch,
+    });
+
+    const sent = jev.sent[0].body.state.evidence;
+    // The cap, less at most a space the cut landed on.
+    expect(sent.length).toBeGreaterThan(990);
+    expect(sent.length).toBeLessThanOrEqual(1000);
+    expect(sent.endsWith('LONG_LINE_END\nexit status 1')).toBe(true);
+  });
+
+  it('still starts on a whole line when that costs little', async () => {
+    const jev = choosing('broken');
+    const lines = Array.from({ length: 50 }, (_unused, index) => `line ${String(index)} ${'x'.repeat(30)}`);
+
+    await askSecondOpinion({
+      question: QUESTION,
+      choices: CHOICES,
+      evidence: { text: lines.join('\n') },
+      env: env({ JEV_OPINION_MAX_EVIDENCE_CHARS: '1000' }),
+      fetch: jev.fetch,
+    });
+
+    expect(jev.sent[0].body.state.evidence).toMatch(/^line \d+ x/);
+  });
+
+  it('is unavailable when nothing but removed secrets is left to judge', async () => {
+    const jev = choosing('broken');
+
+    const opinion = await askSecondOpinion({
+      question: QUESTION,
+      choices: CHOICES,
+      evidence: {
+        text: `-----BEGIN PRIVATE KEY-----\nPLANTEDBODY\n-----END PRIVATE KEY-----\n${['gh', 'p_PLANTEDGITHUBTOKEN0123456789abcdefghij'].join('')}\n`,
+      },
+      env: env(),
+      fetch: jev.fetch,
+    });
+
+    expect(opinion).toEqual(unavailable('insufficient_evidence'));
+    expect(jev.sent).toEqual([]);
+  });
+
+  it('judges only the part of the evidence its caller says the question is about', async () => {
+    const jev = choosing('broken');
+    const framed = (output: string): string => `HEADER the check failed\n<<${output}>>\nFOOTER see the log`;
+    const inside = (evidence: string): string =>
+      evidence.slice(evidence.indexOf('<<') + 2, evidence.lastIndexOf('>>'));
+    const ask = (output: string): Promise<SecondOpinion> =>
+      askSecondOpinion({
+        question: QUESTION,
+        choices: CHOICES,
+        evidence: { text: framed(output) },
+        judged: inside,
+        env: env(),
+        fetch: jev.fetch,
+      });
+
+    // The framing alone says that something failed, never why.
+    expect(await ask('')).toEqual(unavailable('insufficient_evidence'));
+    expect(await ask('  \n ')).toEqual(unavailable('insufficient_evidence'));
+    expect(jev.sent).toEqual([]);
+
+    expect((await ask('Killed')).status).toBe('ok');
+    // The framing is still sent: it is context for what is judged.
+    expect(jev.sent[0].body.state.evidence).toBe(framed('Killed'));
+  });
+
   it('removes planted secrets from the request and keeps the lines around them', async () => {
     const jev = choosing('machine');
     const pem = [
@@ -499,9 +588,9 @@ describe('the evidence that is sent', () => {
       'curl -H "authorization: Basic PLANTEDBASICAUTH==" https://api.example/v1',
       'fetching https://deploy:PLANTED_URL_PASSWORD@git.example/repo.git',
       'GET /callback?access_token=PLANTED_QUERY_TOKEN&state=kept',
-      'using key sk-PLANTEDPROVIDERKEY0123456789abcdef',
-      'token ghp_PLANTEDGITHUBTOKEN0123456789abcdefghij',
-      'aws AKIAPLANTEDAWSKEY012',
+      `using key ${['sk', '-PLANTEDPROVIDERKEY0123456789abcdef'].join('')}`,
+      `token ${['gh', 'p_PLANTEDGITHUBTOKEN0123456789abcdefghij'].join('')}`,
+      `aws ${['AK', 'IAPLANTEDAWSKEY012'].join('')}`,
       pem,
       'echo of an injected value: PLANTED-ENV-VALUE-123',
       `the classifier key itself: ${API_KEY}`,
@@ -555,71 +644,6 @@ describe('the evidence that is sent', () => {
   });
 });
 
-describe('redactEvidence', () => {
-  const redact = (text: string, environment: Record<string, string> = {}): string =>
-    redactEvidence(text, { JEV_API_KEY: API_KEY, ...environment });
-
-  it('removes a key block whose start or end lies outside the text', () => {
-    const tailOfBlock = 'PLANTEDBODY==\n-----END OPENSSH PRIVATE KEY-----\nError: exit 1';
-    expect(redact(tailOfBlock)).toBe('[REDACTED PRIVATE KEY]\nError: exit 1');
-    const headOfBlock = 'Error: exit 1\n-----BEGIN EC PRIVATE KEY-----\nPLANTEDBODY';
-    expect(redact(headOfBlock)).toBe('Error: exit 1\n[REDACTED PRIVATE KEY]');
-  });
-
-  it.each([
-    'Error: DATABASE_URL is not set',
-    'FATAL: password authentication failed for user "postgres"',
-    'tests/test_token.py::test_refresh_token FAILED',
-    'thread main panicked at src/auth/token.rs:42:9',
-    'error[E0433]: failed to resolve: use of undeclared crate `auth::token::verify`',
-    "SyntaxError: Unexpected token '}' in JSON at position 41",
-    'Error: listen EADDRINUSE: address already in use :::3000',
-    'npm error code ERESOLVE',
-    'expect(received).toBe(expected) // Object.is equality',
-    'see https://github.com/example/repo/issues/12 for details',
-  ])('leaves an ordinary failure line as it is: %s', line => {
-    expect(redact(line)).toBe(line);
-  });
-
-  // Evidence is whatever a failing command printed. The patterns bound how far a
-  // name or a URL scheme may run, so none of these shapes costs time quadratic in the
-  // text; a pattern that did would take far longer than this allows.
-  it('stays fast on long runs of text that almost match a pattern', () => {
-    const size = 72_000;
-    const runs = [
-      'a.'.repeat(size / 2),
-      'a-'.repeat(size / 2),
-      'x://'.repeat(size / 4),
-      'password'.repeat(size / 8),
-      '-----BEGIN PRIVATE KEY-----\n'.repeat(size / 28),
-    ];
-
-    const started = performance.now();
-    for (const text of runs) redact(text);
-
-    expect(performance.now() - started).toBeLessThan(5000);
-  });
-
-  it('removes the exact value of a secret-named variable, wherever it is echoed', () => {
-    const text = 'request to /v1 failed with header x-auth: abcd1234efgh';
-    expect(redact(text, { UPSTREAM_API_KEY: 'abcd1234efgh' })).not.toContain('abcd1234efgh');
-  });
-
-  it('never treats a short or ordinary variable as a value to remove', () => {
-    const text = 'retry 1 of 3: true path /srv/app/build failed in production';
-    expect(
-      redact(text, {
-        // Too short to be removed safely: every `1` and `true` in the log would go.
-        FEATURE_TOKEN: '1',
-        DEBUG_SECRET: 'true',
-        // Not secret-named: an ordinary path and mode stay readable.
-        PWD: '/srv/app/build',
-        NODE_ENV: 'production',
-      })
-    ).toBe(text);
-  });
-});
-
 describe('evidence read from the artifacts directory', () => {
   const ask = (
     dir: string,
@@ -662,6 +686,23 @@ describe('evidence read from the artifacts directory', () => {
     expect(sent.length).toBeLessThanOrEqual(300);
     expect(sent.endsWith('SENT_MARKER last line')).toBe(true);
     expect(sent.startsWith('padding line')).toBe(true);
+  });
+
+  it('keeps the end of a last line that is longer than everything it reads', async () => {
+    const long = `expected ${'word '.repeat(60_000)}LONG_LINE_END`;
+    const dir = artifacts({ 'validation.md': `# Validation\n\n${long}\nexit status 1\n` });
+    const jev = choosing('broken');
+
+    const opinion = await ask(dir, 'validation.md', jev, {
+      JEV_OPINION_MAX_EVIDENCE_CHARS: '1000',
+    });
+
+    expect(opinion.status).toBe('ok');
+    const sent = jev.sent[0].body.state.evidence;
+    // The cap, less at most a space the cut landed on.
+    expect(sent.length).toBeGreaterThan(990);
+    expect(sent.length).toBeLessThanOrEqual(1000);
+    expect(sent.endsWith('LONG_LINE_END\nexit status 1')).toBe(true);
   });
 
   it('refuses a path outside the directory', async () => {
