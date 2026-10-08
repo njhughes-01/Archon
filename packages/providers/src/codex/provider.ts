@@ -25,6 +25,7 @@ import { CODEX_CAPABILITIES } from './capabilities';
 import { resolveCodexBinaryPath, resolveSdkBundledCodexCommand } from './binary-resolver';
 import { openCodexToolGateBridge, type CodexToolGateBridge } from './tool-gate-bridge';
 import type { CodexToolCategory } from './tool-gate-request';
+import { assertCodexSupportsToolGate } from './tool-gate-version';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import {
@@ -459,19 +460,19 @@ const HOOKED_ITEM_CATEGORIES: readonly CodexToolCategory[] = ['command', 'file_c
 
 const TOOL_GATE_INACTIVE_MESSAGE =
   "Codex ran a tool without asking Archon's tool gate, so the turn was stopped. " +
-  'The gate reaches Codex through a PreToolUse hook, and that hook did not run for this tool call: ' +
-  'check that hooks are enabled in your Codex configuration (`features.hooks`) and that the Codex CLI is recent enough to support them. ' +
+  'The gate reaches Codex through a PreToolUse hook, which Archon turns on for the turn, and the gate was not asked about this tool call: ' +
+  'a managed Codex policy that disables hooks, or a Codex CLI that handles them differently, is the likely cause. ' +
   'What that tool call did was not checked.';
 
 /**
  * Watches one attempt of a gated turn for a tool that ran unasked.
  *
- * The hook is Codex's to run, and Codex skips it without an error when hooks
- * are disabled, untrusted or unknown to that version. So its running is
- * observed rather than assumed: the bridge counts a call it lets through
- * before answering the hook, hence before the tool's item can appear in the
- * stream, and a denied call leaves no item. More tool items than calls let
- * through therefore means one ran without the gate.
+ * The hook is Codex's to run. A gated turn forces hooks on and bypasses hook
+ * trust, but Codex skips a hook it will not run without any error, so its
+ * running is still observed rather than assumed: the bridge counts a call it
+ * lets through before answering the hook, hence before the tool's item can
+ * appear in the stream, and a denied call leaves no item. More tool items than
+ * calls let through therefore means one ran without the gate.
  *
  * The count is not kept per kind of tool: Codex applies a patch the model
  * pipes to `apply_patch` in the shell itself, so a `Bash` hook call can
@@ -1029,10 +1030,9 @@ export class CodexProvider implements IAgentProvider {
 
     const codexConfig = parseCodexConfig(requestOptions.assistantConfig ?? {});
     const pinnedBinary = await resolveCodexBinaryPath(codexConfig.codexBinaryPath);
-    const bridge = await openCodexToolGateBridge({
-      toolGate,
-      codexCommand: pinnedBinary ? [pinnedBinary] : resolveSdkBundledCodexCommand(),
-    });
+    const codexCommand = pinnedBinary ? [pinnedBinary] : resolveSdkBundledCodexCommand();
+    await assertCodexSupportsToolGate(codexCommand);
+    const bridge = await openCodexToolGateBridge({ toolGate, codexCommand });
     try {
       yield* this.runQuery(prompt, cwd, resumeSessionId, requestOptions, bridge);
     } finally {

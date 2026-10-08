@@ -1,5 +1,5 @@
-import { describe, test, expect, mock, beforeEach, type Mock } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'fs/promises';
+import { describe, test, expect, mock, beforeAll, afterAll, beforeEach, type Mock } from 'bun:test';
+import { chmod, mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import type {
@@ -67,6 +67,8 @@ mock.module('@openai/codex-sdk', () => ({
 }));
 
 import { CodexProvider, classifyCodexError, resetCodexSingleton } from './provider';
+import { resetCodexVersionCache } from './tool-gate-version';
+import { removeTempTree } from '@archon/paths/test-utils';
 
 describe('CodexProvider', () => {
   let client: CodexProvider;
@@ -2841,9 +2843,25 @@ describe('tool gate', () => {
   };
 
   let client: CodexProvider;
+  let codexDir: string;
+  /** A stand-in Codex binary: the provider only asks it for its version; the SDK is mocked. */
+  let codexBinary: string;
 
-  beforeEach(() => {
+  beforeAll(async () => {
+    codexDir = await mkdtemp(join(tmpdir(), 'archon-codex-provider-gate-test-'));
+    codexBinary = join(codexDir, 'codex');
+    await writeFile(codexBinary, '#!/bin/sh\ncat "$(dirname "$0")/version.txt"\n');
+    await chmod(codexBinary, 0o755);
+  });
+
+  afterAll(async () => {
+    await removeTempTree(codexDir);
+  });
+
+  beforeEach(async () => {
     resetCodexSingleton();
+    resetCodexVersionCache();
+    await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.159.3\n');
     client = new CodexProvider({ retryBaseDelayMs: 1 });
     MockCodex.mockClear();
     mockStartThread.mockClear();
@@ -2895,7 +2913,11 @@ describe('tool gate', () => {
     resumeSessionId?: string
   ): Promise<MessageChunk[]> {
     const chunks: MessageChunk[] = [];
-    for await (const chunk of client.sendQuery('test', '/workspace', resumeSessionId, options)) {
+    // A gated request reads the Codex CLI's version first, so it gets the stand-in binary.
+    const withBinary = options?.toolGate
+      ? { ...options, assistantConfig: { codexBinaryPath: codexBinary } }
+      : options;
+    for await (const chunk of client.sendQuery('test', '/workspace', resumeSessionId, withBinary)) {
       chunks.push(chunk);
     }
     return chunks;
@@ -2939,7 +2961,7 @@ describe('tool gate', () => {
     const options = gatedOptions();
     expect(Object.keys(options).sort()).toEqual(['codexPathOverride', 'config']);
     expect(Object.keys(options.config).sort()).toEqual(['features', 'hooks']);
-    expect(options.config.features).toEqual({ unified_exec_tty: false });
+    expect(options.config.features).toEqual({ unified_exec_tty: false, hooks: true });
     expect(options.config.hooks.PreToolUse[0].hooks[0].type).toBe('command');
     expect(mockStartThread.mock.calls).toEqual([[EXPECTED_THREAD_OPTIONS]]);
     expect(launcherExisted).toBe(true);
@@ -3022,7 +3044,7 @@ describe('tool gate', () => {
     expect(MockCodex).toHaveBeenCalledTimes(2);
     expect(gatedOptions(1).codexPathOverride).toBe(gatedOptions(0).codexPathOverride);
     expect(gatedOptions(1).config.hooks).toEqual(gatedOptions(0).config.hooks);
-    expect(gatedOptions(1).config.features).toEqual({ unified_exec_tty: false });
+    expect(gatedOptions(1).config.features).toEqual({ unified_exec_tty: false, hooks: true });
     expect('skills' in gatedOptions(1).config).toBe(false);
   });
 
@@ -3321,6 +3343,7 @@ describe('tool gate', () => {
 
       for await (const _ of client.sendQuery('test', '/workspace', undefined, {
         toolGate: mock<Gate>(() => Promise.resolve(ALLOW)),
+        assistantConfig: { codexBinaryPath: codexBinary },
       })) {
         break;
       }
@@ -3345,6 +3368,44 @@ describe('tool gate', () => {
 
       expect(gateDirs().filter(name => !before.includes(name))).toEqual([]);
     });
+  });
+
+  test('refuses a gated request on a Codex CLI older than the gate was proven on', async () => {
+    // An older CLI may not know `features.unified_exec_tty` and would keep the
+    // unhooked stdin path open without saying so.
+    await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.156.9\n');
+    const { readdirSync } = await import('node:fs');
+    const gateDirs = (): string[] =>
+      readdirSync(tmpdir()).filter(
+        name => name.startsWith('archon-codex-gate-') && !name.includes('test')
+      );
+    const before = gateDirs();
+
+    await expect(collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })).rejects.toThrow(
+      /needs Codex CLI 0\.157\.0 or newer.* is 0\.156\.9/
+    );
+
+    expect(MockCodex).not.toHaveBeenCalled();
+    expect(gateDirs().filter(name => !before.includes(name))).toEqual([]);
+  });
+
+  test('does not read the Codex version for an ungated request', async () => {
+    await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.1.0\n');
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    const chunks: MessageChunk[] = [];
+    for await (const chunk of client.sendQuery('test', '/workspace', undefined, {
+      assistantConfig: { codexBinaryPath: codexBinary },
+    })) {
+      chunks.push(chunk);
+    }
+
+    expect(chunks.at(-1)).toMatchObject({ type: 'result' });
+    expect(MockCodex).toHaveBeenCalledWith({ codexPathOverride: codexBinary });
   });
 
   test('refuses a gated request on Windows instead of running ungated', async () => {

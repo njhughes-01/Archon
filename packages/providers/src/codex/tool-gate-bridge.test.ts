@@ -12,6 +12,12 @@ import { join } from 'node:path';
 import { Codex } from '@openai/codex-sdk';
 import { removeTempTree } from '@archon/paths/test-utils';
 import type { ToolActionDecision, ToolActionRequest } from '../types';
+import {
+  MIN_GATED_CODEX_VERSION,
+  assertCodexSupportsToolGate,
+  parseCodexVersion,
+  resetCodexVersionCache,
+} from './tool-gate-version';
 import { createMockLogger } from '../test/mocks/logger';
 
 const mockLogger = createMockLogger();
@@ -183,7 +189,13 @@ describe('openCodexToolGateBridge', () => {
   test('turns off TTY sessions, so a running command cannot be fed unhooked input', async () => {
     const bridge = await openBridge(mock<Gate>(() => Promise.resolve(ALLOW)));
 
-    expect(bridge.configOverrides.features).toEqual({ unified_exec_tty: false });
+    expect(bridge.configOverrides.features).toMatchObject({ unified_exec_tty: false });
+  });
+
+  test('forces Codex hooks on for the run, whatever the user configured', async () => {
+    const bridge = await openBridge(mock<Gate>(() => Promise.resolve(ALLOW)));
+
+    expect(bridge.configOverrides.features).toEqual({ unified_exec_tty: false, hooks: true });
   });
 
   test('gives Codex longer than the hook needs, and the hook longer than the gate', async () => {
@@ -529,6 +541,95 @@ describe('resolveSdkBundledCodexCommand', () => {
   });
 });
 
+describe('the Codex version floor', () => {
+  /** A stand-in Codex binary whose `--version` output and exit status the test sets. */
+  async function versionedCodex(output: string, exitCode = 0): Promise<string[]> {
+    const dir = await tempDir();
+    const path = join(dir, 'codex');
+    await writeFile(join(dir, 'version.txt'), output);
+    await writeFile(
+      path,
+      [
+        '#!/bin/sh',
+        'here=$(dirname "$0")',
+        'echo "$*" >> "$here/calls.txt"',
+        'cat "$here/version.txt"',
+        `exit ${String(exitCode)}`,
+        '',
+      ].join('\n')
+    );
+    chmodSync(path, 0o755);
+    return [path];
+  }
+
+  test.each([
+    ['codex-cli 0.159.3', [0, 159, 3]],
+    ['codex-cli 0.157.0\n', [0, 157, 0]],
+    ['codex-cli 1.2.10', [1, 2, 10]],
+    ['codex-cli 0.160.0-alpha.3', [0, 160, 0]],
+    ['codex-cli unknown', undefined],
+    ['', undefined],
+  ])('reads the version out of %j', (output, expected) => {
+    expect(parseCodexVersion(output)).toEqual(expected as never);
+  });
+
+  test('the floor is the oldest version the gate was proven on', () => {
+    expect(MIN_GATED_CODEX_VERSION).toEqual([0, 157, 0]);
+  });
+
+  test.each(['codex-cli 0.157.0', 'codex-cli 0.159.3', 'codex-cli 1.0.0'])(
+    'accepts %s',
+    async output => {
+      resetCodexVersionCache();
+      await expect(
+        assertCodexSupportsToolGate(await versionedCodex(output))
+      ).resolves.toBeUndefined();
+    }
+  );
+
+  test.each(['codex-cli 0.156.9', 'codex-cli 0.99.99'])('refuses %s', async output => {
+    resetCodexVersionCache();
+    await expect(assertCodexSupportsToolGate(await versionedCodex(output))).rejects.toThrow(
+      /needs Codex CLI 0\.157\.0 or newer/
+    );
+  });
+
+  test('refuses a CLI whose version cannot be read', async () => {
+    resetCodexVersionCache();
+    await expect(
+      assertCodexSupportsToolGate(await versionedCodex('something else entirely'))
+    ).rejects.toThrow(/could not read/);
+    await expect(
+      assertCodexSupportsToolGate(await versionedCodex('codex-cli 0.159.3', 1))
+    ).rejects.toThrow(/could not be read/);
+    await expect(assertCodexSupportsToolGate(['/nonexistent/codex'])).rejects.toThrow(
+      /could not be read/
+    );
+  });
+
+  test('asks each binary once, and asks again after a failed read', async () => {
+    resetCodexVersionCache();
+    const good = await versionedCodex('codex-cli 0.159.3');
+    await assertCodexSupportsToolGate(good);
+    await assertCodexSupportsToolGate(good);
+    expect(readFileSync(join(good[0], '..', 'calls.txt'), 'utf8')).toBe('--version\n');
+
+    const broken = await versionedCodex('codex-cli 0.159.3', 1);
+    await assertCodexSupportsToolGate(broken).catch(() => undefined);
+    await assertCodexSupportsToolGate(broken).catch(() => undefined);
+    expect(readFileSync(join(broken[0], '..', 'calls.txt'), 'utf8')).toBe('--version\n--version\n');
+  });
+
+  test('passes the launch command through, for a CLI started by a runtime', async () => {
+    resetCodexVersionCache();
+    const [script] = await versionedCodex('codex-cli 0.159.3');
+
+    await assertCodexSupportsToolGate(['/bin/sh', script]);
+
+    expect(readFileSync(join(script, '..', 'calls.txt'), 'utf8')).toBe('--version\n');
+  });
+});
+
 describe('the Codex launcher', () => {
   /** A stand-in Codex binary that records its arguments, one per line. */
   async function fakeCodex(dirName = 'bin'): Promise<{ path: string; argsFile: string }> {
@@ -664,6 +765,7 @@ describe('the Codex launcher', () => {
       `hooks.PreToolUse=[{hooks = [{type = "command", command = ${JSON.stringify(handler.command)}, timeout = ${String(handler.timeout)}}]}]`
     );
     expect(args).toContain('features.unified_exec_tty=false');
+    expect(args).toContain('features.hooks=true');
     expect(args).toContain('approval_policy="never"');
   });
 });

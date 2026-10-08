@@ -354,7 +354,11 @@ export async function openCodexToolGateBridge(
       // to type into and every command is its own hooked call. Turning
       // `unified_exec` itself off does not do this: the model catalog decides
       // the shell tool, and the models in use keep unified exec either way.
-      features: { unified_exec_tty: false },
+      //
+      // `hooks` is forced on so a user who has turned Codex hooks off does not
+      // get a gated turn whose first tool runs unasked. Both are per-invocation
+      // overrides; the user's own config file is not touched.
+      features: { unified_exec_tty: false, hooks: true },
     };
 
     return {
