@@ -4789,6 +4789,7 @@ export interface components {
       agents: boolean;
       toolRestrictions: boolean;
       fileWriteRestriction?: boolean;
+      toolActionGate?: boolean;
       knownToolNames?: string[];
       renamedTools?: {
         [key: string]: string;

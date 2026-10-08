@@ -496,7 +496,56 @@ export interface AgentRequestOptions {
    * provider without it ignores the option.
    */
   restrictFileWrites?: boolean;
+  /**
+   * Asked before each tool call that can change state, with the call described
+   * in provider-neutral terms. The provider maps its native tool names to a
+   * `ToolActionKind`, never calls this for a read-only tool, and on a `deny`
+   * does not run the tool: it hands `reason` and `alternatives` back to the
+   * model as that tool's result. A rejected promise is a gate failure and must
+   * be treated as a denial, never as permission. Gated on the `toolActionGate`
+   * capability: a caller must not set this for a provider without it, because
+   * that provider would run every tool unasked.
+   */
+  toolGate?: (request: ToolActionRequest) => Promise<ToolActionDecision>;
 }
+
+/** What a tool call does, in terms every provider can map its own tools to. */
+export type ToolActionKind = 'shell' | 'file_write' | 'network' | 'mcp' | 'other';
+
+/** One tool call a provider is about to run, as handed to `AgentRequestOptions.toolGate`. */
+export interface ToolActionRequest {
+  /** The provider's own name for the tool. */
+  toolName: string;
+  kind: ToolActionKind;
+  /** The directory the tool will run in, as the provider reports it. */
+  cwd: string;
+  /** Shell text, for `kind: 'shell'`. */
+  command?: string;
+  /** Write targets, for `kind: 'file_write'`. */
+  paths?: string[];
+  url?: string;
+  /** The tool's raw input. It can hold secrets: never log or forward it unredacted. */
+  input: Record<string, unknown>;
+  toolCallId?: string;
+  fromSubagent?: boolean;
+  /** The provider SDK's own parse of the shell text, when it supplies one. */
+  parsedCommands?: string[];
+}
+
+/**
+ * The gate's answer. A denial always carries a reason and safer alternatives
+ * for the model; `needsApproval` marks a call a human could approve, as opposed
+ * to one a fixed rule refuses.
+ */
+export type ToolActionDecision =
+  | { action: 'allow' }
+  | {
+      action: 'deny';
+      needsApproval: boolean;
+      reason: string;
+      alternatives: string[];
+      ruleId?: string;
+    };
 
 /**
  * One property on a native tool's input object. `kind` is the discriminant the
