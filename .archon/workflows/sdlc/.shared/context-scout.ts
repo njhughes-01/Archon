@@ -92,8 +92,9 @@ function switchedOff(value: string | undefined): boolean {
  * The scout's settings, or why it is off.
  *
  * On when `JEV_API_KEY` is set, unless `JEV_ENABLED` (everything Jev) or
- * `JEV_SCOUT_ENABLED` (the scout alone) is `0` or `false`. A container run receives none
- * of the host's environment, so there it is simply off.
+ * `JEV_SCOUT_ENABLED` (the scout alone) is `0` or `false`. A container run does not
+ * inherit the host's environment, so there it is off unless the project's own
+ * environment supplies the key.
  *
  * An unusable number turns the scout off and names the variable, instead of falling back
  * to the default: a mistyped threshold or budget must not quietly become another policy.

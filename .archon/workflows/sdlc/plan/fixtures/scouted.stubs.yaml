@@ -1,0 +1,40 @@
+# Dry-run fixture: the scout ran. Proves its question and paths bind into the
+# classifier node, and that the classifier's result reaches the plan prompt.
+code-index: "stub: index built"
+scout__config: { available: true, reason: "" }
+scout__question:
+  focused: true
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth"]
+scout__classify:
+  status: truncated
+  reason: max_files
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth"]
+  files:
+    - path: src/auth/session.ts
+      relevant: true
+      confidence: 0.91
+      evidence: { startLine: 101, endLine: 220 }
+    - path: src/auth/cookies.ts
+      relevant: false
+      confidence: 0.08
+      evidence: { startLine: 1, endLine: 64 }
+  counts:
+    candidates: 9
+    excluded: { ignored: 0, secret: 1, not_regular_file: 0, too_large: 0, binary: 0, empty: 0 }
+    classified: 2
+    relevant: 1
+    unclassified: 6
+    windows: 5
+    requests: 1
+    charsSent: 18240
+plan:
+  ready: true
+  summary: "stub: approach chosen — full plan at plan.md"
+  report: { type: archon_artifact, run_id: "fixture-run", path: "plan.md" }
+fixture:
+  expect: completed
+  reached: [scout__config, scout__question, scout__classify, plan]
+  resolved-text-contains:
+    plan: '"path":"src/auth/session.ts","relevant":true,"confidence":0.91,"evidence":{"startLine":101,"endLine":220}'

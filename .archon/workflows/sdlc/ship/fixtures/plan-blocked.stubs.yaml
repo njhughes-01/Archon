@@ -15,6 +15,9 @@ triage__triage:
   report: { type: archon_artifact, run_id: "fixture-run", path: "triage.md" }
 # Stubbed so exec-code never builds a real Codanna index in the scratch worktree.
 planned__code-index: "stub: index built"
+# Pinned off: this fixture executes unstubbed scripts, and the scout's gate would
+# otherwise answer from whatever classifier the machine running it has configured.
+planned__scout__config: { available: false, reason: no_api_key }
 planned__plan:
   ready: false
   summary: "stub: owner decision required before implementation"

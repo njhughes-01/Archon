@@ -127,6 +127,49 @@ A vocabulary a node declares in YAML has exactly one owner. A script that routes
 one imports it from `.shared/verdict.ts`; a script that merely consumes another
 node's certified value does not restate the list at all.
 
+## Context scout
+
+[archon-scout](scout/archon-scout.yaml) is an optional pre-read that `investigate`
+and `plan` include before their agent: a classifier answers one yes/no question
+about every candidate file, in line windows, and the agent starts from the files
+it selected. Three nodes, each doing the one thing its kind is for:
+
+- `config` (script) reports whether a classifier is configured. `when:` cannot
+  read the environment, so this is the gate that keeps an install without one
+  from paying for the next node.
+- `question` (agent, small tier) turns the free-text request into one question
+  and the paths worth checking, or declines. That is judgment, so no script
+  attempts it.
+- `classify` (script) is everything after the judgment: which files may be sent,
+  the budgets, the requests, the result.
+
+[`.shared/context-scout.ts`](.shared/context-scout.ts) owns all of the last one,
+and it is where to read what "never sent" means. The settings are environment
+variables, documented with the rest of the configuration reference.
+
+Two rules hold it together:
+
+- **The scout can never cost the run.** Every way it cannot answer is a result
+  (`status: unavailable`, with the reason) or a skip, and a consumer binds its
+  output with `if_skipped`. The one exception is the `question` agent itself: it
+  only runs once a classifier is configured, and its failure fails the run like
+  any other agent node's.
+- **Its list is a lead, never evidence.** The prompts that read it say so. A file
+  the budget cut is counted as unclassified and left out; it is never listed as
+  not relevant.
+
+[`.shared/jev-client.ts`](.shared/jev-client.ts) is a byte-for-byte copy of
+`packages/workflows/src/jev/jev-client.ts`, because nothing in a pack can import
+engine code. Edit the engine file and copy it over; `jev-client-mirror.test.ts`
+fails while they differ.
+
+Whether the classifier is good enough is measured, not assumed:
+`bun run scout-eval` runs the same code over a labelled fixture repository and
+reports recall, precision, files selected and characters sent. It calls the real
+classifier, so it needs `JEV_API_KEY` and is not part of the test suite;
+`--dry` answers from the answer key and sends nothing. See
+[`scripts/context-scout-eval.ts`](../../../scripts/context-scout-eval.ts).
+
 ## Evidence never carries credentials
 
 The engine retains what every exec node prints, so a node's output is the record

@@ -2,6 +2,8 @@
 # that the verdict fields bind. Structured stubs are YAML mappings (they hydrate
 # structuredOutput); plain-string stubs stay strings.
 code-index: "stub: index built"
+# No classifier configured: the scout's gate says so and nothing else of it runs.
+scout__config: { available: false, reason: no_api_key }
 investigate:
   rooted: true
   summary: "stub: cause established — full report at investigation.md"
