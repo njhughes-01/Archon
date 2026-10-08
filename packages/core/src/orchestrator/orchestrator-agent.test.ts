@@ -7228,6 +7228,26 @@ describe('chat turn tool gate', () => {
       });
     });
 
+    test('gate on: the agent is told up front not to clone, so it gives the advice without a denied call', async () => {
+      const { options } = await turn();
+      const prompt = JSON.stringify(options?.systemPrompt);
+      expect(prompt).toContain('do not try to clone');
+      expect(prompt).toContain(SETUP_ADVICE);
+
+      // A project chat, and any chat with the gate off, is told nothing of the kind.
+      mockSendQuery.mockClear();
+      scopeTo(checkout);
+      expect(JSON.stringify((await turn()).options?.systemPrompt)).not.toContain(
+        'do not try to clone'
+      );
+      mockSendQuery.mockClear();
+      unscoped();
+      configure({});
+      expect(JSON.stringify((await turn()).options?.systemPrompt)).not.toContain(
+        'do not try to clone'
+      );
+    });
+
     test('gate on: a shell command is flagged, because it does not run inside the root', async () => {
       const gate = await gateOfTurn();
       mockLogger.info.mockClear();

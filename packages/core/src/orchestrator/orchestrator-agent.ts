@@ -147,6 +147,15 @@ const NO_PROJECT_GATE_ADVICE =
   'with `/register-project <name> <path>` (or Add Project in the web console), or switch the ' +
   'gate off for the setup (toolGate.enabled in ~/.archon/config.yaml).';
 
+/** Added to the system prompt of a chat with no project while the gate is on. */
+const NO_PROJECT_GATE_PROMPT_SECTION =
+  '## Tool gate\n\n' +
+  'The tool gate is on and this chat has no project, so no tool call can write anything from ' +
+  'here. That overrides the Project Setup steps above: do not try to clone a repository. If the ' +
+  'user wants to add a project, tell them to clone it in a terminal and register it with ' +
+  '`/register-project <name> <path>` (or Add Project in the web console), or to switch the gate ' +
+  'off for the setup (toolGate.enabled in ~/.archon/config.yaml).';
+
 /** Max assistant text chunks to keep in batch mode (oldest are dropped) */
 const MAX_BATCH_ASSISTANT_CHUNKS = 20;
 /** Max total chunks (assistant + tool) to keep in batch mode */
@@ -2562,6 +2571,11 @@ export async function handleMessage(
       systemAppend += `\n\n${buildRunManagementSection()}`;
     }
     if (followUpEnabled) systemAppend += `\n\n${RUN_FOLLOW_UP_PROMPT_SECTION}`;
+    // The routing rules tell a chat with no project to clone a new one itself.
+    // With the gate on that clone is denied, so the agent is told before it tries.
+    if (config.toolGate?.enabled === true && scopedCodebase === undefined) {
+      systemAppend += `\n\n${NO_PROJECT_GATE_PROMPT_SECTION}`;
+    }
     const systemPrompt =
       providerKey === 'claude'
         ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemAppend }
