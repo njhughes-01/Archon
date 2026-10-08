@@ -168,20 +168,11 @@ import {
   type LoopWithCompiledCommand,
   type IncludeCommandContent,
 } from './compiled-command';
-import {
-  assistantModelDefaults,
-  resolveNodeModel,
-  type WorkflowModelScope,
-} from './node-model-resolution';
+import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
 import { providerReadsWebSearchMode, unsupportedNodeFields } from './node-capability-checks';
 import { collectCredentialValues, redactCredentialValues } from './redaction';
-import {
-  escalateRoute,
-  escalationReason,
-  formatTaskText,
-  routeAgentNode,
-  type RoutedNode,
-} from './jev/model-router';
+import { escalateRoute, escalationReason } from './jev/model-router';
+import { executorModelScope, routeNodeModel } from './node-model-routing';
 import type { ModelRouterConfig, NodeRoute } from './schemas/model-router';
 import {
   logNodeComplete,
@@ -1623,103 +1614,6 @@ export function substituteLoopPrevRefs(
 
 // buildSDKHooksFromYAML moved to @archon/providers/src/claude/provider.ts
 // loadMcpConfig moved to @archon/providers/src/mcp/config.ts
-
-/** The workflow-level fallbacks the executor threads beside each node, as the resolver takes them. */
-function executorModelScope(
-  workflowProvider: string,
-  workflowModel: string | undefined,
-  workflowPreset: ModelAliasPreset | undefined,
-  workflowLevelOptions: WorkflowLevelOptions
-): WorkflowModelScope {
-  return {
-    provider: workflowProvider,
-    model: workflowModel,
-    preset: workflowPreset,
-    tier: workflowLevelOptions.workflowTier,
-    effort: workflowLevelOptions.effort,
-    // Only used to LABEL an inherited provider in a dry run; the executor discards it.
-    providerOrigin: 'workflow',
-  };
-}
-
-/**
- * Ask the model router whether this node may run below its authored tier. `undefined`
- * means the router does not apply to the node, and nothing is recorded for it.
- *
- * Called only for a single-shot agent node of the top-level DAG. That is the one place a
- * node's `source` still holds the text its author wrote: a loop_group body, a fan-out
- * instance and an approval rework prompt have run data written into theirs before
- * dispatch, and a loop node runs many turns on one binding. Those paths never reach here.
- *
- * What leaves the machine is the authored step text and the run's task input (its
- * message and named inputs), each redacted and cut by the router. Node-local `with:`
- * bindings and upstream outputs are run data and are never sent.
- */
-async function routeNodeModel(
-  ctx: RunLayersContext,
-  node: AgentNode,
-  config: ModelRouterConfig,
-  isParallelLayer: boolean,
-  recorded: NodeRoute | undefined
-): Promise<RoutedNode | undefined> {
-  let resolution: ReturnType<typeof resolveNodeModel>;
-  try {
-    resolution = resolveNodeModel(
-      node,
-      executorModelScope(
-        ctx.workflowProvider,
-        ctx.workflowModel,
-        ctx.workflowPreset,
-        ctx.workflowLevelOptions
-      ),
-      assistantModelDefaults(ctx.config),
-      ctx.aiProfile
-    );
-  } catch {
-    // An unresolvable model ref is the node's own failure, and `resolveNodeProviderAndModel`
-    // reports it next with the full error. Routing has nothing to add to it.
-    return undefined;
-  }
-  const { source } = node;
-  return routeAgentNode({
-    node,
-    resolution,
-    aiProfile: ctx.aiProfile,
-    config,
-    recorded,
-    isResumeSource: ctx.namedResumeSourceIds?.has(node.id) === true,
-    usesPersistedScope: nodeUsesPersistedScope(node, ctx.workflowPersistSessions),
-    // Outside a parallel layer a node may inherit the previous node's session, and the
-    // next node may inherit this one's, and a session only resumes on its own provider.
-    sameProviderOnly: !isParallelLayer,
-    inContainer: ctx.execContext.kind === 'container',
-    capabilityScope: {
-      declaredEffort: resolution.declaredEffort,
-      workflowFallbackModel: ctx.workflowLevelOptions.fallbackModel,
-      workflowSandbox: ctx.workflowLevelOptions.sandbox,
-      webSearchMode: ctx.workflowLevelOptions.webSearchMode,
-      hasEnvVars: (ctx.config.envVars && Object.keys(ctx.config.envVars).length > 0) === true,
-    },
-    loadStepText: async () => {
-      if (source.kind === 'inline') return source.prompt;
-      const loaded = await loadCommandPrompt(
-        ctx.deps,
-        ctx.cwd,
-        source.name,
-        ctx.configuredCommandFolder,
-        ctx.workflowSourceRoots
-      );
-      return loaded.success ? loaded.content : undefined;
-    },
-    taskText: () => formatTaskText(ctx.workflowRun.user_message, resolveRunInputs(ctx.workflowRun)),
-    credentialValues: () =>
-      collectCredentialValues(
-        { ...process.env, ...ctx.config.envVars },
-        ctx.config.protectedEnvKeys,
-        ctx.config.protectedCredentialValues
-      ),
-  });
-}
 
 /**
  * Resolve per-node provider and model.
@@ -10480,14 +10374,14 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
             // being run again.
             const routed =
               ctx.modelRouter !== undefined
-                ? await routeNodeModel(
-                    ctx,
-                    node,
-                    ctx.modelRouter,
+                ? await routeNodeModel(ctx, node, ctx.modelRouter, {
                     isParallelLayer,
-                    unfinishedAttempt?.binding.route ??
-                      ctx.priorCompletedNodes?.get(node.id)?.execution?.binding.route
-                  )
+                    usesPersistedScope: nodeUsesPersistedScope(node, ctx.workflowPersistSessions),
+                    runInputs: resolveRunInputs(ctx.workflowRun),
+                    recorded:
+                      unfinishedAttempt?.binding.route ??
+                      ctx.priorCompletedNodes?.get(node.id)?.execution?.binding.route,
+                  })
                 : undefined;
             ctx.nodeRoute = routed?.route;
             ctx.routedCommandText = node.source.kind === 'command' ? routed?.stepText : undefined;
