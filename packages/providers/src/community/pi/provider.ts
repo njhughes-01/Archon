@@ -20,6 +20,8 @@ import { PI_CAPABILITIES } from './capabilities';
 import { parsePiConfig, resolvePiExtensionSettings } from './config';
 import { parsePiModelRef } from './model-ref';
 import { buildCustomProviderModelsPath } from './request-auth';
+// Types only from the Pi SDK, so this one sibling is safe to import statically.
+import { gatePiBuiltinTools, gatePiNativeTools } from './tool-gate';
 import { withResumedOutcome, resumedOutcome } from '../../shared/resumed';
 
 // IMPORTANT: Do NOT add static `import { ... } from '@earendil-works/*'` here,
@@ -836,11 +838,26 @@ export class PiProvider implements IAgentProvider {
       requestOptions?.nativeTools && requestOptions.nativeTools.length > 0
         ? buildPiNativeToolDefinitions(requestOptions.nativeTools)
         : [];
+    //
+    // toolGate → each state-changing tool's `execute` is wrapped. Wrapping
+    // needs the tool objects, so with the gate on the default set is always
+    // built here instead of being left to Pi (which, like the env and
+    // restrictFileWrites paths, drops a `defaultTools` setting of the user's).
+    // With the gate off this block selects exactly what it did before.
+    const toolGate = requestOptions?.toolGate;
     const baseTools =
       filteredTools ??
-      (nativeToolDefs.length > 0 ? buildDefaultPiTools(cwd, requestOptions?.env) : undefined);
-    const piCustomTools =
-      nativeToolDefs.length > 0 ? [...(baseTools ?? []), ...nativeToolDefs] : filteredTools;
+      (nativeToolDefs.length > 0 || toolGate
+        ? buildDefaultPiTools(cwd, requestOptions?.env)
+        : undefined);
+    const piCustomTools = toolGate
+      ? [
+          ...gatePiBuiltinTools(baseTools ?? [], toolGate, cwd),
+          ...gatePiNativeTools(nativeToolDefs, toolGate, cwd),
+        ]
+      : nativeToolDefs.length > 0
+        ? [...(baseTools ?? []), ...nativeToolDefs]
+        : filteredTools;
 
     const { session, modelFallbackMessage } = await createAgentSession({
       cwd,
