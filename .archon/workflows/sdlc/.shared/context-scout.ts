@@ -29,11 +29,9 @@ import {
 } from 'node:fs';
 import { dirname, join, sep } from 'node:path';
 import { askJevNoul, type Fetch, type JevNoulQuestion } from './jev-client.ts';
+import { readJevAccess, type JevAccess } from './jev-settings.ts';
 
-export interface ScoutSettings {
-  apiKey: string;
-  apiBase: string;
-  model: string;
+export interface ScoutSettings extends JevAccess {
   /** Longest one classifier request may take. */
   timeoutMs: number;
   /** Longest the whole classification may take before it stands down. */
@@ -57,9 +55,6 @@ export interface ScoutSettings {
 export type ScoutAvailability =
   | { available: true; settings: ScoutSettings }
   | { available: false; reason: string };
-
-const DEFAULT_API_BASE = 'https://api.typesafe.ai';
-const DEFAULT_MODEL = 'jev-1.13.0';
 
 type Check = (value: number) => boolean;
 const positiveInteger: Check = value => Number.isInteger(value) && value > 0;
@@ -95,28 +90,18 @@ const NUMBERS = {
 
 type NumericSetting = keyof typeof NUMBERS;
 
-function switchedOff(value: string | undefined): boolean {
-  const flag = value?.trim().toLowerCase();
-  return flag === '0' || flag === 'false';
-}
-
 /**
  * The scout's settings, or why it is off.
  *
  * On when `JEV_API_KEY` is set, unless `JEV_ENABLED` (everything Jev) or
- * `JEV_SCOUT_ENABLED` (the scout alone) is `0` or `false`. A container run does not
- * inherit the host's environment, so there it is off unless the project's own
- * environment supplies the key.
+ * `JEV_SCOUT_ENABLED` (the scout alone) is `0` or `false`: see `readJevAccess`.
  *
  * An unusable number turns the scout off and names the variable, instead of falling back
  * to the default: a mistyped threshold or budget must not quietly become another policy.
  */
 export function readScoutSettings(env: NodeJS.ProcessEnv): ScoutAvailability {
-  if (switchedOff(env.JEV_ENABLED) || switchedOff(env.JEV_SCOUT_ENABLED)) {
-    return { available: false, reason: 'disabled' };
-  }
-  const apiKey = env.JEV_API_KEY?.trim() ?? '';
-  if (apiKey === '') return { available: false, reason: 'no_api_key' };
+  const jev = readJevAccess(env, env.JEV_SCOUT_ENABLED);
+  if (!jev.available) return jev;
 
   const unusable: string[] = [];
   const number = (key: NumericSetting): number => {
@@ -127,9 +112,7 @@ export function readScoutSettings(env: NodeJS.ProcessEnv): ScoutAvailability {
     return value;
   };
   const settings: ScoutSettings = {
-    apiKey,
-    apiBase: env.JEV_API_BASE?.trim() || DEFAULT_API_BASE,
-    model: env.JEV_MODEL?.trim() || DEFAULT_MODEL,
+    ...jev.access,
     timeoutMs: number('timeoutMs'),
     deadlineMs: number('deadlineMs'),
     threshold: number('threshold'),
