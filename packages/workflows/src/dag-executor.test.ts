@@ -3330,6 +3330,12 @@ nodes:
       expect(runUsageWrites(store).at(-1)?.total_cost_usd).toBeCloseTo(0.21, 10);
     });
 
+    it('costs one attempt per tier under the default retry policy: a contract failure is not retried', async () => {
+      cheapFailsContract();
+      await run({ nodes: [mediumStep({ output_format })] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+    });
+
     it('escalates once only: a failure on the authored tier fails the node', async () => {
       mockSendQueryDag.mockImplementation(async function* () {
         yield { type: 'assistant', content: 'still prose' };

@@ -987,6 +987,7 @@ The evaluation compares the router with hand-written labels, so a pass is a prox
 - A lower-tier attempt that completes with a worse answer that still satisfies the step's contract is not detected. Escalation catches failures, not quality.
 - A lower-tier attempt that modifies the checkout of a `mutates_checkout: false` step fails the step. It is not escalated, because the tree is already changed.
 - Escalation runs the step again, as a retry does, so a step with side effects may repeat them.
+- Escalation is a second round of attempts. A failed output contract costs one attempt on each tier. A provider error is retried under the step's `retry:` policy on the lower tier first (by default up to 3 attempts, or 6 when rate-limited) and then again on the authored tier, so in the worst case a routed step uses twice the attempts of an unrouted one.
 - When the lower tier and the authored tier share a provider, a provider-wide failure (quota, authentication) fails on both; escalation costs one more failed attempt.
 - A step is classified once per run. Changing thresholds does not re-route a run that is resumed.
 - Shadow mode still makes the classifier request, so it adds up to `JEV_ROUTER_TIMEOUT_MS` to each routed step and sends the texts described above.
