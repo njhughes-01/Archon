@@ -1,0 +1,23 @@
+$ python -m pytest -q
+...........E.E..........                                                 [100%]
+==================================== ERRORS ====================================
+________________ ERROR at setup of test_export_writes_one_file _________________
+
+tmp_export_dir = PosixPath('/var/lib/exports')
+
+    @pytest.fixture
+    def export_job(tmp_export_dir):
+>       tmp_export_dir.mkdir(parents=True, exist_ok=True)
+
+tests/conftest.py:31:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+/usr/lib/python3.12/pathlib.py:1311: in mkdir
+    os.mkdir(self, mode)
+E   PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
+________________ ERROR at setup of test_export_overwrites_stale ________________
+E   PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
+=========================== short test summary info ============================
+ERROR tests/test_export.py::test_export_writes_one_file - PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
+ERROR tests/test_export.py::test_export_overwrites_stale - PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
+22 passed, 2 errors in 1.07s
+running as uid=1001(ci); /var/lib/exports is owned by root:root, mode 0755

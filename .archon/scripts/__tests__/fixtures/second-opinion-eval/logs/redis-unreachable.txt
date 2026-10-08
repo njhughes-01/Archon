@@ -1,0 +1,21 @@
+$ python -m pytest -q tests/queue
+EEEE                                                                     [100%]
+==================================== ERRORS ====================================
+_________________ ERROR at setup of test_enqueue_assigns_an_id _________________
+
+    @pytest.fixture
+    def queue():
+        client = redis.Redis(host="localhost", port=6379, socket_connect_timeout=2)
+>       client.flushdb()
+
+tests/queue/conftest.py:12:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+.venv/lib/python3.12/site-packages/redis/connection.py:276: in connect
+    raise ConnectionError(self._error_message(e))
+E   redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+=========================== short test summary info ============================
+ERROR tests/queue/test_enqueue.py::test_enqueue_assigns_an_id - redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+ERROR tests/queue/test_enqueue.py::test_enqueue_rejects_empty_payload - redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+ERROR tests/queue/test_dequeue.py::test_dequeue_is_fifo - redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+ERROR tests/queue/test_dequeue.py::test_dequeue_blocks_until_timeout - redis.exceptions.ConnectionError: Error 111 connecting to localhost:6379. Connection refused.
+4 errors in 0.62s

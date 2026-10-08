@@ -1,0 +1,20 @@
+$ python -m pytest -q
+........................F...........                                     [100%]
+=================================== FAILURES ===================================
+_______________________ test_slugify_collapses_separators ______________________
+
+    def test_slugify_collapses_separators():
+        title = "Hello,   World -- again"
+>       assert slugify(title) == "hello-world-again"
+E       AssertionError: assert 'hello---world----again' == 'hello-world-again'
+E
+E         - hello-world-again
+E         + hello---world----again
+E         ?      ++     +++
+
+tests/text/test_slugify.py:18: AssertionError
+----------------------------- Captured stdout call -----------------------------
+normalised='hello   world -- again'
+=========================== short test summary info ============================
+FAILED tests/text/test_slugify.py::test_slugify_collapses_separators - AssertionError: assert 'hello---world----again' == 'hello-world-again'
+1 failed, 35 passed in 0.84s

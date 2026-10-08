@@ -1,0 +1,29 @@
+$ npx jest --ci --runInBand
+PASS src/search/query-parser.test.ts
+FAIL src/search/live-search.test.tsx (9.318 s)
+  ● LiveSearch › requests suggestions after the user stops typing
+
+    thrown: "Exceeded timeout of 5000 ms for a test.
+    Add a timeout value to this test to increase the timeout, if this is a long-running test. See https://jestjs.io/docs/api#testname-fn-timeout."
+
+      18 |   });
+      19 |
+    > 20 |   it('requests suggestions after the user stops typing', async () => {
+         |   ^
+      21 |     render(<LiveSearch debounceMs={250} />);
+      22 |     await userEvent.type(screen.getByRole('searchbox'), 'lamp');
+      23 |     await waitFor(() => expect(fetchSuggestions).toHaveBeenCalledTimes(1));
+
+      at src/search/live-search.test.tsx:20:3
+
+  ● LiveSearch › requests suggestions after the user stops typing
+
+    Warning: An update to LiveSearch inside a test was not wrapped in act(...).
+
+A worker process has failed to exit gracefully and has been force exited. This is likely caused by tests leaking due to improper teardown. Try running with --detectOpenHandles to find leaks. Active timers can also cause this, ensure that .unref() was called on them.
+
+Test Suites: 1 failed, 1 passed, 2 total
+Tests:       1 failed, 22 passed, 23 total
+Time:        11.02 s
+
+history: this test passed in 19 of the last 20 runs of this suite on the same commit

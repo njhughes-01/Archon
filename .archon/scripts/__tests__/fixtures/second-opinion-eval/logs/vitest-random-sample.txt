@@ -1,0 +1,28 @@
+$ npx vitest run --sequence.shuffle
+ RUN  v2.0.5 /workspace
+ Running tests with seed "1718203344"
+
+ ✓ src/sampling/reservoir.test.ts (6)
+ ❯ src/sampling/pick-variant.test.ts (4)
+   ✓ pickVariant > returns the control group when the experiment is off
+   ✓ pickVariant > is stable for the same user id
+   × pickVariant > splits new users roughly evenly
+   ✓ pickVariant > respects an explicit override
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯ Failed Tests 1 ⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/sampling/pick-variant.test.ts > pickVariant > splits new users roughly evenly
+AssertionError: expected 0.61 to be less than 0.6
+ ❯ src/sampling/pick-variant.test.ts:38:27
+     36|     const users = Array.from({ length: 100 }, () => ({ id: crypto.randomUUID() }));
+     37|     const share = users.filter(user => pickVariant(user) === 'B').length / users.length;
+     38|     expect(share).toBeLessThan(0.6);
+       |                   ^
+     39|     expect(share).toBeGreaterThan(0.4);
+     40|   });
+
+ Test Files  1 failed | 1 passed (2)
+      Tests  1 failed | 9 passed (10)
+   Duration  1.12s
+
+ the sample is 100 freshly generated random ids on every run; the share of 'B' varies between runs

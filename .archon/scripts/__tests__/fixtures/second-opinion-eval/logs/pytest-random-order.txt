@@ -1,0 +1,31 @@
+$ python -m pytest -p randomly
+============================= test session starts ==============================
+platform linux -- Python 3.12.4, pytest-8.2.2, pluggy-1.5.0
+Using --randomly-seed=3917204611
+rootdir: /workspace
+plugins: randomly-3.15.0, cov-5.0.0
+collected 118 items
+
+tests/plugins/test_loader.py ......                                      [  5%]
+tests/plugins/test_registry.py ..F.                                      [  8%]
+tests/api/test_routes.py ...................                             [ 24%]
+tests/core/test_events.py ..............................                 [ 50%]
+tests/core/test_scheduler.py ...........................................  [ 86%]
+tests/util/test_paths.py ................                                [100%]
+
+=================================== FAILURES ===================================
+_______________________ test_registry_starts_empty _____________________________
+
+    def test_registry_starts_empty():
+>       assert registry.names() == []
+E       AssertionError: assert ['csv-export', 'pdf-export'] == []
+E
+E         Left contains 2 more items, first extra item: 'csv-export'
+
+tests/plugins/test_registry.py:21: AssertionError
+=========================== short test summary info ============================
+FAILED tests/plugins/test_registry.py::test_registry_starts_empty - AssertionError: assert ['csv-export', 'pdf-export'] == []
+======================== 1 failed, 117 passed in 6.02s =========================
+note: the two extra names are registered by tests/plugins/test_loader.py, which this seed ran first
+note: `pytest tests/plugins/test_registry.py` on its own: 4 passed
+note: rerun with -p randomly -p "randomly_seed=1" (default file order): 118 passed

@@ -1,0 +1,29 @@
+$ mvn -B -q verify
+[INFO] Running com.acme.gateway.GatewayApplicationIT
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+2026-04-03T10:22:41.118Z  INFO 5120 --- [           main] c.a.gateway.GatewayApplicationIT        : Starting GatewayApplicationIT using Java 21.0.3
+2026-04-03T10:22:43.902Z ERROR 5120 --- [           main] o.s.b.d.LoggingFailureAnalysisReporter   :
+
+***************************
+APPLICATION FAILED TO START
+***************************
+
+Description:
+
+Web server failed to start. Port 8080 was already in use.
+
+Action:
+
+Identify and stop the process that's listening on port 8080 or configure this application to listen on another port.
+
+[ERROR] Tests run: 1, Failures: 0, Errors: 1, Skipped: 0, Time elapsed: 3.611 s <<< FAILURE! -- in com.acme.gateway.GatewayApplicationIT
+[ERROR] com.acme.gateway.GatewayApplicationIT.contextLoads -- Time elapsed: 0.004 s <<< ERROR!
+java.lang.IllegalStateException: Failed to load ApplicationContext
+Caused by: org.springframework.boot.web.server.PortInUseException: Port 8080 is already in use
+Caused by: java.net.BindException: Address already in use
+	at java.base/sun.nio.ch.Net.bind0(Native Method)
+	at java.base/sun.nio.ch.Net.bind(Net.java:565)
+
+$ ss -ltnp | grep 8080
+LISTEN 0 4096 *:8080 *:* users:(("java",pid=4377,fd=12))

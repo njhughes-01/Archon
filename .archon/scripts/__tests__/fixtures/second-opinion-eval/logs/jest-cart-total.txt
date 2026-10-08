@@ -1,0 +1,39 @@
+$ npx jest --ci
+Changed files since origin/main:
+  src/cart/total.ts
+  src/cart/total.test.ts
+
+PASS src/cart/discount.test.ts
+PASS src/catalog/search.test.ts
+FAIL src/cart/total.test.ts
+  ● cartTotal › applies the percentage discount before tax
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 107.1
+    Received: 117
+
+      21 |     const cart = makeCart([{ sku: 'A1', price: 100, quantity: 1 }]);
+      22 |     const total = cartTotal(cart, { discountPercent: 10, taxRate: 0.19 });
+    > 23 |     expect(total).toBe(107.1);
+         |                   ^
+      24 |   });
+      25 |
+      26 |   it('rounds to cents', () => {
+
+      at Object.<anonymous> (src/cart/total.test.ts:23:19)
+
+  ● cartTotal › rounds to cents
+
+    expect(received).toBe(expected) // Object.is equality
+
+    Expected: 10.01
+    Received: 10.005
+
+      at Object.<anonymous> (src/cart/total.test.ts:29:19)
+
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       2 failed, 14 passed, 16 total
+Snapshots:   0 total
+Time:        3.412 s
+Ran all test suites.

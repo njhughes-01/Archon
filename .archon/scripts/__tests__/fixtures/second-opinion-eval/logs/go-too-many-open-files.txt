@@ -1,0 +1,16 @@
+$ go test ./...
+ok  	example.com/crawler/internal/frontier	0.318s
+--- FAIL: TestFetcherFollowsRedirects (0.01s)
+    fetcher_test.go:29: starting test server: listen tcp 127.0.0.1:0: socket: too many open files
+--- FAIL: TestFetcherHonoursRobots (0.00s)
+    fetcher_test.go:58: starting test server: listen tcp 127.0.0.1:0: socket: too many open files
+--- FAIL: TestFetcherTimesOut (0.00s)
+    fetcher_test.go:81: starting test server: listen tcp 127.0.0.1:0: socket: too many open files
+FAIL
+FAIL	example.com/crawler/internal/fetch	0.022s
+2026/02/11 17:03:19 open /workspace/testdata/pages/index.html: too many open files
+FAIL	example.com/crawler/internal/parse	0.009s
+FAIL
+
+$ ulimit -n
+64

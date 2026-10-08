@@ -1,0 +1,9 @@
+$ bun install --frozen-lockfile
+bun install v1.4.2 (b0a6feca)
+Resolving dependencies
+Resolved, downloaded and extracted [12]
+error: lockfile had changes, but lockfile is frozen
+note: try re-running without --frozen-lockfile and commit the updated lockfile
+
+package.json requires "hono": "^4.6.0"; bun.lock pins hono@4.4.13
+error: script "ci:install" exited with code 1
