@@ -43,7 +43,7 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
-import { authoredCeiling } from './jev/model-router';
+import { authoredCeiling, routerInactiveReason } from './jev/model-router';
 import { MODEL_ROUTER_RECORDED_MODES, type ModelRouterConfig } from './schemas/model-router';
 import { tierNameSchema } from './schemas/model-binding';
 import {
@@ -396,13 +396,19 @@ const dryRunResolutionSchema = z.object({
     .object({ declared: z.string(), resolved: z.string(), modelRef: z.string() })
     .optional(),
   /**
-   * Set when the model router is on and may consider this node. A dry run makes no
-   * network call, so it never knows the route: everything above is the unrouted
-   * resolution, which is the most the node can run on. In `apply` mode a real run may
-   * use a tier below `ceiling`; in `shadow` mode it records a route and runs as reported.
+   * Set when the model router is configured and this node is one it may lower: an agent
+   * node on a routable tier that declares an output contract. A dry run makes no network
+   * call, so it never knows the route: everything above is the unrouted resolution, which
+   * is the most the node can run on. In `apply` mode a real run may use a tier below
+   * `ceiling`; in `shadow` mode it records a route and runs as reported.
    */
   modelRouter: z
-    .object({ mode: z.enum(MODEL_ROUTER_RECORDED_MODES), ceiling: tierNameSchema })
+    .object({
+      mode: z.enum(MODEL_ROUTER_RECORDED_MODES),
+      ceiling: tierNameSchema,
+      /** The router is configured but cannot run here: it has no key, or a switch is off. */
+      inactive: z.enum(['disabled_by_env', 'no_api_key']).optional(),
+    })
     .optional(),
 });
 export type DryRunResolution = z.infer<typeof dryRunResolutionSchema>;
@@ -583,6 +589,8 @@ interface DryRunContext {
    * DAG, the only place a real run routes. Cleared inside a loop_group body.
    */
   modelRouter?: ModelRouterConfig;
+  /** Why the configured router makes no request in this environment, when it does not. */
+  modelRouterInactive?: 'disabled_by_env' | 'no_api_key';
 }
 
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
@@ -679,12 +687,18 @@ function resolutionFor(node: DagNode, ctx: DryRunContext): DryRunResolution | un
     ctx.assistantModels,
     ctx.aiProfile
   );
-  // Only single-shot agent nodes are routed; a loop keeps one binding for all its turns.
-  const router = isAgentNode(node) ? ctx.modelRouter : undefined;
+  // Only single-shot agent nodes with an output contract are lowered: a loop keeps one
+  // binding for all its turns, and without a contract escalation has nothing to check.
+  const router =
+    isAgentNode(node) && node.output_format !== undefined ? ctx.modelRouter : undefined;
   const ceiling = router && authoredCeiling(node, resolved, router);
   const routerNote =
     router && ceiling
-      ? { mode: router.mode === 'apply' ? ('apply' as const) : ('shadow' as const), ceiling }
+      ? {
+          mode: router.mode === 'apply' ? ('apply' as const) : ('shadow' as const),
+          ceiling,
+          ...(ctx.modelRouterInactive ? { inactive: ctx.modelRouterInactive } : {}),
+        }
       : undefined;
   return {
     provider: resolved.provider,
@@ -1500,8 +1514,11 @@ export async function dryRunWorkflow(options: {
    */
   config?: WorkflowConfig;
   aiProfile?: ResolvedAiProfile;
+  /** Where the model router's switches and key are read from; defaults to `process.env`. */
+  env?: Readonly<Record<string, string | undefined>>;
 }): Promise<DryRunResult> {
   const assistantModels = options.config ? assistantModelDefaults(options.config) : {};
+  const routerInactive = routerInactiveReason(options.env ?? process.env);
   // Same layering as the executor: declared defaults under caller-supplied values
   // (supplied wins). A workflow with no `inputs:` block keeps passthrough semantics.
   const declaredDefaults = defaultRunInputs(options.workflow.inputs);
@@ -1528,6 +1545,7 @@ export async function dryRunWorkflow(options: {
     missingStubs: new Set<string>(),
     toleratedMissingStubs: new Set<string>(),
     ...(options.config?.modelRouter ? { modelRouter: options.config.modelRouter } : {}),
+    ...(routerInactive ? { modelRouterInactive: routerInactive } : {}),
     scope: resolveWorkflowModelScope(
       options.workflow,
       options.config?.assistant ?? 'claude',
@@ -1594,7 +1612,11 @@ export function formatDryRunTrace(result: DryRunResult): string {
         `  runs on: ${r.provider} (${r.providerFrom}) / ${model} (${r.modelFrom})${authored}`
       );
       if (r.effort) lines.push(`  effort: ${r.effort} (${r.effortFrom})`);
-      if (r.modelRouter) {
+      if (r.modelRouter?.inactive) {
+        lines.push(
+          `  model router: inactive here (${r.modelRouter.inactive}); this step runs on the model above`
+        );
+      } else if (r.modelRouter) {
         lines.push(
           r.modelRouter.mode === 'apply'
             ? `  model router: apply mode may run this step below '${r.modelRouter.ceiling}'; the model above is its ceiling`

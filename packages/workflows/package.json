@@ -184,6 +184,9 @@
     [
       "src/jev/",
       "src/redaction.test.ts"
+    ],
+    [
+      "src/node-model-routing.test.ts"
     ]
   ]
 }

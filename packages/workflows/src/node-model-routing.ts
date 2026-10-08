@@ -7,6 +7,7 @@
  * how far are in `jev/model-router.ts`; this file only supplies the facts.
  */
 import type { ExecutionContext } from '@archon/providers/types';
+import { readComposedMeta } from './compiled-command';
 import type { WorkflowConfig, WorkflowDeps } from './deps';
 import { loadCommandPrompt } from './executor-shared';
 import { formatTaskText, routeAgentNode, type RoutedNode } from './jev/model-router';
@@ -17,9 +18,10 @@ import {
   type WorkflowModelScope,
 } from './node-model-resolution';
 import { collectCredentialValues } from './redaction';
-import type { AgentNode, EffortLevel } from './schemas';
+import type { AgentNode, DagNode, EffortLevel } from './schemas';
 import type { ModelRouterConfig, NodeRoute } from './schemas/model-router';
-import type { WorkflowSourceRoots } from './workflow-source';
+import type { GraphPlan } from './schemas/workflow';
+import { assertWorkflowSourceIntegrity, type WorkflowSourceRoots } from './workflow-source';
 
 /** The workflow-level values that reach a node's model resolution and capability checks. */
 export interface ModelScopeOptions {
@@ -27,6 +29,7 @@ export interface ModelScopeOptions {
   fallbackModel?: unknown;
   sandbox?: unknown;
   webSearchMode?: unknown;
+  betas?: unknown;
   workflowTier?: TierName;
 }
 
@@ -63,18 +66,95 @@ export interface NodeRoutingRun {
   configuredCommandFolder?: string;
   workflowSourceRoots: WorkflowSourceRoots;
   namedResumeSourceIds?: ReadonlySet<string>;
+  /** The topological layers the executor is walking: the whole top-level DAG. */
+  layers: GraphPlan['layers'];
+  /**
+   * Whether this run may use a provider at all. Nothing sets it yet; the tool-action
+   * gate will, so that with the gate on a provider without the `toolActionGate`
+   * capability is never offered. Absent means every registered provider is usable.
+   */
+  providerUsable?: (provider: string) => boolean;
 }
 
 /** What the executor knows about this one dispatch of the node. */
 export interface NodeRoutingDispatch {
-  /** The node shares its layer with others, so no session crosses it. */
-  isParallelLayer: boolean;
+  /** The index of the node's layer in `NodeRoutingRun.layers`. */
+  layerIndex: number;
   /** The node's session is stored and resumed across runs. */
   usesPersistedScope: boolean;
   /** The run's named inputs, already resolved. */
   runInputs: Readonly<Record<string, unknown>> | undefined;
   /** The route an earlier pass of this run recorded for the node. */
   recorded: NodeRoute | undefined;
+}
+
+/** A node the engine starts without a session whatever ran before it. */
+function startsFreshByDeclaration(node: DagNode): boolean {
+  // A composed block's entry starts as coldly as the block would standalone, unless its
+  // author asked for the caller's thread with `context: shared`.
+  return (
+    node.context === 'fresh' ||
+    (readComposedMeta(node)?.blockEntry === true && node.context !== 'shared')
+  );
+}
+
+/** A node that makes no provider turn and leaves the session cursor exactly as it found it. */
+function leavesSessionCursorAlone(node: DagNode): boolean {
+  return node.kind === 'exec' || node.kind === 'halt' || node.kind === 'wait';
+}
+
+/**
+ * Whether a provider session may cross the node at `layers[layerIndex]`: come into it from
+ * an earlier node, or go out of it into a later one. A session only resumes on the provider
+ * that created it, so moving such a node to another provider either drops a continuation
+ * the unrouted run would have had or creates one it would not.
+ *
+ * Read off the plan alone, from the executor's cursor rules, so the answer is the same on
+ * every run of a graph and never depends on which nodes happened to be skipped:
+ *
+ *  - Every node of a parallel layer starts without a session, and none of them becomes the
+ *    cursor. A parallel layer also clears the cursor when it starts.
+ *  - A single-node layer's node becomes the cursor when it completes with a session.
+ *  - Bash, script, cancel and wait nodes neither read nor move the cursor. A script
+ *    between two agent nodes therefore does not separate them.
+ *  - An agent node that starts fresh by declaration does not read the cursor, but it may
+ *    be skipped, and a skipped node leaves the cursor where it was. So it is not a
+ *    barrier in either direction.
+ *
+ *  - A loop group never reads the enclosing cursor (its body has its own), so one after
+ *    the node is not a reader. One before the node may have left a session behind.
+ *
+ * `false` is a proof that no session crosses the node. Anything not proven is `true`: a
+ * loop, an approval gate, a sub-run or a fan-out next to the node counts as a possible
+ * session, because their use of the cursor is not modelled here.
+ */
+export function sessionMayCrossNode(layers: GraphPlan['layers'], layerIndex: number): boolean {
+  const own = layers[layerIndex];
+  if (own?.length !== 1) return false;
+  const [node] = own;
+
+  // In: walk back to the nearest thing that could have set the cursor.
+  if (!startsFreshByDeclaration(node)) {
+    for (let index = layerIndex - 1; index >= 0; index--) {
+      const layer = layers[index];
+      if (layer.length !== 1) break;
+      if (!leavesSessionCursorAlone(layer[0])) return true;
+    }
+  }
+
+  // Out: walk forward to the nearest node that could read the cursor this node sets.
+  for (let index = layerIndex + 1; index < layers.length; index++) {
+    const layer = layers[index];
+    if (layer.length !== 1) break;
+    const [next] = layer;
+    if (leavesSessionCursorAlone(next)) continue;
+    if (next.kind === 'agent' && startsFreshByDeclaration(next)) continue;
+    // A loop group's body runs on the group's own cursor, which starts empty or from the
+    // group's own pause record. It never reads the enclosing one, though it may replace it.
+    if (next.kind === 'loop_group') continue;
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -123,19 +203,23 @@ export async function routeNodeModel(
     recorded: dispatch.recorded,
     isResumeSource: run.namedResumeSourceIds?.has(node.id) === true,
     usesPersistedScope: dispatch.usesPersistedScope,
-    // Outside a parallel layer a node may inherit the previous node's session, and the
-    // next node may inherit this one's, and a session only resumes on its own provider.
-    sameProviderOnly: !dispatch.isParallelLayer,
+    sameProviderOnly: sessionMayCrossNode(run.layers, dispatch.layerIndex),
+    ...(run.providerUsable !== undefined ? { providerUsable: run.providerUsable } : {}),
     inContainer: run.execContext.kind === 'container',
     capabilityScope: {
       declaredEffort: resolution.declaredEffort,
       workflowFallbackModel: run.workflowLevelOptions.fallbackModel,
       workflowSandbox: run.workflowLevelOptions.sandbox,
       webSearchMode: run.workflowLevelOptions.webSearchMode,
+      workflowBetas: run.workflowLevelOptions.betas,
       hasEnvVars: (run.config.envVars && Object.keys(run.config.envVars).length > 0) === true,
     },
     loadStepText: async () => {
       if (source.kind === 'inline') return source.prompt;
+      // The node's own execution checks the captured source before it reads a command.
+      // This read comes first and its text leaves the machine, so it checks too: a
+      // tampered capture throws here, which the router turns into "keep the ceiling".
+      await assertWorkflowSourceIntegrity(run.workflowSourceRoots);
       const loaded = await loadCommandPrompt(
         run.deps,
         run.cwd,

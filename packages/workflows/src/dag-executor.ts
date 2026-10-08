@@ -1735,6 +1735,7 @@ async function resolveNodeProviderAndModel(
     workflowFallbackModel: workflowLevelOptions.fallbackModel,
     workflowSandbox: workflowLevelOptions.sandbox,
     webSearchMode: workflowLevelOptions.webSearchMode,
+    workflowBetas: workflowLevelOptions.betas,
     hasEnvVars: (config.envVars && Object.keys(config.envVars).length > 0) === true,
   });
 
@@ -10372,17 +10373,29 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
             // A resumed or restarted run reuses the route its earlier pass recorded for
             // this node: the unfinished attempt's, or the completion's when the node is
             // being run again.
-            const routed =
-              ctx.modelRouter !== undefined
-                ? await routeNodeModel(ctx, node, ctx.modelRouter, {
-                    isParallelLayer,
-                    usesPersistedScope: nodeUsesPersistedScope(node, ctx.workflowPersistSessions),
-                    runInputs: resolveRunInputs(ctx.workflowRun),
-                    recorded:
-                      unfinishedAttempt?.binding.route ??
-                      ctx.priorCompletedNodes?.get(node.id)?.execution?.binding.route,
-                  })
-                : undefined;
+            let routed: Awaited<ReturnType<typeof routeNodeModel>>;
+            try {
+              routed =
+                ctx.modelRouter !== undefined
+                  ? await routeNodeModel(ctx, node, ctx.modelRouter, {
+                      layerIndex: layerIdx,
+                      usesPersistedScope: nodeUsesPersistedScope(node, ctx.workflowPersistSessions),
+                      runInputs: resolveRunInputs(ctx.workflowRun),
+                      recorded:
+                        unfinishedAttempt?.binding.route ??
+                        ctx.priorCompletedNodes?.get(node.id)?.execution?.binding.route,
+                    })
+                  : undefined;
+            } catch (error) {
+              // Routing is advice and must never be why a node fails. The router records
+              // its own failures as a fallback route; anything that escapes it leaves the
+              // node unrouted, exactly as with no router.
+              getLog().warn(
+                { nodeId: node.id, errorName: error instanceof Error ? error.name : 'unknown' },
+                'model_router.failed_unrouted'
+              );
+              routed = undefined;
+            }
             ctx.nodeRoute = routed?.route;
             ctx.routedCommandText = node.source.kind === 'command' ? routed?.stepText : undefined;
             // An applied route resolves exactly as if the author had written the lower tier.
@@ -10618,13 +10631,38 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
             // Model-router escalation. A node the router ran on a lower tier, whose
             // attempts there ended in a failure of a kind `escalationReason` names, runs
             // once more exactly as it would have with no router: the authored tier, its
-            // own retry policy, and the session input the node started from. It never
-            // continues the failed attempt's own session. This sits before the
-            // `mutates_checkout` assertion on purpose: a lower-tier attempt that changed
-            // the tree has already done the damage, and a second run could not undo it.
+            // own retry policy, and the session input the node started from, never the
+            // failed attempt's own new session. This sits before the `mutates_checkout`
+            // assertion on purpose: a lower-tier attempt that completed after changing
+            // the tree fails there, on its own record.
             const lowerTierRoute = ctx.nodeRoute;
             const escalation = escalationReason(lowerTierRoute, retriedOutput);
-            if (lowerTierRoute !== undefined && escalation !== undefined) {
+            // A lower-tier attempt that changed a checkout the node promised to leave
+            // alone owns that violation. Running the authored tier next would only have
+            // the final assertion blame an attempt that did nothing wrong, so the node
+            // stays failed on the attempt that caused it.
+            const treeAfterLowerTier =
+              escalation !== undefined && treeBefore !== undefined
+                ? await snapshotCheckout(ctx.cwd, checkoutExcludes)
+                : undefined;
+            const lowerTierChangedCheckout =
+              treeAfterLowerTier !== undefined && treeAfterLowerTier !== treeBefore;
+            if (lowerTierRoute !== undefined && lowerTierChangedCheckout) {
+              getLog().error(
+                {
+                  nodeId: node.id,
+                  routedTier: lowerTierRoute.routedTier,
+                  authoredTier: lowerTierRoute.authoredTier,
+                },
+                'model_router.escalation_skipped_checkout_changed'
+              );
+              await safeSendMessage(
+                ctx.platform,
+                ctx.conversationId,
+                `Node \`${node.id}\` failed on the \`${lowerTierRoute.routedTier}\` tier after changing a checkout it declares \`mutates_checkout: false\`. It was not run again on its authored tier.`,
+                { workflowId: ctx.workflowRun.id, nodeName: node.id }
+              );
+            } else if (lowerTierRoute !== undefined && escalation !== undefined) {
               const lowerTierOutput = retriedOutput;
               ctx.nodeRoute = escalateRoute(lowerTierRoute, escalation);
               getLog().warn(

@@ -73,8 +73,17 @@ const CROSS_PROVIDER: ResolvedAiProfile = {
   },
 };
 
+/** A closed schema every provider in these tests can enforce as written. */
+const CONTRACT = { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] };
+
 function agentNode(fields: Record<string, unknown> = {}): AgentNode {
-  const node = dagNodeSchema.parse({ id: 'step', prompt: STEP_TEXT, model: 'medium', ...fields });
+  const node = dagNodeSchema.parse({
+    id: 'step',
+    prompt: STEP_TEXT,
+    model: 'medium',
+    output_format: CONTRACT,
+    ...fields,
+  });
   if (node.kind !== 'agent') throw new Error('fixture is not an agent node');
   return node;
 }
@@ -114,6 +123,7 @@ function candidate(overrides: CandidateOverrides = {}): RouteAgentNodeInput {
       workflowFallbackModel: undefined,
       workflowSandbox: undefined,
       webSearchMode: undefined,
+      workflowBetas: undefined,
       hasEnvVars: false,
     },
     loadStepText: () => Promise.resolve(STEP_TEXT),
@@ -359,35 +369,91 @@ describe('offerTiers: which lower tiers may be offered', () => {
     });
   });
 
-  it('does not offer a provider with a weaker structured-output guarantee', () => {
-    const node = agentNode({
-      output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+  describe('a tier is offered only where escalation could catch a bad result', () => {
+    it('never offers a tier to a node with no output contract, on any provider', () => {
+      const node = agentNode({ output_format: undefined });
+      expect(offer({ node }).excluded).toEqual({ small: 'unverifiable' });
+      expect(offer({ node, profile: CROSS_PROVIDER }).excluded).toEqual({ small: 'unverifiable' });
     });
-    expect(
-      offer({ node, profile: CROSS_PROVIDER }, lookup({ structuredOutput: 'best-effort' })).excluded
-    ).toEqual({ small: 'structured_output' });
-    // Without an output_format the guarantee is irrelevant.
-    expect(
-      offer({ profile: CROSS_PROVIDER }, lookup({ structuredOutput: 'best-effort' })).offered
-    ).toEqual(['small']);
+
+    it('does not offer a provider that only makes a best effort at the contract', () => {
+      const bestEffort = lookup({ structuredOutput: 'best-effort' });
+      expect(offer({ profile: CROSS_PROVIDER }, bestEffort).excluded).toEqual({
+        small: 'structured_output',
+      });
+      // The rule is about the target, so it binds on the authored provider too.
+      const table: Record<string, ProviderCapabilities> = {
+        alpha: { ...FULL, structuredOutput: 'best-effort' },
+      };
+      expect(offer({}, provider => table[provider]).excluded).toEqual({
+        small: 'structured_output',
+      });
+    });
+
+    it('does not offer a strict-schema provider a schema it would reject', () => {
+      const node = agentNode({
+        output_format: {
+          type: 'object',
+          properties: { ok: { type: 'boolean' }, note: { type: 'string' } },
+          required: ['ok'],
+        },
+      });
+      const strict = lookup({ requiresAllPropertiesRequired: true });
+      expect(offer({ node, profile: CROSS_PROVIDER }, strict).excluded).toEqual({
+        small: 'strict_schema',
+      });
+      expect(offer({ profile: CROSS_PROVIDER }, strict).offered).toEqual(['small']);
+    });
+
+    it('does not offer a strict-schema provider a schema it would silently close', () => {
+      const node = agentNode({
+        output_format: { ...CONTRACT, additionalProperties: { type: 'string' } },
+      });
+      const strict = lookup({ requiresAllPropertiesRequired: true });
+      expect(offer({ node, profile: CROSS_PROVIDER }, strict).excluded).toEqual({
+        small: 'open_schema',
+      });
+      // A provider that honours the schema as written keeps the open record open.
+      expect(offer({ node, profile: CROSS_PROVIDER }).offered).toEqual(['small']);
+    });
   });
 
-  it('does not offer a strict-schema provider a schema it would reject', () => {
-    const node = agentNode({
-      output_format: {
-        type: 'object',
-        properties: { ok: { type: 'boolean' }, note: { type: 'string' } },
-        required: ['ok'],
+  it('does not move a node that promises to leave the checkout alone to another provider', () => {
+    const node = agentNode({ mutates_checkout: false });
+    expect(offer({ node, profile: CROSS_PROVIDER }).excluded).toEqual({ small: 'read_only_node' });
+    // On its own provider the node keeps its guard and its escalation path.
+    expect(offer({ node }).offered).toEqual(['small']);
+  });
+
+  it('does not offer a provider the run may not use', () => {
+    const providerUsable = (provider: string): boolean => provider !== 'beta';
+    expect(offer({ profile: CROSS_PROVIDER, providerUsable }).excluded).toEqual({
+      small: 'provider_unusable',
+    });
+    expect(offer({ providerUsable }).offered).toEqual(['small']);
+    expect(offer({ providerUsable: () => false }).excluded).toEqual({ small: 'provider_unusable' });
+  });
+
+  it('does not offer a provider that would ignore the Claude betas a node names', () => {
+    // No capability flag covers betas, so the providers here are the real ids.
+    const profile: ResolvedAiProfile = {
+      defaultProvider: 'claude',
+      aliases: {
+        small: { provider: 'codex', model: 'c-small' },
+        medium: { provider: 'claude', model: 'c-medium' },
       },
-    });
-    const strict = lookup({ requiresAllPropertiesRequired: true });
-    expect(offer({ node, profile: CROSS_PROVIDER }, strict).excluded).toEqual({
-      small: 'strict_schema',
-    });
-    const complete = agentNode({
-      output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
-    });
-    expect(offer({ node: complete, profile: CROSS_PROVIDER }, strict).offered).toEqual(['small']);
+    };
+    const both: CapabilityLookup = () => FULL;
+    const node = agentNode({ betas: ['context-1m-2025-08-07'] });
+    const withBetas = candidate({ node, profile });
+    const withBetasScope = candidate({ profile });
+    const scoped = {
+      ...withBetasScope,
+      capabilityScope: { ...withBetasScope.capabilityScope, workflowBetas: ['x'] },
+    };
+    expect(offerTiers(withBetas, 'medium', both).excluded).toEqual({ small: 'unsupported:betas' });
+    expect(offerTiers(scoped, 'medium', both).excluded).toEqual({ small: 'unsupported:betas' });
+    expect(offerTiers(candidate({ profile }), 'medium', both).offered).toEqual(['small']);
   });
 
   it('does not offer a provider that cannot run inside the container the run uses', () => {
@@ -551,6 +617,8 @@ describe('readRouterSettings', () => {
     [{ ...ENV, JEV_ENABLED: 'FALSE' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_ENABLED: '0' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_ENABLED: 'false' }, 'disabled_by_env'],
+    [{ ...ENV, JEV_ROUTER_ENABLED: 'OFF' }, 'disabled_by_env'],
+    [{ ...ENV, JEV_ROUTER_ENABLED: ' no ' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_MIN_PROB: '1.5' }, 'invalid_setting:JEV_ROUTER_MIN_PROB'],
     [{ ...ENV, JEV_ROUTER_RISK_THRESHOLD: 'high' }, 'invalid_setting:JEV_ROUTER_RISK_THRESHOLD'],
     [{ ...ENV, JEV_ROUTER_TIMEOUT_MS: '0' }, 'invalid_setting:JEV_ROUTER_TIMEOUT_MS'],
@@ -642,9 +710,6 @@ describe('routeAgentNode', () => {
     expect(body.state.step).toBe(STEP_TEXT);
     expect(body.state.task).toBe(TASK_TEXT);
     expect(body.state.features).toEqual({
-      step_name: 'step',
-      node_kind: 'inline',
-      has_output_format: true,
       tools_declared: true,
       mcp_present: true,
       skills_present: true,
@@ -655,15 +720,19 @@ describe('routeAgentNode', () => {
     expect(raw[0]).not.toContain('authored_tier');
   });
 
-  it('names a command step by its command and does not claim an undeclared step is read-only', async () => {
-    const node = agentNode({ prompt: undefined, command: 'discover-checks' });
-    const { fetch, bodies } = fakeFetch(answering());
-    await routeAgentNode(candidate({ node }), opts({ fetch }));
-    expect(bodies[0].state.features).toMatchObject({
-      step_name: 'discover-checks',
-      node_kind: 'command',
-      read_only_enforced: false,
-    });
+  it('sends the same facts for a command run by its own workflow and the same command composed in', async () => {
+    // Composition turns a command into an inline prompt under a prefixed node id. Nothing
+    // the classifier sees may depend on that.
+    const sent = async (node: AgentNode): Promise<SentBody['state']> => {
+      const { fetch, bodies } = fakeFetch(answering());
+      await routeAgentNode(candidate({ node }), opts({ fetch }));
+      return bodies[0].state;
+    };
+    const standalone = await sent(agentNode({ prompt: undefined, command: 'sdlc-step' }));
+    const composed = await sent(agentNode({ id: 'outer__inner__step' }));
+    expect(standalone).toEqual(composed);
+    expect(standalone.features).toMatchObject({ read_only_enforced: false });
+    expect(JSON.stringify(standalone)).not.toContain('sdlc-step');
   });
 
   it('sends only the opening of a long step by default, and far more of the task', async () => {
@@ -689,7 +758,7 @@ describe('routeAgentNode', () => {
         loadStepText: () =>
           Promise.resolve(`Deploy with DEPLOY_TOKEN=step-shaped-secret. ${'s'.repeat(400)}`),
         taskText: () =>
-          `Use injected-exact-credential and password: task-shaped-secret, clone https://bot:url-secret@git.example.com/x. ${'t'.repeat(400)}`,
+          `Use injected-exact-credential and password: task-shaped-secret, clone https://bot:url-secret@git.example.com/x.\n${'t'.repeat(400)}`,
         credentialValues: () => ['injected-exact-credential'],
       }),
       opts({
@@ -765,28 +834,109 @@ describe('routeAgentNode', () => {
   );
 
   it.each([
-    ['no key', {}, 'no_api_key'],
-    ['the Jev master switch off', { ...ENV, JEV_ENABLED: '0' }, 'disabled_by_env'],
-    ['the router switch off', { ...ENV, JEV_ROUTER_ENABLED: 'false' }, 'disabled_by_env'],
-    [
-      'an unusable setting',
-      { ...ENV, JEV_ROUTER_MIN_CONFIDENCE: 'x' },
-      'invalid_setting:JEV_ROUTER_MIN_CONFIDENCE',
-    ],
-  ] as [string, Record<string, string>, string][])(
-    'keeps the ceiling and calls nothing with %s',
-    async (_label, env, reason) => {
+    ['no key', {}],
+    ['the Jev master switch off', { ...ENV, JEV_ENABLED: '0' }],
+    ['the router switch off', { ...ENV, JEV_ROUTER_ENABLED: 'off' }],
+  ] as [string, Record<string, string>][])(
+    'is absent with %s: no call, no route, no log line',
+    async (_label, env) => {
       const { fetch, urls } = fakeFetch(answering());
-      const routed = await routeAgentNode(candidate(), opts({ env, fetch }));
+      const { log, calls } = recordingLog();
+      expect(await routeAgentNode(candidate(), opts({ env, fetch, log }))).toBeUndefined();
       expect(urls).toEqual([]);
-      expect(routed?.route).toEqual({
-        mode: 'apply',
-        source: 'disabled',
-        authoredTier: 'medium',
-        routedTier: 'medium',
-        applied: false,
-        reason,
+      expect(calls).toEqual([]);
+    }
+  );
+
+  it('keeps the ceiling, calls nothing and records why with an unusable setting', async () => {
+    const { fetch, urls } = fakeFetch(answering());
+    const routed = await routeAgentNode(
+      candidate(),
+      opts({ env: { ...ENV, JEV_ROUTER_MIN_CONFIDENCE: 'x' }, fetch })
+    );
+    expect(urls).toEqual([]);
+    expect(routed?.route).toEqual({
+      mode: 'apply',
+      source: 'disabled',
+      authoredTier: 'medium',
+      routedTier: 'medium',
+      applied: false,
+      reason: 'invalid_setting:JEV_ROUTER_MIN_CONFIDENCE',
+    });
+  });
+
+  it.each(['shadow', 'apply'] as const)(
+    'never asks about a node with no output contract, and records it as unverifiable in %s mode',
+    async mode => {
+      const { fetch, urls } = fakeFetch(answering());
+      const routed = await routeAgentNode(
+        candidate({
+          node: agentNode({ output_format: undefined }),
+          config: { tiers: ['medium'], mode },
+        }),
+        opts({ fetch })
+      );
+      expect(urls).toEqual([]);
+      expect(routed).toEqual({
+        route: {
+          mode,
+          source: 'disabled',
+          authoredTier: 'medium',
+          routedTier: 'medium',
+          applied: false,
+          reason: 'unverifiable',
+        },
       });
+    }
+  );
+
+  it.each([
+    [
+      'the task text',
+      {
+        taskText: (): string => {
+          throw new Error('boom');
+        },
+      },
+    ],
+    [
+      'the credential list',
+      {
+        credentialValues: (): string[] => {
+          throw new Error('boom');
+        },
+      },
+    ],
+    ['a capability lookup', {}],
+  ] as [string, CandidateOverrides][])(
+    'keeps the ceiling with a recorded fallback when %s throws',
+    async (label, overrides) => {
+      const { fetch } = fakeFetch(answering());
+      const { log, calls } = recordingLog();
+      let lookups = 0;
+      const throwingLookup: CapabilityLookup = provider => {
+        // The ceiling check comes first and must succeed; the offer filter then throws.
+        if (label === 'a capability lookup' && ++lookups > 1) throw new Error('boom');
+        return lookup()(provider);
+      };
+      const routed = await routeAgentNode(
+        candidate(overrides),
+        opts({ fetch, log, getCapabilities: throwingLookup })
+      );
+      expect(routed).toEqual({
+        route: {
+          mode: 'apply',
+          source: 'fallback',
+          authoredTier: 'medium',
+          routedTier: 'medium',
+          applied: false,
+          reason: 'router_error',
+        },
+      });
+      expect(calls.map(([level, , message]) => [level, message])).toEqual([
+        ['warn', 'model_router.decision'],
+      ]);
+      expect(JSON.stringify(calls)).not.toContain('boom');
     }
   );
 
@@ -883,13 +1033,8 @@ describe('routeAgentNode', () => {
     it.each([
       ['no key', {}],
       ['the router switch off', { ...ENV, JEV_ROUTER_ENABLED: '0' }],
-    ] as [string, Record<string, string>][])('is not applied with %s', async (_label, env) => {
-      const routed = await routeAgentNode(candidate({ recorded }), opts({ env }));
-      expect(routed?.route).toMatchObject({
-        source: 'disabled',
-        routedTier: 'medium',
-        applied: false,
-      });
+    ] as [string, Record<string, string>][])('is dropped with %s', async (_label, env) => {
+      expect(await routeAgentNode(candidate({ recorded }), opts({ env }))).toBeUndefined();
     });
 
     it('follows the mode the operator has now', async () => {

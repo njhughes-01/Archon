@@ -22,6 +22,7 @@ import {
   getProviderCapabilities,
   isRegisteredProvider,
 } from '@archon/providers';
+import { hasOpenAdditionalProperties } from '@archon/providers/structured-output';
 import type { ProviderCapabilities } from '@archon/providers/types';
 import { unsupportedNodeFields, type NodeCapabilityScope } from '../node-capability-checks';
 import type { NodeModelResolution } from '../node-model-resolution';
@@ -76,10 +77,20 @@ export type RouterEnv = Readonly<Record<string, string | undefined>>;
 const isUnit = (value: number): boolean => value >= 0 && value <= 1;
 const isPositiveInteger = (value: number): boolean => Number.isInteger(value) && value > 0;
 
-/** `0` or `false` in any case. Unset and empty leave the feature on, as for every Jev switch. */
+const OFF_VALUES = new Set(['0', 'false', 'off', 'no']);
+
+/** `0`, `false`, `off` or `no` in any case. Unset and empty leave the feature on. */
 function isSwitchedOff(raw: string | undefined): boolean {
-  const flag = raw?.trim().toLowerCase();
-  return flag === '0' || flag === 'false';
+  return raw !== undefined && OFF_VALUES.has(raw.trim().toLowerCase());
+}
+
+/** Why the router makes no request at all in this environment, or `undefined` when it can. */
+export function routerInactiveReason(env: RouterEnv): 'disabled_by_env' | 'no_api_key' | undefined {
+  // JEV_ENABLED is the switch for every Jev feature; JEV_ROUTER_ENABLED is this one's alone.
+  if (isSwitchedOff(env.JEV_ENABLED) || isSwitchedOff(env.JEV_ROUTER_ENABLED)) {
+    return 'disabled_by_env';
+  }
+  return env.JEV_API_KEY ? undefined : 'no_api_key';
 }
 
 /**
@@ -90,12 +101,9 @@ function isSwitchedOff(raw: string | undefined): boolean {
 export function readRouterSettings(
   env: RouterEnv
 ): { ok: true; settings: RouterSettings } | { ok: false; reason: string } {
-  // JEV_ENABLED is the switch for every Jev feature; JEV_ROUTER_ENABLED is this one's alone.
-  if (isSwitchedOff(env.JEV_ENABLED) || isSwitchedOff(env.JEV_ROUTER_ENABLED)) {
-    return { ok: false, reason: 'disabled_by_env' };
-  }
+  const inactive = routerInactiveReason(env);
   const apiKey = env.JEV_API_KEY;
-  if (!apiKey) return { ok: false, reason: 'no_api_key' };
+  if (inactive !== undefined || !apiKey) return { ok: false, reason: inactive ?? 'no_api_key' };
 
   const invalid: string[] = [];
   const read = (name: string, fallback: number, isUsable: (value: number) => boolean): number => {
@@ -153,14 +161,21 @@ export interface RoutingCandidate {
   /** The node's session is stored and resumed across runs (`persist_session`). */
   usesPersistedScope: boolean;
   /**
-   * A session may continue into or out of this node, so its provider must not change.
-   * True for every node outside a parallel layer: such a node may inherit the previous
-   * node's session, and the next node may inherit its own.
+   * The node's provider must not change, because a session may cross it. False only when
+   * the caller has shown both halves: the node starts without a session, and no later node
+   * can inherit the one it creates. Anything not shown is `true`.
    */
   sameProviderOnly: boolean;
   /** The run executes inside the container backend. */
   inContainer: boolean;
   capabilityScope: NodeCapabilityScope;
+  /**
+   * Whether this run may use a provider at all, for conditions no node field expresses.
+   * Absent means every registered provider is usable. The tool-action gate supplies it:
+   * with the gate on, a provider without the `toolActionGate` capability fails at
+   * dispatch, so a tier on such a provider must never be offered.
+   */
+  providerUsable?: (provider: string) => boolean;
 }
 
 /**
@@ -205,11 +220,24 @@ export function routingCeiling(
   return ceiling;
 }
 
-const STRUCTURED_OUTPUT_RANK: Record<string, number> = {
-  enforced: 2,
-  'best-effort': 1,
-  false: 0,
-};
+/**
+ * Why a provider cannot be trusted to show that it got the node wrong, or `undefined` when
+ * it can. A node is lowered only where escalation could catch a bad result, and the one
+ * thing escalation can see is a failed output contract. So the target must enforce the
+ * node's `output_format` as written: grammar-constrained decoding, every property required
+ * where the provider demands it, and no open `additionalProperties` that a strict provider
+ * would silently close.
+ */
+function unverifiableOn(node: AgentNode, caps: ProviderCapabilities): string | undefined {
+  if (node.output_format === undefined) return 'unverifiable';
+  if (caps.structuredOutput !== 'enforced') return 'structured_output';
+  if (!caps.requiresAllPropertiesRequired) return undefined;
+  // The run-start strict-schema check only looked at the authored tier's provider.
+  if (findRequiredPropertyGaps(node.output_format, 'output_format').length > 0) {
+    return 'strict_schema';
+  }
+  return hasOpenAdditionalProperties(node.output_format) ? 'open_schema' : undefined;
+}
 
 /** Why a provider other than the ceiling's cannot take the node, or `undefined` when it can. */
 function crossProviderExclusion(
@@ -223,6 +251,9 @@ function crossProviderExclusion(
   // A node that names its provider would get a new "model resolves to another provider"
   // warning, and the author's stated provider would lose to the router's.
   if (node.provider !== undefined && node.provider !== provider) return 'declared_provider';
+  // A node that promises to leave the checkout alone fails outright if a lower tier on
+  // another provider writes to it, and no second attempt can undo the write.
+  if (node.mutates_checkout === false) return 'read_only_node';
   // The run-start container pre-scan only looked at the authored tier's provider.
   if (candidate.inContainer && !caps.containerExec) return 'container_exec';
   // A field the ceiling honours and this provider would silently ignore: a dropped tool
@@ -233,23 +264,7 @@ function crossProviderExclusion(
   const lost = unsupportedNodeFields(node, provider, caps, capabilityScope).find(
     field => !ceilingUnsupported.has(field)
   );
-  if (lost !== undefined) return `unsupported:${lost}`;
-  if (node.output_format !== undefined) {
-    if (
-      STRUCTURED_OUTPUT_RANK[String(caps.structuredOutput)] <
-      STRUCTURED_OUTPUT_RANK[String(ceilingCaps.structuredOutput)]
-    ) {
-      return 'structured_output';
-    }
-    // The run-start strict-schema check only looked at the authored tier's provider.
-    if (
-      caps.requiresAllPropertiesRequired &&
-      findRequiredPropertyGaps(node.output_format, 'output_format').length > 0
-    ) {
-      return 'strict_schema';
-    }
-  }
-  return undefined;
+  return lost !== undefined ? `unsupported:${lost}` : undefined;
 }
 
 export interface TierOffer {
@@ -262,9 +277,10 @@ export interface TierOffer {
 /**
  * The tiers below `ceiling` that could run the node. A tier is offered only when it has a
  * preset of its own (a missing tier falls back to a higher one, which would raise the
- * node), differs from the ceiling's preset, and names a provider that can run everything
- * the ceiling's provider can. A tier on the ceiling's own provider needs no capability
- * check: capabilities belong to the provider, not the model.
+ * node), differs from the ceiling's preset, names a provider this run may use and that
+ * enforces the node's output contract, and, on another provider, can run everything the
+ * ceiling's provider can. A tier on the ceiling's own provider needs no capability
+ * comparison: capabilities belong to the provider, not the model.
  */
 export function offerTiers(
   candidate: RoutingCandidate,
@@ -294,12 +310,17 @@ export function offerTiers(
       preset.effort === ceilingPreset.effort
     ) {
       exclusion = 'same_as_ceiling';
-    } else if (preset.provider !== ceilingPreset.provider) {
+    } else {
       const caps = getCapabilities(preset.provider);
-      exclusion =
-        caps === undefined
-          ? 'unregistered_provider'
-          : crossProviderExclusion(candidate, preset.provider, caps, ceilingCaps);
+      if (caps === undefined) exclusion = 'unregistered_provider';
+      else if (candidate.providerUsable?.(preset.provider) === false) {
+        exclusion = 'provider_unusable';
+      } else {
+        exclusion =
+          (preset.provider !== ceilingPreset.provider
+            ? crossProviderExclusion(candidate, preset.provider, caps, ceilingCaps)
+            : undefined) ?? unverifiableOn(candidate.node, caps);
+      }
     }
     if (exclusion === undefined) offer.offered.push(tier);
     else offer.excluded[tier] = exclusion;
@@ -357,13 +378,18 @@ export function decideTier(
   return { source: 'jev', routedTier: chosenTier, chosenTier };
 }
 
-/** Facts about a step computed in code, so the classifier need not infer them from prose. */
+/**
+ * Facts about a step computed in code, so the classifier need not infer them from prose.
+ *
+ * Nothing here depends on how the step reached the run. A command run by its own workflow
+ * and the same command composed into another through `include:` differ in node id and in
+ * source kind, and must look identical to the classifier, so neither is sent. The authored
+ * tier is not sent either: the offered tiers are already the question's options, and
+ * naming the one the author picked anchors the answer there. Whether the step declares an
+ * output format is not a fact worth sending, because only steps that do are classified.
+ */
 export interface RouteFeatures {
   [key: string]: JevStateValue;
-  /** The command a step runs, or the node's id for an inline prompt. Authored, never run data. */
-  step_name: string;
-  node_kind: 'command' | 'inline';
-  has_output_format: boolean;
   tools_declared: boolean;
   mcp_present: boolean;
   skills_present: boolean;
@@ -378,15 +404,8 @@ export interface RouteFeatures {
   context_chars: number;
 }
 
-/**
- * The authored tier is deliberately not among the facts: the offered tiers are already the
- * question's options, and telling the classifier which one the author picked anchors it there.
- */
 export function routeFeatures(node: AgentNode, stepText: string, taskText: string): RouteFeatures {
   return {
-    step_name: node.source.kind === 'command' ? node.source.name : node.id,
-    node_kind: node.source.kind,
-    has_output_format: node.output_format !== undefined,
     tools_declared: node.allowed_tools !== undefined || node.denied_tools !== undefined,
     mcp_present: node.mcp !== undefined,
     skills_present: node.skills !== undefined && node.skills.length > 0,
@@ -414,14 +433,15 @@ const AMBIGUITY_QUESTION = 'ambiguous_or_multi_step';
 /**
  * What each tier is for. Keyed by `TierName`, so a new tier cannot be offered undescribed.
  *
- * Each entry stands on its own: what the work is, the kinds of step that are that work,
- * and what it is not. The classifier otherwise reads "several instructions" as "hard".
+ * Each entry stands on its own: what the work is, kinds of work that are it, and what it
+ * is not. The examples name kinds of work, never the steps of any one workflow pack: a
+ * description that lists a pack's own steps would only teach the classifier that pack.
  */
 const TIER_CRITERIA: Record<TierName, string> = {
   small:
-    'Collecting, listing, sorting or restating facts that already exist, by following fixed instructions. Examples: finding which commands a project uses to check itself; sorting a failure or a change into given categories; writing or updating a pull-request description for a small or single-purpose change from existing notes and results. Not for work whose answer depends on weighing trade-offs, on understanding unfamiliar code in depth, or on a sensitive subject.',
+    'Collecting, listing, sorting or restating facts that already exist, by following fixed instructions. Examples: reading files or command output and listing what they define; putting an observed result into one of a few given categories; writing a short description of a small, single-purpose change from material already at hand. Not for work whose answer depends on weighing trade-offs, on understanding unfamiliar code in depth, or on a sensitive subject.',
   medium:
-    'Engineering judgement on a clearly stated task within one part of a system. Examples: reviewing a change for defects; investigating a defect with a known symptom in one area; triaging an issue; implementing a well-specified change; summarising a large, multi-part change from several sources. Not for collecting or restating known facts, and not for design decisions or sensitive changes.',
+    'Engineering judgement on a clearly stated task within one part of a system. Examples: examining a change for defects; finding the cause of a defect that has a known symptom in one area; assessing a request and deciding what it needs next; making a well-specified change; condensing a large, multi-part body of work from several sources. Not for collecting or restating known facts, and not for design decisions or sensitive changes.',
   large:
     'Hard or consequential reasoning. Examples: architecture or design decisions; requirements that are unclear or conflict; diagnosing a problem that has no reproduction or several possible causes across components; changes to security, data schemas, deletion or money; work that spans several systems.',
 };
@@ -529,9 +549,41 @@ export async function routeAgentNode(
 ): Promise<RoutedNode | undefined> {
   const getCapabilities = options.getCapabilities ?? registeredCapabilities;
   const log = options.log ?? getLog();
+  const env = options.env ?? process.env;
+  // With no key, or with a switch off, the router is absent: no route, no record, whatever
+  // an earlier pass of the run decided. This is what "optional" means for a config block
+  // that is present on a machine that cannot or may not classify.
+  if (routerInactiveReason(env) !== undefined) return undefined;
   const ceiling = routingCeiling(input, getCapabilities);
   if (ceiling === undefined) return undefined;
   const mode = input.config.mode === 'apply' ? 'apply' : 'shadow';
+  try {
+    return await decideRoute(input, ceiling, mode, env, options.fetch, getCapabilities, log);
+  } catch (error) {
+    // Routing is advice. Whatever goes wrong inside it (a caller's loader, a provider
+    // lookup, a malformed node) must leave the node on its authored tier, never fail it.
+    const route = ceilingRoute(mode, ceiling, 'fallback', 'router_error');
+    log.warn(
+      {
+        nodeId: input.node.id,
+        ...route,
+        errorName: error instanceof Error ? error.name : 'unknown',
+      },
+      'model_router.decision'
+    );
+    return { route };
+  }
+}
+
+async function decideRoute(
+  input: RouteAgentNodeInput,
+  ceiling: TierName,
+  mode: NodeRoute['mode'],
+  env: RouterEnv,
+  fetch: Fetch | undefined,
+  getCapabilities: CapabilityLookup,
+  log: RouterLog
+): Promise<RoutedNode> {
   const nodeId = input.node.id;
   const offer = offerTiers(input, ceiling, getCapabilities);
 
@@ -547,11 +599,18 @@ export async function routeAgentNode(
     return route;
   };
 
-  // Checked before a recorded route is reused: with no key, or with a switch off, a node
-  // resolves exactly as it would with no router, whatever an earlier pass decided.
-  const read = readRouterSettings(options.env ?? process.env);
+  // Only an unusable setting reaches here as "not ok": the operator meant the router to
+  // run and mistyped a number, which they need to see on the record.
+  const read = readRouterSettings(env);
   if (!read.ok) return { route: finish(ceilingRoute(mode, ceiling, 'disabled', read.reason)) };
   const { settings } = read;
+
+  // A node with no output contract gives escalation nothing to check, so a weak answer
+  // from a lower tier would pass unseen. It is never lowered, on any provider, and the
+  // classifier is not asked.
+  if (input.node.output_format === undefined) {
+    return { route: finish(ceilingRoute(mode, ceiling, 'disabled', 'unverifiable')) };
+  }
 
   // A resumed or restarted run keeps the route its first pass recorded: the same node of
   // the same run must not be classified twice, and a node that escalated stays escalated.
@@ -599,7 +658,7 @@ export async function routeAgentNode(
     apiKey: settings.apiKey,
     model: settings.model,
     timeoutMs: settings.timeoutMs,
-    fetch: options.fetch,
+    fetch,
     questions: buildQuestions([...offer.offered, ceiling]),
     // The task and the computed facts come first and the step text is only its opening:
     // what the run was asked to do decides the tier far more than the step's procedure.

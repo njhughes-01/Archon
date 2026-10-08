@@ -2729,14 +2729,30 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     ...minimalConfig,
     modelRouter: { tiers: routed as ('small' | 'medium' | 'large')[], mode },
   });
+  /** A closed contract Claude and Codex both enforce as written. */
+  const CONTRACT = {
+    type: 'object',
+    properties: { ok: { type: 'boolean' } },
+    required: ['ok'],
+  };
+  // A node is only lowered when it declares a contract escalation can check, so the
+  // routable fixture declares one and the default provider answer satisfies it.
   const mediumStep = (fields: Record<string, unknown> = {}): DagNode =>
     ({
       id: 'step1',
       kind: 'agent',
       source: { kind: 'inline', prompt: 'Summarise $ARGUMENTS' },
       model: 'medium',
+      output_format: CONTRACT,
       ...fields,
     }) as DagNode;
+  const meetsContract = async function* (): AsyncGenerator<MessageChunk> {
+    yield { type: 'assistant', content: '{"ok":true}' };
+    yield { type: 'result', sessionId: 'dag-session-id', structuredOutput: { ok: true } };
+  };
+  /** No attempt of any node carried a route: the router never considered them. */
+  const noRouteRecorded = (deps: ReturnType<typeof createMockDeps>): boolean =>
+    !eventsOf(deps).some(event => 'route' in ((event.data?.binding as object | undefined) ?? {}));
 
   interface RouterAnswer {
     choice?: string;
@@ -2807,10 +2823,7 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     await writeFile(join(testDir, '.archon', 'commands', 'discover.md'), COMMAND_TEXT);
     mockSendQueryDag.mockClear();
     mockLogFn.mockClear();
-    mockSendQueryDag.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'DAG AI response' };
-      yield { type: 'result', sessionId: 'dag-session-id' };
-    });
+    mockSendQueryDag.mockImplementation(meetsContract);
     // The seam reads the router's settings from the real environment and reaches the
     // classifier through the real global fetch, so this suite — and only this suite —
     // lifts the test-run switch and fakes that one HTTP boundary.
@@ -2894,34 +2907,37 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
   );
 
   it.each([
-    ['no key', (): void => void delete process.env.JEV_API_KEY, 'no_api_key'],
-    [
-      'the Jev master switch off',
-      (): void => void (process.env.JEV_ENABLED = '0'),
-      'disabled_by_env',
-    ],
-    [
-      'the router switch off',
-      (): void => void (process.env.JEV_ROUTER_ENABLED = '0'),
-      'disabled_by_env',
-    ],
-  ] as [string, () => void, string][])(
-    'runs on the authored tier and records why with %s',
-    async (_label, arrange, reason) => {
+    ['no key', (): void => void delete process.env.JEV_API_KEY],
+    ['the Jev master switch off', (): void => void (process.env.JEV_ENABLED = '0')],
+    ['the router switch off', (): void => void (process.env.JEV_ROUTER_ENABLED = 'off')],
+  ] as [string, () => void][])(
+    'runs on the authored tier and records nothing with %s, block or no block',
+    async (_label, arrange) => {
       arrange();
       const deps = await run();
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(sentModels()).toEqual(['sonnet']);
-      expect(bindingsOf(deps, 'node_started')[0].route).toEqual({
-        mode: 'apply',
-        source: 'disabled',
-        authoredTier: 'medium',
-        routedTier: 'medium',
-        applied: false,
-        reason,
-      });
+      expect(noRouteRecorded(deps)).toBe(true);
     }
   );
+
+  it('never lowers a node with no output contract, and records it as unverifiable', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'prose' };
+      yield { type: 'result', sessionId: 'sid' };
+    });
+    const deps = await run({ nodes: [mediumStep({ output_format: undefined })] });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(sentModels()).toEqual(['sonnet']);
+    expect(bindingsOf(deps, 'node_started')[0].route).toEqual({
+      mode: 'apply',
+      source: 'disabled',
+      authoredTier: 'medium',
+      routedTier: 'medium',
+      applied: false,
+      reason: 'unverifiable',
+    });
+  });
 
   it('runs on the authored tier, without failing, when the classifier fails', async () => {
     fetchSpy.mockImplementation(
@@ -2978,8 +2994,7 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     mockSendQueryDag.mockImplementation(async function* () {
       attempts++;
       if (attempts === 1) throw new Error('Claude Code crash: process exited with code 1');
-      yield { type: 'assistant', content: 'done' };
-      yield { type: 'result', sessionId: 'sid' };
+      yield* meetsContract();
     });
 
     await run({
@@ -2989,6 +3004,7 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
           kind: 'agent',
           source: { kind: 'command', name: 'discover' },
           model: 'medium',
+          output_format: CONTRACT,
           retry: { max_attempts: 1, delay_ms: 1 },
         },
       ],
@@ -3003,6 +3019,35 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     ]);
   });
 
+  it('sends nothing from a captured command that was changed, and the node fails as it always has', async () => {
+    const captureRoot = join(testDir, 'capture');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(
+      join(captureRoot, 'project', '.archon', 'commands', 'discover.md'),
+      'tampered after capture'
+    );
+    const deps = await run({
+      workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      nodes: [
+        {
+          id: 'step1',
+          kind: 'agent',
+          source: { kind: 'command', name: 'discover' },
+          model: 'medium',
+          output_format: CONTRACT,
+        },
+      ],
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const failed = eventsOf(deps).find(event => event.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain('captured source has changed');
+    expect((failed?.data?.binding as Record<string, unknown>).route).toMatchObject({
+      source: 'fallback',
+      reason: 'step_text_unavailable',
+    });
+  });
+
   it('leaves a missing command to fail the node as it always has', async () => {
     const deps = await run({
       nodes: [
@@ -3011,6 +3056,7 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
           kind: 'agent',
           source: { kind: 'command', name: 'absent' },
           model: 'medium',
+          output_format: CONTRACT,
         },
       ],
     });
@@ -3172,9 +3218,10 @@ nodes:
     expect(discovered.errors).toEqual([]);
     const parent = discovered.workflows.find(w => w.workflow.name === 'fan-parent');
     if (!parent) throw new Error('fan-parent was not discovered');
+    const fanDeps = createMockDeps();
     await executeDagWorkflow({
       ...dagOptions({
-        deps: createMockDeps(),
+        deps: fanDeps,
         cwd: testDir,
         workflow: { name: 'placeholder', nodes: [] },
         workflowRun: makeWorkflowRun('router-fan-out', { user_message: TASK }),
@@ -3185,6 +3232,7 @@ nodes:
     });
     expect(sentModels()).toEqual(['sonnet', 'sonnet']);
     expect(fetchSpy).not.toHaveBeenCalled();
+    expect(noRouteRecorded(fanDeps)).toBe(true);
   });
 
   describe('a tier on another provider', () => {
@@ -3196,14 +3244,73 @@ nodes:
       mockGetAgentProviderDag.mockClear();
     });
 
-    it('is not offered to a sequential node, whose session the next node may continue', async () => {
-      const deps = await run({ aiProfile: crossProvider() });
+    const follower = (dependsOn: string, fields: Record<string, unknown> = {}): DagNode =>
+      ({
+        id: 'follow',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'continue' },
+        model: 'large',
+        depends_on: [dependsOn],
+        ...fields,
+      }) as DagNode;
+
+    it.each([
+      ['the next node', (): DagNode[] => [mediumStep(), follower('step1')]],
+      [
+        'the next agent node, across a script',
+        (): DagNode[] => [
+          mediumStep(),
+          dagNodeSchema.parse({ id: 'publish', bash: 'true', depends_on: ['step1'] }) as DagNode,
+          follower('publish'),
+        ],
+      ],
+    ] as [string, () => DagNode[]][])(
+      'is not offered to a node whose session %s may continue',
+      async (_label, nodes) => {
+        const deps = await run({ aiProfile: crossProvider(), nodes: nodes() });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(sentModels()).toEqual(['sonnet', 'opus']);
+        expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+          source: 'disabled',
+          reason: 'no_lower_tier',
+        });
+        // The follower did continue the session the unrouted node created.
+        expect(mockSendQueryDag.mock.calls[1][2]).toBe('dag-session-id');
+      }
+    );
+
+    it.each([
+      ['runs alone', (): DagNode[] => [mediumStep()]],
+      [
+        'is followed only by a script',
+        (): DagNode[] => [
+          mediumStep(),
+          dagNodeSchema.parse({ id: 'publish', bash: 'true', depends_on: ['step1'] }) as DagNode,
+        ],
+      ],
+    ] as [string, () => DagNode[]][])(
+      'is offered to a sequential node that %s, since no session can cross it',
+      async (_label, nodes) => {
+        const deps = await run({ aiProfile: crossProvider(), nodes: nodes() });
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(sentModels()).toEqual(['gpt-mini']);
+        expect(bindingsOf(deps, 'node_started')[0].provider).toBe('codex');
+      }
+    );
+
+    it('is not offered to a node that promises to leave the checkout alone', async () => {
+      const deps = await run({
+        aiProfile: crossProvider(),
+        nodes: [mediumStep({ mutates_checkout: false })],
+      });
       expect(fetchSpy).not.toHaveBeenCalled();
       expect(sentModels()).toEqual(['sonnet']);
-      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
-        source: 'disabled',
-        reason: 'no_lower_tier',
-      });
+      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({ reason: 'no_lower_tier' });
+
+      // On its own provider the same node may still be lowered.
+      mockSendQueryDag.mockClear();
+      await run({ nodes: [mediumStep({ mutates_checkout: false })] });
+      expect(sentModels()).toEqual(['haiku']);
     });
 
     it('is offered to a node in a parallel layer, where no session crosses the node', async () => {
@@ -3363,8 +3470,7 @@ nodes:
           };
           return;
         }
-        yield { type: 'assistant', content: 'done' };
-        yield { type: 'result', sessionId: 'sid' };
+        yield* meetsContract();
       });
       const deps = await run({ nodes: [mediumStep({ retry: { max_attempts: 0 } })] });
       expect(sentModels()).toEqual(['haiku', 'sonnet']);
@@ -3437,31 +3543,66 @@ nodes:
       ]);
     });
 
-    it('does not escalate a checkout the lower tier already changed', async () => {
-      await git.execFileAsync('git', ['init', '-q'], { cwd: testDir });
-      await git.execFileAsync(
-        'git',
-        ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'],
-        { cwd: testDir }
-      );
-      await writeFile(join(testDir, '.gitignore'), '.archon/\nartifacts/\nstate/\nlogs/\n');
-      await git.execFileAsync('git', ['add', '.gitignore'], { cwd: testDir });
-      await git.execFileAsync(
-        'git',
-        ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'],
-        { cwd: testDir }
-      );
-      mockSendQueryDag.mockImplementation(async function* () {
-        await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
-        yield { type: 'assistant', content: 'done' };
-        yield { type: 'result', sessionId: 'sid' };
+    describe('a lower tier that changes a checkout the node declares read-only', () => {
+      const readOnlyStep = (): DagNode =>
+        mediumStep({ mutates_checkout: false, retry: { max_attempts: 0 } });
+
+      beforeEach(async () => {
+        await git.execFileAsync('git', ['init', '-q'], { cwd: testDir });
+        await writeFile(join(testDir, '.gitignore'), '.archon/\nartifacts/\nstate/\nlogs/\n');
+        await git.execFileAsync('git', ['add', '.gitignore'], { cwd: testDir });
+        await git.execFileAsync(
+          'git',
+          ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'],
+          { cwd: testDir }
+        );
       });
-      const deps = await run({
-        nodes: [mediumStep({ mutates_checkout: false, retry: { max_attempts: 0 } })],
+
+      it('fails on its own attempt when it completed, and is not run again', async () => {
+        mockSendQueryDag.mockImplementation(async function* () {
+          await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
+          yield* meetsContract();
+        });
+        const deps = await run({ nodes: [readOnlyStep()] });
+        expect(sentModels()).toEqual(['haiku']);
+        const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
+        expect(failed.map(event => event.data?.failure_kind)).toEqual(['output_contract']);
+        expect((failed[0].data?.binding as Record<string, unknown>).tier).toBe('small');
       });
-      expect(sentModels()).toEqual(['haiku']);
-      const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
-      expect(failed.map(event => event.data?.failure_kind)).toEqual(['output_contract']);
+
+      it('is not escalated when it failed: the authored tier is never blamed for the write', async () => {
+        const platform = createMockPlatform();
+        mockSendQueryDag.mockImplementation(async function* () {
+          await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
+          yield { type: 'assistant', content: 'prose, not the contract' };
+          yield { type: 'result', sessionId: 'sid' };
+        });
+        const deps = await run({ nodes: [readOnlyStep()], platform });
+        // The contract failure would escalate, but the tree is already changed.
+        expect(sentModels()).toEqual(['haiku']);
+        const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
+        expect(failed).toHaveLength(1);
+        expect((failed[0].data?.binding as Record<string, unknown>).route).toMatchObject({
+          routedTier: 'small',
+          applied: true,
+        });
+        expect(deliveredMessages(platform)).toContain(
+          'Node `step1` failed on the `small` tier after changing a checkout it declares `mutates_checkout: false`. It was not run again on its authored tier.'
+        );
+      });
+
+      it('is escalated as usual when it failed without touching the checkout', async () => {
+        mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+          if ((options as { model?: string } | undefined)?.model === 'haiku') {
+            yield { type: 'assistant', content: 'prose' };
+            yield { type: 'result', sessionId: 'sid' };
+            return;
+          }
+          yield* meetsContract();
+        });
+        await run({ nodes: [readOnlyStep()] });
+        expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      });
     });
   });
 
@@ -3497,10 +3638,7 @@ nodes:
     });
     fetchSpy.mockClear();
     mockSendQueryDag.mockClear();
-    mockSendQueryDag.mockImplementation(async function* () {
-      yield { type: 'assistant', content: 'done' };
-      yield { type: 'result' };
-    });
+    mockSendQueryDag.mockImplementation(meetsContract);
 
     await run({ deps, nodes, workflowRun, priorCompletedNodes: new Map() });
 
