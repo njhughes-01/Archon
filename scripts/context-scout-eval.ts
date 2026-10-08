@@ -21,9 +21,11 @@
  *   bun run scripts/context-scout-eval.ts [--dry] [--json] [--repo <dir>] [--key <file>]
  *
  * Exit codes:
- *   0  scored, and it passed: every relevant file selected, and at most half of all files
+ *   0  scored, and it passed: every relevant file selected, and at most half of the files
+ *      the scout could read
  *   1  scored, and it did not pass
- *   2  not scored: the classifier was unavailable, the run was cut short, or bad usage
+ *   2  not scored: the classifier was unavailable, the run was cut short, the evaluation
+ *      could not be set up (answer key, repository), or bad usage
  *
  * Prints paths and numbers only. Never file contents, never the key.
  */
@@ -56,13 +58,23 @@ export interface AnswerKey {
   relevant: string[];
 }
 
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 /** `relevant` is a path-to-reason map on disk; the reasons are for whoever edits the key. */
 export async function readAnswerKey(path: string): Promise<AnswerKey> {
-  const parsed: unknown = JSON.parse(await Bun.file(path).text());
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(await Bun.file(path).text());
+  } catch (error) {
+    // Bun's parse error names a position, not the file it came from.
+    throw new Error(`${path} could not be read as JSON: ${messageOf(error)}`, { cause: error });
+  }
   if (!isRecord(parsed) || typeof parsed.question !== 'string' || !isRecord(parsed.relevant)) {
     throw new Error(`${path} is not an answer key: it needs "question" and a "relevant" map`);
   }
@@ -90,7 +102,13 @@ export interface Score {
   /** Files the scout selected. */
   selected: number;
   /** Tracked files the scout was pointed at. */
-  total: number;
+  candidates: number;
+  /**
+   * The candidates the scout was allowed to send: those it classified and those a budget
+   * cut. This is what narrowing is measured against. A withheld secret or binary was
+   * never the scout's to select, so it must not make a broad selection look narrow.
+   */
+  classifiable: number;
   truePositives: number;
   /** Selected, but a decoy. */
   falsePositives: string[];
@@ -109,7 +127,10 @@ export interface Score {
   requests: number;
   windows: number;
   files: ScoredFile[];
-  /** Full recall from a complete run that selected at most `MAX_SELECTED_SHARE` of the files. */
+  /**
+   * Full recall from a complete run that selected at most `MAX_SELECTED_SHARE` of the
+   * classifiable files.
+   */
   pass: boolean;
 }
 
@@ -141,13 +162,14 @@ export function scoreSelection(key: AnswerKey, result: ScoutResult): Score {
   }
 
   const recall = key.relevant.length === 0 ? 1 : truePositives / key.relevant.length;
-  const total = result.counts.candidates;
+  const classifiable = result.counts.classified + result.counts.unclassified;
   return {
     status: result.status,
     reason: result.reason,
     relevantTotal: key.relevant.length,
     selected: selected.length,
-    total,
+    candidates: result.counts.candidates,
+    classifiable,
     truePositives,
     falsePositives: selected.filter(file => !file.relevant).map(file => file.path),
     falseNegatives,
@@ -158,7 +180,10 @@ export function scoreSelection(key: AnswerKey, result: ScoutResult): Score {
     requests: result.counts.requests,
     windows: result.counts.windows,
     files,
-    pass: result.status === 'ok' && recall === 1 && selected.length <= total * MAX_SELECTED_SHARE,
+    pass:
+      result.status === 'ok' &&
+      recall === 1 &&
+      selected.length <= classifiable * MAX_SELECTED_SHARE,
   };
 }
 
@@ -191,6 +216,8 @@ export interface EvalRun {
 }
 
 export interface EvalReport extends Score {
+  /** True when the answer key answered instead of a classifier. Such a run measures nothing about one. */
+  dry: boolean;
   repoDir: string;
   question: string;
   /** What answered: the dry oracle, or the endpoint and model. */
@@ -256,11 +283,20 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
   }
   return {
     ...scoreSelection(run.key, result),
+    dry: run.dry === true,
     repoDir: run.repoDir,
     question: result.question,
     classifier,
     threshold: settings.available ? settings.settings.threshold : null,
   };
+}
+
+/** Says so when some tracked files were never the scout's to read. */
+function withheld(report: EvalReport): string {
+  const count = report.candidates - report.classifiable;
+  return count === 0
+    ? ''
+    : ` (${String(count)} more tracked files were withheld from the classifier)`;
 }
 
 function ratio(value: number | null): string {
@@ -271,6 +307,16 @@ function listed(label: string, paths: readonly string[]): string[] {
   const head = `${label}:`.padEnd(12);
   if (paths.length === 0) return [`${head}none`];
   return paths.map((path, index) => `${index === 0 ? head : ' '.repeat(12)}${path}`);
+}
+
+/**
+ * How every result line starts. The last line of a report gets pasted on its own, and a
+ * dry run's must never read as a classifier's.
+ */
+function resultLabel(report: EvalReport): string {
+  return report.dry
+    ? 'RESULT (dry run: the answers came from the answer key, not from a classifier):'
+    : 'RESULT:';
 }
 
 /** The report as text: paths and numbers only. */
@@ -285,7 +331,7 @@ export function formatReport(report: EvalReport): string {
     lines.push(
       `status:     unavailable (${report.reason})`,
       '',
-      'RESULT: NOT SCORED. The classifier gave no answers, so there is nothing to measure.'
+      `${resultLabel(report)} NOT SCORED. The classifier gave no answers, so there is nothing to measure.`
     );
     return lines.join('\n');
   }
@@ -299,7 +345,7 @@ export function formatReport(report: EvalReport): string {
     report.precision === null
       ? 'precision:  n/a   (nothing was selected)'
       : `precision:  ${ratio(report.precision)}  (${String(report.truePositives)} of ${String(report.selected)} selected files are relevant)`,
-    `selected:   ${String(report.selected)} of ${String(report.total)} files`,
+    `selected:   ${String(report.selected)} of ${String(report.classifiable)} files${withheld(report)}`,
     `sent:       ${report.charsSent.toLocaleString('en-US')} characters of code and question text in ${String(report.requests)} ${plural} (${String(report.windows)} windows)`,
     '',
     ...listed('missed', report.falseNegatives),
@@ -326,25 +372,26 @@ export function formatReport(report: EvalReport): string {
     const { threshold, selected } = report.recallSafeThreshold;
     lines.push(
       `Highest threshold that still selects every relevant file: ${String(threshold)} ` +
-        `(selects ${String(selected)} of ${String(report.total)} files).`
+        `(selects ${String(selected)} of ${String(report.classifiable)} files).`
     );
   }
 
+  const result = resultLabel(report);
   if (report.status === 'truncated') {
     lines.push(
-      `RESULT: NOT SCORED. The run was cut short (${report.reason}); raise the budget and rerun.`
+      `${result} NOT SCORED. The run was cut short (${report.reason}); raise the budget and rerun.`
     );
   } else if (report.pass) {
     lines.push(
-      `RESULT: PASS. Recall 1.00, with ${String(report.selected)} of ${String(report.total)} files selected.`
+      `${result} PASS. Recall 1.00, with ${String(report.selected)} of ${String(report.classifiable)} files selected.`
     );
   } else if (report.recall < 1) {
     lines.push(
-      `RESULT: FAIL. ${String(report.falseNegatives.length)} relevant file(s) were not selected.`
+      `${result} FAIL. ${String(report.falseNegatives.length)} relevant file(s) were not selected.`
     );
   } else {
     lines.push(
-      `RESULT: FAIL. Recall is 1.00, but ${String(report.selected)} of ${String(report.total)} files were ` +
+      `${result} FAIL. Recall is 1.00, but ${String(report.selected)} of ${String(report.classifiable)} files were ` +
         `selected, more than ${String(MAX_SELECTED_SHARE * 100)}%: the scout narrowed too little.`
     );
   }
@@ -378,7 +425,15 @@ export async function main(
     }
   }
 
-  const report = await runEval({ repoDir, key: await readAnswerKey(keyPath), env, dry });
+  let report: EvalReport;
+  try {
+    report = await runEval({ repoDir, key: await readAnswerKey(keyPath), env, dry });
+  } catch (error) {
+    // Deliberately every error: exit 1 means "the classifier was measured and fell
+    // short", and nothing that stops the run before a score may be mistaken for that.
+    write(`Cannot run the evaluation: ${messageOf(error)}`);
+    return 2;
+  }
   write(json ? JSON.stringify(report, null, 2) : formatReport(report));
   if (report.status !== 'ok') return 2;
   return report.pass ? 0 : 1;

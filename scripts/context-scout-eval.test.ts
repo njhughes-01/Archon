@@ -1,5 +1,8 @@
 import { describe, expect, it } from 'bun:test';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { trackTempRoots } from '@archon/paths/test-utils';
 import type { Fetch } from '../.archon/workflows/sdlc/.shared/jev-client.ts';
 import type { ScoutResult } from '../.archon/workflows/sdlc/.shared/context-scout.ts';
 import {
@@ -88,7 +91,7 @@ describe('scoreSelection', () => {
 
     expect(report.relevantTotal).toBe(4);
     expect(report.selected).toBe(3);
-    expect(report.total).toBe(6);
+    expect(report.classifiable).toBe(6);
     expect(report.truePositives).toBe(2);
     expect(report.falsePositives).toEqual(['x.ts']);
     // A relevant file with no answer is a miss, exactly like one answered no.
@@ -116,7 +119,7 @@ describe('scoreSelection', () => {
     expect(half.recall).toBe(1);
     expect(half.precision).toBe(1);
     expect(half.selected).toBe(4);
-    expect(half.total).toBe(8);
+    expect(half.classifiable).toBe(8);
     expect(half.pass).toBe(true);
   });
 
@@ -141,6 +144,45 @@ describe('scoreSelection', () => {
     expect(overHalf.selected).toBe(5);
     expect(overHalf.pass).toBe(false);
     expect(MAX_SELECTED_SHARE).toBe(0.5);
+  });
+
+  // Files the scout withheld (secrets, binaries) were never its to select, so they do not
+  // make a broad selection look narrow.
+  it('measures narrowing against the files it could read, not every tracked file', () => {
+    const report = scoreSelection(
+      { question: 'q', paths: [], relevant: ['a.ts', 'b.ts'] },
+      result(
+        [
+          ['a.ts', 0.9],
+          ['b.ts', 0.8],
+          ['x.ts', 0.7],
+          ['y.ts', 0.1],
+        ],
+        // Ten tracked files, six of them withheld.
+        {
+          counts: {
+            ...result([]).counts,
+            candidates: 10,
+            classified: 4,
+            excluded: {
+              ignored: 0,
+              secret: 5,
+              not_regular_file: 0,
+              too_large: 0,
+              binary: 1,
+              empty: 0,
+            },
+          },
+        }
+      )
+    );
+
+    expect(report.recall).toBe(1);
+    expect(report.selected).toBe(3);
+    expect(report.candidates).toBe(10);
+    expect(report.classifiable).toBe(4);
+    // Three of the four it could read is not narrowing, though it is under half of ten.
+    expect(report.pass).toBe(false);
   });
 
   it('has no precision when nothing was selected', () => {
@@ -216,7 +258,7 @@ describe('the seeded fixture', () => {
     // The oracle answers from the key, so this run also proves the key and repo agree.
     const report = await runEval({ repoDir: join(EVAL_FIXTURE, 'repo'), key, dry: true, env: {} });
     expect(report.status).toBe('ok');
-    expect(report.total).toBe(21);
+    expect(report.classifiable).toBe(21);
   });
 
   it('scores a perfect run from the oracle: every relevant file and no decoy', async () => {
@@ -251,7 +293,7 @@ describe('the seeded fixture', () => {
     expect(report.recall).toBe(6 / 7);
     expect(report.precision).toBe(6 / 7);
     expect(report.selected).toBe(7);
-    expect(report.total).toBe(21);
+    expect(report.classifiable).toBe(21);
     expect(report.pass).toBe(false);
   });
 
@@ -352,17 +394,49 @@ describe('the classifier line', () => {
   });
 });
 
+const trackTempRoot = trackTempRoots();
+
 describe('main', () => {
-  it('runs the dry evaluation offline and exits 0', async () => {
+  it('runs the dry evaluation offline, exits 0, and says on the result line that it was dry', async () => {
     const lines: string[] = [];
 
     const code = await main(['--dry'], {}, line => lines.push(line));
 
     expect(code).toBe(0);
     const text = lines.join('\n');
-    expect(text).toContain('dry run');
+    expect(text).toContain('classifier: dry run');
     expect(text).toContain('recall:     1.00  (7 of 7 relevant files selected)');
-    expect(text).toContain('RESULT: PASS');
+    // A pasted last line must not read as a classifier's result.
+    expect(lines.at(-1)?.split('\n').at(-1)).toBe(
+      'RESULT (dry run: the answers came from the answer key, not from a classifier): PASS. ' +
+        'Recall 1.00, with 7 of 21 files selected.'
+    );
+  });
+
+  it('marks a dry run in the JSON report too', async () => {
+    const lines: string[] = [];
+
+    const code = await main(['--dry', '--json'], {}, line => lines.push(line));
+
+    expect(code).toBe(0);
+    expect(JSON.parse(lines.join('\n'))).toMatchObject({ dry: true, pass: true, recall: 1 });
+  });
+
+  it('does not mark a run answered by a classifier as dry', async () => {
+    const key = await readAnswerKey(join(EVAL_FIXTURE, 'answer-key.json'));
+
+    const report = await runEval({
+      repoDir: join(EVAL_FIXTURE, 'repo'),
+      key,
+      env: { JEV_API_KEY: 'test-key', JEV_API_BASE: 'https://jev.example' },
+      fetch: sayingYesTo(key.relevant),
+    });
+
+    expect(report.dry).toBe(false);
+    expect(formatReport(report)).toContain(
+      'RESULT: PASS. Recall 1.00, with 7 of 21 files selected.'
+    );
+    expect(formatReport(report)).not.toContain('dry run');
   });
 
   it('exits 2 and says what is missing when asked for a live run without a key', async () => {
@@ -381,5 +455,74 @@ describe('main', () => {
 
     expect(code).toBe(2);
     expect(lines.join('\n')).toContain('--threshold');
+  });
+
+  // Exit 1 means "the classifier was measured and fell short". A run that could not be
+  // set up measured nothing, so each of these is 2, with the cause in the output.
+  describe('exits 2, with a message, when the evaluation cannot be set up', () => {
+    function scratch(): string {
+      return trackTempRoot(mkdtempSync(join(tmpdir(), 'context-scout-eval-')));
+    }
+
+    async function run(argv: string[]): Promise<{ code: number; text: string }> {
+      const lines: string[] = [];
+      const code = await main(argv, {}, line => lines.push(line));
+      return { code, text: lines.join('\n') };
+    }
+
+    it('for an answer key that does not exist', async () => {
+      const missing = join(scratch(), 'no-such-key.json');
+      const { code, text } = await run(['--dry', '--key', missing]);
+      expect(code).toBe(2);
+      expect(text).toContain('Cannot run the evaluation');
+      expect(text).toContain(missing);
+    });
+
+    it('for an answer key that is not JSON', async () => {
+      const key = join(scratch(), 'key.json');
+      writeFileSync(key, '{ not json');
+      const { code, text } = await run(['--dry', '--key', key]);
+      expect(code).toBe(2);
+      expect(text).toContain('Cannot run the evaluation');
+      expect(text).toContain(key);
+    });
+
+    it('for an answer key of the wrong shape', async () => {
+      const key = join(scratch(), 'key.json');
+      writeFileSync(key, JSON.stringify({ question: 'q', relevant: ['a.ts'] }));
+      const { code, text } = await run(['--dry', '--key', key]);
+      expect(code).toBe(2);
+      expect(text).toContain('is not an answer key');
+    });
+
+    it('for a repository that is not a git checkout', async () => {
+      const plain = scratch();
+      writeFileSync(join(plain, 'a.ts'), 'a');
+      const { code, text } = await run(['--dry', '--repo', plain]);
+      expect(code).toBe(2);
+      expect(text).toContain('Cannot run the evaluation');
+      expect(text).toContain(plain);
+    });
+
+    it('for an answer key that names a file the repository does not track', async () => {
+      const key = join(scratch(), 'key.json');
+      writeFileSync(
+        key,
+        JSON.stringify({
+          question: 'q',
+          paths: [],
+          relevant: { 'services/api/gone.ts': 'removed' },
+        })
+      );
+      const { code, text } = await run(['--dry', '--key', key]);
+      expect(code).toBe(2);
+      expect(text).toContain('services/api/gone.ts');
+    });
+
+    it('for an option that is missing its value', async () => {
+      const { code, text } = await run(['--dry', '--key']);
+      expect(code).toBe(2);
+      expect(text).toContain('--key');
+    });
   });
 });
