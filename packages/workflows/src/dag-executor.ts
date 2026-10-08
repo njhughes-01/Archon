@@ -175,7 +175,13 @@ import {
 } from './node-model-resolution';
 import { providerReadsWebSearchMode, unsupportedNodeFields } from './node-capability-checks';
 import { collectCredentialValues, redactCredentialValues } from './redaction';
-import { formatTaskText, routeAgentNode, type RoutedNode } from './jev/model-router';
+import {
+  escalateRoute,
+  escalationReason,
+  formatTaskText,
+  routeAgentNode,
+  type RoutedNode,
+} from './jev/model-router';
 import type { ModelRouterConfig, NodeRoute } from './schemas/model-router';
 import {
   logNodeComplete,
@@ -1140,6 +1146,26 @@ async function runNodeRetryLoop(
   }
   output.costUsd = accumulatedCostUsd;
   output.tokens = accumulatedTokens;
+  return output;
+}
+
+/**
+ * Add the usage of an earlier, separate round of attempts to a later round's result. Each
+ * {@link runNodeRetryLoop} call totals only its own attempts, so a node that ran two rounds
+ * (a lower model tier, then its authored one) would otherwise report only the second.
+ */
+function addEarlierUsage(
+  output: NodeExecutionResult,
+  earlier: NodeExecutionResult,
+  nodeId: string
+): NodeExecutionResult {
+  if (earlier.costUsd !== undefined) output.costUsd = (output.costUsd ?? 0) + earlier.costUsd;
+  if (earlier.tokens !== undefined) {
+    output.tokens = sumTokenUsage(
+      [earlier.tokens, ...(output.tokens !== undefined ? [output.tokens] : [])],
+      { nodeId }
+    );
+  }
   return output;
 }
 
@@ -10468,28 +10494,27 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
             // An applied route resolves exactly as if the author had written the lower tier.
             const routedNode: AgentNode =
               routed?.route.applied === true ? { ...node, model: routed.route.routedTier } : node;
-            const {
-              provider,
-              model: resolvedNodeModel,
-              options: nodeOptions,
-              tier: resolvedTier,
-              effort: resolvedEffort,
-            } = await resolveNodeProviderAndModel(
-              routedNode,
-              ctx.workflowProvider,
-              ctx.workflowModel,
-              ctx.config,
-              ctx.platform,
-              ctx.conversationId,
-              ctx.workflowRun.id,
-              ctx.cwd,
-              ctx.workflowLevelOptions,
-              ctx.aiProfile,
-              ctx.workflowPreset,
-              resolveAiConfigText,
-              ctx.warnedProviderConflicts,
-              ctx.execContext
-            );
+            const resolveBinding = (
+              target: AgentNode
+            ): ReturnType<typeof resolveNodeProviderAndModel> =>
+              resolveNodeProviderAndModel(
+                target,
+                ctx.workflowProvider,
+                ctx.workflowModel,
+                ctx.config,
+                ctx.platform,
+                ctx.conversationId,
+                ctx.workflowRun.id,
+                ctx.cwd,
+                ctx.workflowLevelOptions,
+                ctx.aiProfile,
+                ctx.workflowPreset,
+                resolveAiConfigText,
+                ctx.warnedProviderConflicts,
+                ctx.execContext
+              );
+            const binding = await resolveBinding(routedNode);
+            const { provider } = binding;
 
             // 5. Determine session. An explicit named ancestor has first priority and
             // is independent of the ambient sequential cursor and parallel-layer reset.
@@ -10650,40 +10675,91 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
               node.mutates_checkout === false
                 ? await snapshotCheckout(ctx.cwd, checkoutExcludes)
                 : undefined;
-            const retriedOutput = await runNodeRetryLoop(
-              node,
-              ctx.platform,
-              ctx.conversationId,
-              ctx.workflowRun,
-              getEffectiveNodeRetryConfig(node),
-              async () => {
-                // Fresh per attempt: an attempt after a transient failure observes
-                // artifacts published in the interval, and never reuses the
-                // listing handed to AI-configuration substitution above.
-                const attemptTypedArtifactsFile = await writeNodeArtifactsListing(
-                  ctx.artifactsDir,
-                  ctx.workflowRun.id
-                );
-                return executeNodeInternal(
-                  ctx,
-                  node,
-                  provider,
-                  nodeOptions,
-                  // Always pass the prior session ID. executeNodeInternal requests a fork,
-                  // but legacy resume-only providers may continue in place; named resume
-                  // separately capability-gates and verifies an exact fork.
-                  resumeSessionId,
-                  resolvedNodeModel,
-                  resolvedTier,
-                  resolvedEffort,
-                  ctx.stepNamePrefix,
-                  iteration,
-                  checkpointSessionForProvider(provider),
-                  attemptTypedArtifactsFile
-                );
-              },
-              { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
-            );
+            const runOnBinding = (
+              attemptBinding: typeof binding,
+              attemptResumeSessionId: string | undefined
+            ): Promise<NodeExecutionResult> =>
+              runNodeRetryLoop(
+                node,
+                ctx.platform,
+                ctx.conversationId,
+                ctx.workflowRun,
+                getEffectiveNodeRetryConfig(node),
+                async () => {
+                  // Fresh per attempt: an attempt after a transient failure observes
+                  // artifacts published in the interval, and never reuses the
+                  // listing handed to AI-configuration substitution above.
+                  const attemptTypedArtifactsFile = await writeNodeArtifactsListing(
+                    ctx.artifactsDir,
+                    ctx.workflowRun.id
+                  );
+                  return executeNodeInternal(
+                    ctx,
+                    node,
+                    attemptBinding.provider,
+                    attemptBinding.options,
+                    // Always pass the prior session ID. executeNodeInternal requests a fork,
+                    // but legacy resume-only providers may continue in place; named resume
+                    // separately capability-gates and verifies an exact fork.
+                    attemptResumeSessionId,
+                    attemptBinding.model,
+                    attemptBinding.tier,
+                    attemptBinding.effort,
+                    ctx.stepNamePrefix,
+                    iteration,
+                    checkpointSessionForProvider(attemptBinding.provider),
+                    attemptTypedArtifactsFile
+                  );
+                },
+                {
+                  state: 'failed',
+                  output: '',
+                  error: 'Node did not execute',
+                } as NodeExecutionResult
+              );
+            let retriedOutput = await runOnBinding(binding, resumeSessionId);
+            // The provider whose session this node hands on: the one that ran last.
+            let sessionProvider = provider;
+
+            // Model-router escalation. A node the router ran on a lower tier, whose
+            // attempts there ended in a failure of a kind `escalationReason` names, runs
+            // once more exactly as it would have with no router: the authored tier, its
+            // own retry policy, and the session input the node started from. It never
+            // continues the failed attempt's own session. This sits before the
+            // `mutates_checkout` assertion on purpose: a lower-tier attempt that changed
+            // the tree has already done the damage, and a second run could not undo it.
+            const lowerTierRoute = ctx.nodeRoute;
+            const escalation = escalationReason(lowerTierRoute, retriedOutput);
+            if (lowerTierRoute !== undefined && escalation !== undefined) {
+              const lowerTierOutput = retriedOutput;
+              ctx.nodeRoute = escalateRoute(lowerTierRoute, escalation);
+              getLog().warn(
+                {
+                  nodeId: node.id,
+                  escalatedFrom: lowerTierRoute.routedTier,
+                  authoredTier: lowerTierRoute.authoredTier,
+                  escalationReason: escalation,
+                },
+                'model_router.escalated'
+              );
+              await safeSendMessage(
+                ctx.platform,
+                ctx.conversationId,
+                `⚠️ Node \`${node.id}\` failed on the \`${lowerTierRoute.routedTier}\` tier (${escalation}). Running it once more on its authored \`${lowerTierRoute.authoredTier}\` tier.`,
+                { workflowId: ctx.workflowRun.id, nodeName: node.id }
+              );
+              const ceilingBinding = await resolveBinding(node);
+              sessionProvider = ceilingBinding.provider;
+              retriedOutput = addEarlierUsage(
+                await runOnBinding(
+                  ceilingBinding,
+                  // A session resumes only on the provider that created it.
+                  ceilingBinding.provider === provider ? resumeSessionId : undefined
+                ),
+                lowerTierOutput,
+                node.id
+              );
+            }
             const output = await assertCheckoutUntouched(
               node,
               ctx.cwd,
@@ -10790,7 +10866,7 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
               }
             }
 
-            return { nodeId: node.id, output, sessionProvider: provider };
+            return { nodeId: node.id, output, sessionProvider };
           } catch (error) {
             // This dispatch boundary also owns provider/binding preparation failures.
             // Durable-write rejection must reach run recovery without becoming a node outcome.

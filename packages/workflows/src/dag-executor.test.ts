@@ -3267,6 +3267,197 @@ nodes:
     });
   });
 
+  describe('escalation of a down-routed node', () => {
+    const output_format = {
+      type: 'object',
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok'],
+    };
+    const contractNode = (fields: Record<string, unknown> = {}): DagNode =>
+      mediumStep({ output_format, retry: { max_attempts: 0 }, ...fields });
+    /** The lower tier answers in prose; the authored tier meets the node's contract. */
+    const cheapFailsContract = (): void => {
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+        if ((options as { model?: string } | undefined)?.model === 'haiku') {
+          yield { type: 'assistant', content: 'I think it is fine.' };
+          yield { type: 'result', sessionId: 'cheap-session', cost: 0.01 };
+          return;
+        }
+        yield { type: 'assistant', content: '{"ok":true}' };
+        yield {
+          type: 'result',
+          sessionId: 'ceiling-session',
+          structuredOutput: { ok: true },
+          cost: 0.2,
+        };
+      });
+    };
+    const resumeArgs = (): unknown[] => mockSendQueryDag.mock.calls.map(call => call[2]);
+
+    it('runs once more on the authored tier, in a fresh session, when the output contract fails', async () => {
+      cheapFailsContract();
+      const store = createMockStore();
+      const deps = await run({ deps: createMockDeps(store), nodes: [contractNode()] });
+
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      // The escalation never continues the failed attempt's session.
+      expect(resumeArgs()).toEqual([undefined, undefined]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      const failed = bindingsOf(deps, 'node_failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0].tier).toBe('small');
+      expect(failed[0].route).toMatchObject({ routedTier: 'small', applied: true });
+      expect((failed[0].route as Record<string, unknown>).escalatedFrom).toBeUndefined();
+
+      const [completed] = bindingsOf(deps, 'node_completed');
+      expect(completed.tier).toBe('medium');
+      expect(completed.route).toEqual({
+        mode: 'apply',
+        source: 'jev',
+        authoredTier: 'medium',
+        routedTier: 'medium',
+        applied: false,
+        chosenTier: 'small',
+        probability: 0.96,
+        confidence: 0.9,
+        riskNoul: 0.02,
+        ambiguityNoul: 0.04,
+        escalatedFrom: 'small',
+        escalationReason: 'output_contract',
+      });
+      // Both attempts were paid for.
+      expect(runUsageWrites(store).at(-1)?.total_cost_usd).toBeCloseTo(0.21, 10);
+    });
+
+    it('escalates once only: a failure on the authored tier fails the node', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'still prose' };
+        yield { type: 'result', sessionId: 'sid' };
+      });
+      const deps = await run({ nodes: [contractNode()] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
+      expect(failed.map(event => event.data?.failure_kind)).toEqual([
+        'output_contract',
+        'output_contract',
+      ]);
+      expect(bindingsOf(deps, 'node_completed')).toEqual([]);
+    });
+
+    it('escalates when the lower tier fails with a provider error', async () => {
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+        if ((options as { model?: string } | undefined)?.model === 'haiku') {
+          yield {
+            type: 'result',
+            isError: true,
+            errors: ['Invalid API key'],
+            errorSubtype: 'error_during_execution',
+          };
+          return;
+        }
+        yield { type: 'assistant', content: 'done' };
+        yield { type: 'result', sessionId: 'sid' };
+      });
+      const deps = await run({ nodes: [mediumStep({ retry: { max_attempts: 0 } })] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      // The reason is the failure kind the engine recorded for the failed attempt,
+      // never a reading of its error text.
+      const failureKind = eventsOf(deps).find(event => event.event_type === 'node_failed')?.data
+        ?.failure_kind;
+      expect(typeof failureKind).toBe('string');
+      expect(bindingsOf(deps, 'node_completed')[0].route).toMatchObject({
+        routedTier: 'medium',
+        escalatedFrom: 'small',
+        escalationReason: failureKind,
+      });
+    });
+
+    it.each([
+      ['shadow mode, which never lowered it', routerConfig('shadow'), {}],
+      [
+        'a classifier answer that kept the authored tier',
+        routerConfig('apply'),
+        { choice: 'medium' },
+      ],
+    ] as [string, WorkflowConfig, RouterAnswer][])(
+      'does not run a node again under %s',
+      async (_label, config, answer) => {
+        fetchSpy.mockImplementation((async () => jevAnswer(answer)) as unknown as typeof fetch);
+        mockSendQueryDag.mockImplementation(async function* () {
+          yield { type: 'assistant', content: 'prose' };
+          yield { type: 'result', sessionId: 'sid' };
+        });
+        const deps = await run({ config, nodes: [contractNode()] });
+        expect(sentModels()).toEqual(['sonnet']);
+        expect(eventsOf(deps).filter(event => event.event_type === 'node_failed')).toHaveLength(1);
+      }
+    );
+
+    it('keeps the inherited session input for the escalation, never the failed attempt session', async () => {
+      const seen: { model: unknown; resume: unknown }[] = [];
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, resume, options) {
+        const model = (options as { model?: string } | undefined)?.model;
+        seen.push({ model, resume });
+        if (model === 'opus') {
+          yield { type: 'assistant', content: 'first' };
+          yield { type: 'result', sessionId: 'first-session' };
+          return;
+        }
+        if (model === 'haiku') {
+          yield { type: 'assistant', content: 'prose' };
+          yield { type: 'result', sessionId: 'cheap-session' };
+          return;
+        }
+        yield { type: 'assistant', content: '{"ok":true}' };
+        yield { type: 'result', sessionId: 'ceiling-session', structuredOutput: { ok: true } };
+      });
+      await run({
+        nodes: [
+          {
+            id: 'first',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'begin' },
+            model: 'large',
+          } as DagNode,
+          contractNode({ depends_on: ['first'] }),
+        ],
+      });
+      expect(seen).toEqual([
+        { model: 'opus', resume: undefined },
+        { model: 'haiku', resume: 'first-session' },
+        { model: 'sonnet', resume: 'first-session' },
+      ]);
+    });
+
+    it('does not escalate a checkout the lower tier already changed', async () => {
+      await git.execFileAsync('git', ['init', '-q'], { cwd: testDir });
+      await git.execFileAsync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'init', '--allow-empty'],
+        { cwd: testDir }
+      );
+      await writeFile(join(testDir, '.gitignore'), '.archon/\nartifacts/\nstate/\nlogs/\n');
+      await git.execFileAsync('git', ['add', '.gitignore'], { cwd: testDir });
+      await git.execFileAsync(
+        'git',
+        ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'],
+        { cwd: testDir }
+      );
+      mockSendQueryDag.mockImplementation(async function* () {
+        await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
+        yield { type: 'assistant', content: 'done' };
+        yield { type: 'result', sessionId: 'sid' };
+      });
+      const deps = await run({
+        nodes: [mediumStep({ mutates_checkout: false, retry: { max_attempts: 0 } })],
+      });
+      expect(sentModels()).toEqual(['haiku']);
+      const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
+      expect(failed.map(event => event.data?.failure_kind)).toEqual(['output_contract']);
+    });
+  });
+
   it('reuses the route a failed pass recorded when the run is resumed, without classifying again', async () => {
     const store = createMockStore();
     const deps = createMockDeps(store);
