@@ -39,12 +39,33 @@ nodes:
       timeout 540 codegraph --index 2>&1 || echo "code-index: FAILED; agent steps will use ordinary reads"
     timeout: 600000
 
+  # Optional pre-read. With a classifier configured it names the files worth
+  # opening first. Without one only its shell gate runs: no AI turn, no Bun, and
+  # the plan node runs as it always has.
+  #
+  # The engine runs the graph layer by layer, so only that gate shares a layer
+  # with code-index. With a classifier, the scout's question and classification
+  # start after code-index has finished and add their own time before plan:
+  # one small-tier turn, then the classification, which stands down at its
+  # 120 s deadline. A scout node that fails then fails the run before plan
+  # starts; JEV_SCOUT_ENABLED=0 turns the scout off.
+  - id: scout
+    include: archon-scout
+    with:
+      request: "$INPUTS.work"
+
   # Blocked is a valid outcome, not a failure: ready:false naming exactly what
   # is missing beats a plan built on guesses. Consumers gate on
   # $plan.output.ready before building.
   - id: plan
-    depends_on: [code-index]
+    depends_on: [code-index, scout]
+    # The scout is skipped whenever it has nothing to say, and a skipped dependency
+    # blocks the default all_success. A failed one still blocks this node.
+    trigger_rule: none_failed_min_one_success
     command: plan
+    with:
+      # `if_skipped` is what the prompt reads when no scout ran.
+      scout: { from: "$scout.output", if_skipped: { status: unavailable, reason: not_run } }
     # Every Codanna tool, typed, over the index code-index built. `mcp:` is read
     # literally and a relative path would resolve inside the target checkout, so
     # this names the host's config absolutely. The file must exist or this workflow

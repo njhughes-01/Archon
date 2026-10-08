@@ -1,9 +1,13 @@
 # Dry-run fixture: the inconclusive path. rooted:false is a VALID outcome —
 # the run must COMPLETE (consumers gate on the field), never fail on honesty.
 code-index: "code-index: FAILED; agent steps will use ordinary reads"
+# No classifier configured: the scout's gate says so and nothing else of it runs.
+scout__config: { available: false, reason: no_api_key }
 investigate:
   rooted: false
   summary: "stub: two hypotheses survive — the report names what would separate them"
   report: { type: archon_artifact, run_id: "fixture-run", path: "investigation.md" }
 fixture:
   expect: completed
+  resolved-text-contains:
+    investigate: '{"status":"unavailable","reason":"not_run"}'

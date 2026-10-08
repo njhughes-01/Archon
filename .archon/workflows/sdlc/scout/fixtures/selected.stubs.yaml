@@ -1,0 +1,37 @@
+# Dry-run fixture: the full path. Proves the question and its paths bind into the
+# classifier node and that the result satisfies its declared contract.
+config: { available: true, reason: "" }
+question:
+  focused: true
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth", "test/auth"]
+classify:
+  status: ok
+  reason: ""
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth", "test/auth"]
+  files:
+    - path: src/auth/session.ts
+      relevant: true
+      confidence: 0.91
+      evidence: { startLine: 101, endLine: 220 }
+    - path: src/auth/cookies.ts
+      relevant: false
+      confidence: 0.08
+      evidence: { startLine: 1, endLine: 64 }
+  skipped: []
+  counts:
+    candidates: 3
+    badPaths: 0
+    excluded: { ignored: 0, secret: 1, not_regular_file: 0, too_large: 0, binary: 0, empty: 0 }
+    classified: 2
+    relevant: 1
+    unclassified: 0
+    windows: 5
+    requests: 1
+    charsSent: 18240
+fixture:
+  expect: completed
+  reached: [config, question, classify]
+  resolved-text-contains:
+    question: "## Write one question"

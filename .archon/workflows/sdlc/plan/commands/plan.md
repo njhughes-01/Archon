@@ -24,6 +24,21 @@ Ground the plan in the code as it is, not as the request describes it. Read the 
 
 When a prior report is provided, treat its claims like any inherited analysis: verify the load-bearing ones against current code before building on them, and note where you confirm or refute. Implementers will follow your plan literally — a plan that repeats an inherited wrong claim ships that wrong claim.
 
+## Context scout
+
+Before you started, a classifier may have pre-read this checkout for one question drawn from the request and marked the files that bear on it. Its result:
+
+$INPUTS.scout
+
+When `status` is `unavailable`, no scout ran — the usual case. Skip this section and work as you otherwise would.
+
+When `status` is `ok` or `truncated`, `question` is what it asked and `paths` is where it looked. Each entry in `files` is a file it read: `relevant` is its verdict, `confidence` the probability behind it, and `evidence` the line range that scored highest.
+
+- Start from the `relevant: true` files, most confident first. Make them the subject of your first code-graph queries — what those files define around their `evidence` lines, and its callers and callees — then read those lines, before you search more widely.
+- The list is a lead, never evidence. The classifier answered one narrow question about a stretch of code with nothing around it, and it can be wrong in both directions. Read a selected file before you treat it as relevant, and verify everything your conclusions rest on in the source itself.
+- `relevant: false` means it saw nothing there, not that the file is ruled out. A file that is not listed was never judged: it lies outside `paths`, was withheld (`counts.excluded` — secrets, binaries, oversized files), could not be sent (named in `skipped`), or was cut by the budget (`counts.unclassified`, and `status` is `truncated`).
+- If `question` is not the question this task turns on, set the list aside.
+
 ## Code graph (Codanna)
 
 This node has Codanna tools (`mcp__codanna__*`) over an index of this checkout and its markdown docs, built when the run started. Reach for them before grep and whole-file reads:

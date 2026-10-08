@@ -1,0 +1,7 @@
+# Dry-run fixture: a classifier is configured, but no single question fits the
+# request. Declining is a VALID outcome: the run completes and nothing is sent.
+config: { available: true, reason: "" }
+question: { focused: false, question: "", paths: [] }
+fixture:
+  expect: completed
+  reached: [config, question]

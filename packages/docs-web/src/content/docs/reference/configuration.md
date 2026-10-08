@@ -606,6 +606,42 @@ Signup uses email + password (no email verification by default). **Signup postur
 | `AUTH_SERVICE_PORT` | Port for the auth service container | `9000` |
 | `COOKIE_MAX_AGE` | Auth cookie lifetime in seconds | `86400` |
 
+### Context scout -- Jev (optional)
+
+Before the `archon-investigate` and `archon-plan` agents read a checkout, a classifier can pre-read it for them. One small-tier agent turn turns the request into a yes/no question and the paths worth checking; [Jev](https://docs.typesafe.ai/) then answers that question about every candidate file, in line windows. The agent that follows starts from the files the classifier selected and still verifies them itself. The scout is the `archon-scout` workflow in the SDLC pack, and any workflow can `include:` it.
+
+The scout is on when `JEV_API_KEY` is set. Without a key, or with either switch off, only its gate runs: a shell step that needs nothing installed. No AI turn is spent and the workflows run as they always have. A [container run](#container-runs-and-run-output) does not inherit the host's environment, so there the scout is off unless the project's own environment variables supply the key.
+
+With a key set, the scout adds two steps before the workflow's own agent: the small-tier agent turn that writes the question, and the classification, which needs `bun` on the `PATH`. They start after the code-index step and add their own time: one small-tier turn, then the classification, which stands down after `JEV_SCOUT_DEADLINE_MS`.
+
+- **The workflow's agent runs without a list** when the classifier fails or times out, a setting is unusable, the request has no single question, or the scout's paths select nothing. The classification's node output names the reason.
+- **The run fails before the workflow's agent starts** when one of the scout's own steps fails: the question turn still failing after its five retries, or the classification unable to start because `bun` is missing. The engine has no optional step, so this is the same outcome as any other failed step. The run can be resumed, and `JEV_SCOUT_ENABLED=0` turns the scout off without removing the key.
+
+**What leaves the machine.** Line windows of files under the selected paths are sent to `JEV_API_BASE`, with their paths. Only files git tracks and does not ignore are considered. Never sent: env files (`.env*`, `*.env`, `env.production`, and anything under a `.env*` directory); key, certificate and credential files and renamed copies of them (`id_rsa*`, `id_ed25519*`, `*.pem`, `*.key`, `credentials.*`, `secrets.*`, `.npmrc`, `.netrc`, Terraform state and variables, and anything under `.ssh/`, `.aws/`, `.gnupg/`, `.kube/`, `.docker/` or `secrets/`); any file containing a private-key block; symlinks, and files reached through a directory that links out of the checkout; binaries; and files over `JEV_SCOUT_MAX_FILE_BYTES`. A secret written into an ordinary source file is not detected. For a repository where that matters, leave the scout off or point `JEV_API_BASE` at a service you host.
+
+Each run is bounded by a file, a window and a character budget. When a budget is reached the result is marked `truncated` and the files it did not reach are counted, never reported as not relevant. A file with lines too long to fit one request is named in the result's `skipped` list, and a path git rejects is passed over and counted.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `JEV_API_KEY` | API key, sent as a Bearer token. The scout is off without it. | -- |
+| `JEV_ENABLED` | Set to `0` or `false` to turn every Jev feature off while keeping the key | on when the key is set |
+| `JEV_SCOUT_ENABLED` | Set to `0` or `false` to turn only the scout off | on when the key is set |
+| `JEV_API_BASE` | Base URL of the service. Any Jev-compatible endpoint works. | `https://api.typesafe.ai` |
+| `JEV_MODEL` | Model id sent with each request | `jev-1.13.0` |
+| `JEV_SCOUT_THRESHOLD` | A file is selected when its best window scores at least this (0--1). Low on purpose: a missed file costs more than an extra one. | `0.3` |
+| `JEV_SCOUT_WINDOW_LINES` | Lines per window | `120` |
+| `JEV_SCOUT_WINDOW_OVERLAP` | Lines each window repeats from the one before; must be smaller than the window | `20` |
+| `JEV_SCOUT_PARALLELISM` | Classifier requests in flight at once, at most `16` | `4` |
+| `JEV_SCOUT_MAX_FILES` | Most files classified in one run | `60` |
+| `JEV_SCOUT_MAX_WINDOWS` | Most windows classified in one run | `240` |
+| `JEV_SCOUT_MAX_CHARS` | Most characters of code and question text sent in one run | `600000` |
+| `JEV_SCOUT_MAX_FILE_BYTES` | Files larger than this are never sent | `200000` |
+| `JEV_SCOUT_MAX_REQUEST_CHARS` | Most characters in one request | `40000` |
+| `JEV_SCOUT_TIMEOUT_MS` | Longest one classifier request may take | `30000` |
+| `JEV_SCOUT_DEADLINE_MS` | Longest the whole classification may take before it stands down | `120000` |
+
+An unusable number makes the classification report `unavailable` and name the variable; it never falls back to the default, so a mistyped threshold or budget cannot quietly become another policy.
+
 ### Telemetry
 
 Archon sends a few anonymous events — `archon_started` (once per CLI invocation or server boot), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals, counted as failed when the provider errors mid-turn; never message content), `workflow_invoked` (workflow start or resumed segment), `workflow_completed`/`workflow_failed`/`workflow_cancelled` (sent once when the run's final status is saved), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape (`nodes_<type>` counts, `graph_depth`, `max_fan_out`, `command_refs`, `prompt_chars_bucket`) and feature flags, `derived_from`/`derived_similarity` naming the bundled workflow a custom one was copied from (never the copy's own name), outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class and exit/cancel reason (never error text), a `run_ref` hash that joins one run's events without sending its id, deployment shape (adapter/db/auth booleans), OS/arch/version, install channel (`binary`/`docker`/`source`) and build commit, a `schema_version`, and a random install UUID stored at `$ARCHON_HOME/telemetry-id`. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.

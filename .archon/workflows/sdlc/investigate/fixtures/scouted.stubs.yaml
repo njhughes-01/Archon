@@ -1,0 +1,42 @@
+# Dry-run fixture: the scout ran. Proves its question and paths bind into the
+# classifier node, and that the classifier's result reaches the investigate prompt.
+code-index: "stub: index built"
+scout__config: { available: true, reason: "" }
+scout__question:
+  focused: true
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth"]
+scout__classify:
+  status: truncated
+  reason: max_files
+  question: "Does this code check whether a login session or access token is still valid?"
+  paths: ["src/auth"]
+  files:
+    - path: src/auth/session.ts
+      relevant: true
+      confidence: 0.91
+      evidence: { startLine: 101, endLine: 220 }
+    - path: src/auth/cookies.ts
+      relevant: false
+      confidence: 0.08
+      evidence: { startLine: 1, endLine: 64 }
+  skipped: []
+  counts:
+    candidates: 9
+    badPaths: 0
+    excluded: { ignored: 0, secret: 1, not_regular_file: 0, too_large: 0, binary: 0, empty: 0 }
+    classified: 2
+    relevant: 1
+    unclassified: 6
+    windows: 5
+    requests: 1
+    charsSent: 18240
+investigate:
+  rooted: true
+  summary: "stub: cause established — full report at investigation.md"
+  report: { type: archon_artifact, run_id: "fixture-run", path: "investigation.md" }
+fixture:
+  expect: completed
+  reached: [scout__config, scout__question, scout__classify, investigate]
+  resolved-text-contains:
+    investigate: '"path":"src/auth/session.ts","relevant":true,"confidence":0.91,"evidence":{"startLine":101,"endLine":220}'

@@ -1,0 +1,178 @@
+name: archon-scout
+description: |
+  Pre-read a checkout for one focused question, so the agent that follows opens
+  the files that matter first. A small agent turns the request into one yes/no
+  question and the paths worth checking; a classifier then answers that question
+  about every candidate file, in line windows. Advisory and optional: with no
+  classifier configured it spends no AI turn and selects nothing.
+
+  Use when: composed before an agent that is about to read a large checkout —
+  investigate and plan include it.
+  NOT for: answering the question itself, or deciding what to change.
+
+inputs:
+  request:
+    default: ""
+    description: >-
+      The work the following agent was asked to do, in the caller's words. When
+      empty, the run's trigger message is the request.
+
+# A caller binds this with `if_skipped`: without a classifier, or when no single
+# question fits the request, `classify` never runs and there is no result.
+returns: classify
+
+nodes:
+
+  # The classifier is configured in the environment, which `when:` cannot read.
+  # This is the gate that keeps an install without one from paying for anything
+  # below it, so it must run wherever a `bash:` node runs: shell built-ins only,
+  # no Bun. It decides one thing, whether a key is set and no switch is off.
+  #
+  # .shared/context-scout.ts makes the same decision again before it sends
+  # anything, and is the only place that reads the numeric settings. The two
+  # are held together by context-scout-script.test.ts, which runs this text
+  # under sh and bash with an empty PATH against that function.
+  - id: config
+    bash: |
+      # Unquoted on purpose: with globbing off, splitting a value into words and
+      # keeping the first is how sh trims it. Nothing here evaluates a value.
+      set -f
+      set -- ${JEV_API_KEY-}
+      key=${1-}
+      set -- ${JEV_ENABLED-}
+      all=${1-}
+      set -- ${JEV_SCOUT_ENABLED-}
+      scout=${1-}
+
+      off() {
+        case "$1" in
+          0 | [Ff][Aa][Ll][Ss][Ee]) return 0 ;;
+        esac
+        return 1
+      }
+
+      if off "$all" || off "$scout"; then
+        printf '%s\n' '{"available":false,"reason":"disabled"}'
+      elif [ -z "$key" ]; then
+        printf '%s\n' '{"available":false,"reason":"no_api_key"}'
+      else
+        printf '%s\n' '{"available":true,"reason":""}'
+      fi
+    output_format:
+      type: object
+      properties:
+        available: { type: boolean }
+        reason: { type: string }
+      required: [available, reason]
+
+  # Turning a free-text request into one question is judgment, so an agent does
+  # it; everything it returns is bounded again by the script that consumes it.
+  - id: question
+    command: scout-question
+    # This workflow declares no top-level model, so its one AI node names its
+    # tier. Writing a question and a list of paths is small-tier work.
+    model: small
+    depends_on: [config]
+    when: "$config.output.available == true"
+    mutates_checkout: false
+    # With a classifier configured, this node failing fails the run before the
+    # caller's agent starts, and the engine has no optional agent node. So it
+    # retries the most the engine allows, on every failure that is not fatal:
+    # a provider hiccup, or a structured-output miss on a best-effort provider.
+    retry:
+      max_attempts: 5
+      on_error: all
+    output_format:
+      type: object
+      properties:
+        focused: { type: boolean }
+        question: { type: string }
+        paths:
+          type: array
+          items: { type: string }
+      required: [focused, question, paths]
+
+  # Never fails the run on purpose: every way the classifier cannot answer is an
+  # `unavailable` result, and its own deadline ends it well before this timeout.
+  # The timeout is the backstop, and it skips rather than fails. This is the one
+  # node here that needs Bun, and it runs only once the gate says available.
+  - id: classify
+    script: context-scout
+    runtime: bun
+    depends_on: [question]
+    when: "$question.output.focused == true"
+    timeout: 300000
+    on_timeout: skip
+    with:
+      question: "$question.output.question"
+      paths: { from: "$question.output.paths" }
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable, truncated] }
+        reason: { type: string }
+        question: { type: string }
+        paths:
+          type: array
+          items: { type: string }
+        files:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              relevant: { type: boolean }
+              confidence: { type: number, minimum: 0, maximum: 1 }
+              evidence:
+                type: object
+                properties:
+                  startLine: { type: integer, minimum: 1 }
+                  endLine: { type: integer, minimum: 1 }
+                required: [startLine, endLine]
+                additionalProperties: false
+            required: [path, relevant, confidence, evidence]
+            additionalProperties: false
+        skipped:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              reason: { type: string, enum: [window_too_large] }
+            required: [path, reason]
+            additionalProperties: false
+        counts:
+          type: object
+          properties:
+            candidates: { type: integer, minimum: 0 }
+            badPaths: { type: integer, minimum: 0 }
+            excluded:
+              type: object
+              properties:
+                ignored: { type: integer, minimum: 0 }
+                secret: { type: integer, minimum: 0 }
+                not_regular_file: { type: integer, minimum: 0 }
+                too_large: { type: integer, minimum: 0 }
+                binary: { type: integer, minimum: 0 }
+                empty: { type: integer, minimum: 0 }
+              required: [ignored, secret, not_regular_file, too_large, binary, empty]
+              additionalProperties: false
+            classified: { type: integer, minimum: 0 }
+            relevant: { type: integer, minimum: 0 }
+            unclassified: { type: integer, minimum: 0 }
+            windows: { type: integer, minimum: 0 }
+            requests: { type: integer, minimum: 0 }
+            charsSent: { type: integer, minimum: 0 }
+          required:
+            - candidates
+            - badPaths
+            - excluded
+            - classified
+            - relevant
+            - unclassified
+            - windows
+            - requests
+            - charsSent
+          additionalProperties: false
+      required: [status, reason, question, paths, files, skipped, counts]
+      additionalProperties: false

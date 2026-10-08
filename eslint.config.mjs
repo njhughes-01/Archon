@@ -38,6 +38,10 @@ export default tseslint.config(
       // pack tsconfig owns, so the ignore names what stays out rather than the tree.
       '.archon/workflows/**/commands/**',
       '.archon/workflows/**/fixtures/**',
+      // Script-test fixtures are sample inputs (scanner samples, the scout's evaluation
+      // repository), not code this repository runs. No tsconfig project includes them,
+      // so typed rules crash on one the moment a commit stages it.
+      '.archon/scripts/__tests__/fixtures/**',
       '**/*.generated.ts', // Auto-generated source files (content inlined via JSON.stringify)
       '**/*.js',
       '*.mjs',
