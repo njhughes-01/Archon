@@ -211,9 +211,26 @@ function rewrittenInput(output: unknown): Record<string, unknown> | undefined {
 export function withToolGateHooks(
   hooks: Options['hooks'],
   toolGate: ToolGate,
-  archonNativeTools: boolean
+  archonNativeTools: boolean,
+  onDenied: (call: { toolName: string; toolCallId: string; message: string }) => void
 ): NonNullable<Options['hooks']> {
   const verdicts = new Map<string, Promise<ToolActionDecision>>();
+  const reported = new Set<string>();
+
+  // The SDK fires neither PostToolUse nor PostToolUseFailure for a call a hook
+  // denied, so without this the stream would show the call and never its
+  // outcome. Reported once per call, however many hooks answer deny.
+  const deny = (input: PreToolUseHookInput, denial: ToolGateDenial): HookJSONOutput => {
+    if (!reported.has(input.tool_use_id)) {
+      reported.add(input.tool_use_id);
+      onDenied({
+        toolName: input.tool_name,
+        toolCallId: input.tool_use_id,
+        message: formatToolGateDenial(denial),
+      });
+    }
+    return denyOutput(denial);
+  };
 
   const verdictFor = (
     input: PreToolUseHookInput,
@@ -234,7 +251,7 @@ export function withToolGateHooks(
   const gateHook: HookCallback = async (input, _toolUseId, { signal }) => {
     if (input.hook_event_name !== 'PreToolUse') return { continue: true };
     const verdict = await verdictFor(input, signal);
-    return verdict.action === 'deny' ? denyOutput(verdict) : { continue: true };
+    return verdict.action === 'deny' ? deny(input, verdict) : { continue: true };
   };
 
   const guarded =
@@ -244,7 +261,7 @@ export function withToolGateHooks(
       if (input.hook_event_name !== 'PreToolUse') return output;
 
       const verdict = await verdictFor(input, options.signal);
-      if (verdict.action === 'deny') return denyOutput(verdict);
+      if (verdict.action === 'deny') return deny(input, verdict);
 
       const rewritten = rewrittenInput(output);
       if (rewritten) {
@@ -252,7 +269,7 @@ export function withToolGateHooks(
         const rewrittenVerdict = request
           ? await askToolGate(toolGate, request)
           : ({ action: 'allow' } as const);
-        if (rewrittenVerdict.action === 'deny') return denyOutput(rewrittenVerdict);
+        if (rewrittenVerdict.action === 'deny') return deny(input, rewrittenVerdict);
       }
       return output;
     };

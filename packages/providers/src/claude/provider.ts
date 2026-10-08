@@ -1601,7 +1601,15 @@ export class ClaudeProvider implements IAgentProvider {
         options.hooks = withToolGateHooks(
           options.hooks,
           requestOptions.toolGate,
-          (requestOptions.nativeTools?.length ?? 0) > 0
+          (requestOptions.nativeTools?.length ?? 0) > 0,
+          ({ toolName, toolCallId, message }) => {
+            toolResultQueue.push({
+              toolName,
+              toolOutput: message,
+              toolCallId,
+              toolOutcome: 'error',
+            });
+          }
         );
       }
 

@@ -3706,6 +3706,39 @@ describe('ClaudeProvider toolGate', () => {
     expect(reason).toContain('Report the work as blocked.');
   });
 
+  test('a denied call shows up in the stream as that tool call’s error result, once', async () => {
+    const gate = mock<GateStub>(async () => GATE_DENIAL);
+    const yamlAllow = {
+      response: {
+        hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+      },
+    };
+    mockQuery.mockImplementation(async function* (args) {
+      // Two hooks answer deny for this one call (the gate's and the wrapped node hook).
+      await firePreToolUse(args.options, { ...destructiveBash, tool_use_id: 'toolu_denied' });
+      yield { type: 'assistant', message: { content: [{ type: 'text', text: 'blocked' }] } };
+    });
+
+    const chunks: MessageChunk[] = [];
+    for await (const chunk of client.sendQuery('test', '/workspace', undefined, {
+      toolGate: gate,
+      nodeConfig: { hooks: { PreToolUse: [yamlAllow] } },
+    })) {
+      chunks.push(chunk);
+    }
+
+    const results = chunks.filter(chunk => chunk.type === 'tool_result');
+    expect(results).toEqual([
+      {
+        type: 'tool_result',
+        toolName: 'Bash',
+        toolOutput: expect.stringContaining('It deletes every file under the home directory.'),
+        toolCallId: 'toolu_denied',
+        toolOutcome: 'error',
+      },
+    ]);
+  });
+
   test('an allowed call runs, and the hook never answers allow or ask', async () => {
     const gate = mock<GateStub>(async () => ({ action: 'allow' }));
     const { outputs, toolBody } = await runToolCalls({ toolGate: gate }, [destructiveBash]);
