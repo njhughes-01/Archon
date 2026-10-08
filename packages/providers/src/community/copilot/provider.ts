@@ -38,6 +38,7 @@ import { COPILOT_EFFORTS, parseCopilotConfig, type CopilotProviderDefaults } fro
 import { clampEffort } from '@archon/paths/effort';
 import { resolveCopilotBinaryPath } from './binary-resolver';
 import { bridgeSession } from './event-bridge';
+import { buildToolGateHook } from './tool-gate';
 
 // `ReasoningEffort` is defined in the SDK but not re-exported from its barrel
 // (as of @github/copilot-sdk@0.2.2), so the vocabulary is mirrored in ./config
@@ -345,6 +346,20 @@ async function buildSessionConfig(
   await applyMcpServers(sessionConfig, requestOptions?.nodeConfig, cwd, warnings);
   applySkills(sessionConfig, requestOptions?.nodeConfig, cwd, warnings);
   applyAgents(sessionConfig, requestOptions?.nodeConfig, warnings);
+
+  // toolGate → preToolUse hook. After applyMcpServers, whose server names let
+  // the hook tell this request's MCP tools apart from other tools. The
+  // permission handler above is left as it is: the hook never pre-approves a
+  // call, so the chat's write rejection still decides what the gate lets through.
+  if (requestOptions?.toolGate) {
+    sessionConfig.hooks = {
+      onPreToolUse: buildToolGateHook(
+        requestOptions.toolGate,
+        cwd,
+        Object.keys(sessionConfig.mcpServers ?? {})
+      ),
+    };
+  }
 
   return sessionConfig;
 }

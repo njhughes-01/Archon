@@ -50,6 +50,7 @@ import { CLAUDE_CAPABILITIES, CLAUDE_FILE_WRITE_TOOLS } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
 import { resolveClaudeBinaryPath, pathKind } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
+import { withToolGateHooks } from './tool-gate';
 import {
   SessionSpendLedger,
   spendSince,
@@ -1591,6 +1592,24 @@ export class ClaudeProvider implements IAgentProvider {
         getLog().info(
           { count: requestOptions.nativeTools.length },
           'claude.native_tools_registered'
+        );
+      }
+
+      // 2c. toolGate → PreToolUse hook. Last of the hook translations, so it
+      //     covers the node's own YAML hooks merged in step 2.
+      if (requestOptions?.toolGate) {
+        options.hooks = withToolGateHooks(
+          options.hooks,
+          requestOptions.toolGate,
+          (requestOptions.nativeTools?.length ?? 0) > 0,
+          ({ toolName, toolCallId, message }) => {
+            toolResultQueue.push({
+              toolName,
+              toolOutput: message,
+              toolCallId,
+              toolOutcome: 'error',
+            });
+          }
         );
       }
 
