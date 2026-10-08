@@ -2,7 +2,12 @@ import { describe, test, expect, mock, beforeEach, type Mock } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type { Codex as SdkCodex, Thread as SdkThread, Usage } from '@openai/codex-sdk';
+import type {
+  Codex as SdkCodex,
+  Thread as SdkThread,
+  ThreadOptions,
+  Usage,
+} from '@openai/codex-sdk';
 import type { MessageChunk } from '../types';
 import { createMockLogger } from '../test/mocks/logger';
 
@@ -101,6 +106,7 @@ describe('CodexProvider', () => {
         agents: false,
         toolRestrictions: false,
         fileWriteRestriction: false,
+        toolActionGate: true,
         structuredOutput: 'enforced',
         requiresAllPropertiesRequired: true,
         envInjection: true,
@@ -2800,5 +2806,534 @@ describe('classifyCodexError (#2509 R7)', () => {
     expect(classifyCodexError('rate limit exceeded')).toBe('rate_limit');
     expect(classifyCodexError('too many requests, please slow down')).toBe('rate_limit');
     expect(classifyCodexError('server overloaded')).toBe('rate_limit');
+  });
+});
+
+describe('tool gate', () => {
+  type Gate = NonNullable<NonNullable<Parameters<CodexProvider['sendQuery']>[3]>['toolGate']>;
+  type GateDecision = Awaited<ReturnType<Gate>>;
+  interface GatedCodexOptions {
+    codexPathOverride: string;
+    config: {
+      hooks: { PreToolUse: { hooks: { type: string; command: string; timeout: number }[] }[] };
+      features: Record<string, boolean>;
+      [key: string]: unknown;
+    };
+  }
+
+  const ALLOW: GateDecision = { action: 'allow' };
+  const DENY: GateDecision = {
+    action: 'deny',
+    needsApproval: true,
+    reason: 'Pushing to main needs approval.',
+    alternatives: ['Push to a feature branch'],
+  };
+  const EXPECTED_THREAD_OPTIONS: ThreadOptions = {
+    workingDirectory: '/workspace',
+    skipGitRepoCheck: true,
+    sandboxMode: 'danger-full-access',
+    networkAccessEnabled: true,
+    approvalPolicy: 'never',
+    model: undefined,
+    modelReasoningEffort: undefined,
+    webSearchMode: undefined,
+    additionalDirectories: undefined,
+  };
+
+  let client: CodexProvider;
+
+  beforeEach(() => {
+    resetCodexSingleton();
+    client = new CodexProvider({ retryBaseDelayMs: 1 });
+    MockCodex.mockClear();
+    mockStartThread.mockClear();
+    mockResumeThread.mockClear();
+    mockRunStreamed.mockReset();
+    mockLogger.error.mockClear();
+    mockLogger.warn.mockClear();
+    mockStartThread.mockReturnValue(createMockThread('new-thread-id'));
+    mockResumeThread.mockReturnValue(createMockThread('resumed-thread-id'));
+  });
+
+  function gatedOptions(call = 0): GatedCodexOptions {
+    return MockCodex.mock.calls[call]?.[0] as unknown as GatedCodexOptions;
+  }
+
+  /** Does what Codex does before a tool call: runs the configured hook command with the payload on stdin. */
+  async function callHook(
+    toolName: string,
+    toolInput: Record<string, unknown>,
+    call = 0
+  ): Promise<{ exitCode: number; stderr: string }> {
+    const command = gatedOptions(call).config.hooks.PreToolUse[0].hooks[0].command;
+    const child = Bun.spawn(['/bin/sh', '-c', command], {
+      stdin: 'pipe',
+      stdout: 'ignore',
+      stderr: 'pipe',
+    });
+    child.stdin.write(
+      JSON.stringify({
+        session_id: 's',
+        turn_id: 't',
+        transcript_path: null,
+        cwd: '/workspace',
+        hook_event_name: 'PreToolUse',
+        model: 'gpt-test',
+        permission_mode: 'bypassPermissions',
+        tool_name: toolName,
+        tool_input: toolInput,
+        tool_use_id: 'call-1',
+      })
+    );
+    await child.stdin.end();
+    const [stderr, exitCode] = await Promise.all([new Response(child.stderr).text(), child.exited]);
+    return { exitCode, stderr };
+  }
+
+  async function collect(
+    options: Parameters<CodexProvider['sendQuery']>[3],
+    resumeSessionId?: string
+  ): Promise<MessageChunk[]> {
+    const chunks: MessageChunk[] = [];
+    for await (const chunk of client.sendQuery('test', '/workspace', resumeSessionId, options)) {
+      chunks.push(chunk);
+    }
+    return chunks;
+  }
+
+  function commandItem(id: string): Record<string, unknown> {
+    return { id, type: 'command_execution', command: "/bin/bash -lc 'ls'", status: 'in_progress' };
+  }
+
+  test('without a gate, Codex is started exactly as before', async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    await collect(undefined);
+
+    // The shared client, the SDK's own binary resolution, and no config overrides.
+    expect(MockCodex.mock.calls).toEqual([[{ codexPathOverride: undefined }]]);
+    expect(mockStartThread.mock.calls).toEqual([[EXPECTED_THREAD_OPTIONS]]);
+  });
+
+  test('with a gate, only the binary path and the config overrides change', async () => {
+    let launcherExisted = false;
+    let socketExisted = false;
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          const { existsSync } = await import('node:fs');
+          launcherExisted = existsSync(gatedOptions().codexPathOverride);
+          socketExisted = existsSync(join(gatedOptions().codexPathOverride, '..', 'gate.sock'));
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(MockCodex).toHaveBeenCalledTimes(1);
+    const options = gatedOptions();
+    expect(Object.keys(options).sort()).toEqual(['codexPathOverride', 'config']);
+    expect(Object.keys(options.config).sort()).toEqual(['features', 'hooks']);
+    expect(options.config.features).toEqual({ unified_exec: false });
+    expect(options.config.hooks.PreToolUse[0].hooks[0].type).toBe('command');
+    expect(mockStartThread.mock.calls).toEqual([[EXPECTED_THREAD_OPTIONS]]);
+    expect(launcherExisted).toBe(true);
+    expect(socketExisted).toBe(true);
+    // The launcher, hook and socket are gone once the request has ended.
+    const { existsSync } = await import('node:fs');
+    expect(existsSync(join(options.codexPathOverride, '..'))).toBe(false);
+  });
+
+  test('a gated request does not become the shared client for later ungated ones', async () => {
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+    await collect(undefined);
+
+    expect(MockCodex.mock.calls[1]).toEqual([{ codexPathOverride: undefined }]);
+  });
+
+  test('keeps the workflow skill and MCP overrides next to the hook', async () => {
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    await collect({
+      toolGate: mock<Gate>(() => Promise.resolve(ALLOW)),
+      nodeConfig: { nodeId: 'implement' },
+    });
+
+    expect(Object.keys(gatedOptions().config).sort()).toEqual(['features', 'hooks', 'skills']);
+    expect(gatedOptions().config.skills).toEqual({ include_instructions: false });
+  });
+
+  test('a resumed thread is gated the same way', async () => {
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) }, 'existing-thread');
+
+    expect(mockResumeThread).toHaveBeenCalledWith('existing-thread', EXPECTED_THREAD_OPTIONS);
+    expect(gatedOptions().config.hooks.PreToolUse).toHaveLength(1);
+    expect(gatedOptions().codexPathOverride.endsWith('/codex')).toBe(true);
+  });
+
+  test('the skill-catalog fallback client is still gated', async () => {
+    let attempt = 0;
+    mockRunStreamed.mockImplementation(() => {
+      attempt += 1;
+      if (attempt === 1) {
+        return Promise.reject(
+          new Error('Error loading config: unknown field `include_instructions` in `skills`')
+        );
+      }
+      return Promise.resolve({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+    });
+
+    await collect({
+      toolGate: mock<Gate>(() => Promise.resolve(ALLOW)),
+      nodeConfig: { nodeId: 'implement' },
+    });
+
+    expect(MockCodex).toHaveBeenCalledTimes(2);
+    expect(gatedOptions(1).codexPathOverride).toBe(gatedOptions(0).codexPathOverride);
+    expect(gatedOptions(1).config.hooks).toEqual(gatedOptions(0).config.hooks);
+    expect(gatedOptions(1).config.features).toEqual({ unified_exec: false });
+    expect('skills' in gatedOptions(1).config).toBe(false);
+  });
+
+  test('a denied call reaches the model with the reason and alternatives, and the turn goes on', async () => {
+    const gate = mock<Gate>(() => Promise.resolve(DENY));
+    let hook: { exitCode: number; stderr: string } | undefined;
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          hook = await callHook('Bash', { command: 'git push origin main' });
+          yield {
+            type: 'item.completed',
+            item: { id: 'm1', type: 'agent_message', text: 'The push was blocked.' },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: gate });
+
+    expect(hook).toEqual({
+      exitCode: 2,
+      stderr: 'Pushing to main needs approval.\nSafer alternatives:\n- Push to a feature branch\n',
+    });
+    expect(gate.mock.calls[0][0]).toMatchObject({
+      toolName: 'Bash',
+      kind: 'shell',
+      command: 'git push origin main',
+      cwd: '/workspace',
+    });
+    expect(chunks.at(-1)).toMatchObject({ type: 'result' });
+    expect(chunks.at(-1)).not.toHaveProperty('isError');
+  });
+
+  test('an allowed call runs: the hook passes and the command item is accepted', async () => {
+    let hook: { exitCode: number; stderr: string } | undefined;
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          hook = await callHook('Bash', { command: 'ls' });
+          yield { type: 'item.started', item: commandItem('c1') };
+          yield { type: 'item.completed', item: { ...commandItem('c1'), exit_code: 0 } };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(hook).toEqual({ exitCode: 0, stderr: '' });
+    expect(chunks.map(chunk => chunk.type)).toEqual(['tool', 'tool_result', 'result']);
+    expect(chunks.at(-1)).not.toHaveProperty('isError');
+  });
+
+  test.each([
+    ['a shell command', { type: 'item.started', item: commandItem('c1') }],
+    [
+      'a file change',
+      {
+        type: 'item.completed',
+        item: {
+          id: 'f1',
+          type: 'file_change',
+          status: 'completed',
+          changes: [{ kind: 'add', path: 'a.txt' }],
+        },
+      },
+    ],
+    [
+      'an MCP tool',
+      {
+        type: 'item.started',
+        item: {
+          id: 'x1',
+          type: 'mcp_tool_call',
+          server: 'fs',
+          tool: 'write',
+          status: 'in_progress',
+        },
+      },
+    ],
+  ])('%s that ran without the hook stops the turn', async (_label, event) => {
+    let consumedPastTheTool = false;
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          yield { type: 'thread.started', thread_id: 'thread-7' };
+          yield event;
+          consumedPastTheTool = true;
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(chunks).toHaveLength(1);
+    expect(chunks[0]).toMatchObject({
+      type: 'result',
+      isError: true,
+      errorSubtype: 'codex_tool_gate_inactive',
+      sessionId: 'thread-7',
+    });
+    expect((chunks[0] as { errors: string[] }).errors[0]).toContain('without asking');
+    // The stream was dropped, which is what kills the Codex process, and the
+    // request was not retried into a second ungated run.
+    expect(consumedPastTheTool).toBe(false);
+    expect(mockRunStreamed).toHaveBeenCalledTimes(1);
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ itemType: event.item.type }),
+      'codex.tool_gate_inactive'
+    );
+  });
+
+  test('a patch the model pipes to apply_patch in the shell is covered by its shell hook call', async () => {
+    // Seen in a real run: the hook reports `Bash`, the stream reports a file change.
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          await callHook('Bash', { command: "apply_patch <<'EOF'\n*** Begin Patch\nEOF" });
+          yield {
+            type: 'item.completed',
+            item: { id: 'f1', type: 'file_change', status: 'completed', changes: [] },
+          };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(chunks.at(-1)).not.toHaveProperty('isError');
+  });
+
+  test('a hook call for a tool with no stream item does not cover a command', async () => {
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          await callHook('update_plan', { plan: [] });
+          await callHook('spawn_agent', { task: 'x' });
+          yield { type: 'item.started', item: commandItem('c1') };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(chunks.at(-1)).toMatchObject({
+      isError: true,
+      errorSubtype: 'codex_tool_gate_inactive',
+    });
+  });
+
+  test('a second tool call needs its own hook call', async () => {
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          await callHook('Bash', { command: 'ls' });
+          yield { type: 'item.started', item: commandItem('c1') };
+          yield { type: 'item.completed', item: { ...commandItem('c1'), exit_code: 0 } };
+          yield { type: 'item.started', item: commandItem('c2') };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(chunks.map(chunk => chunk.type)).toEqual(['tool', 'tool_result', 'result']);
+    expect(chunks.at(-1)).toMatchObject({
+      isError: true,
+      errorSubtype: 'codex_tool_gate_inactive',
+    });
+  });
+
+  test('hook calls from a crashed attempt do not cover the retry', async () => {
+    let attempt = 0;
+    mockRunStreamed.mockImplementation(() => {
+      attempt += 1;
+      const current = attempt;
+      return Promise.resolve({
+        events: (async function* () {
+          if (current === 1) {
+            await callHook('Bash', { command: 'ls' });
+            throw new Error('Codex Exec exited with code 1: boom');
+          }
+          yield { type: 'item.started', item: commandItem('c1') };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+    });
+
+    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+
+    expect(mockRunStreamed).toHaveBeenCalledTimes(2);
+    expect(chunks.at(-1)).toMatchObject({
+      isError: true,
+      errorSubtype: 'codex_tool_gate_inactive',
+    });
+  });
+
+  test('without a gate, tool items are never checked against hook calls', async () => {
+    mockRunStreamed.mockResolvedValue({
+      events: (async function* () {
+        yield { type: 'item.started', item: commandItem('c1') };
+        yield { type: 'item.completed', item: { ...commandItem('c1'), exit_code: 0 } };
+        yield { type: 'turn.completed', usage: defaultUsage };
+      })(),
+    });
+
+    const chunks = await collect(undefined);
+
+    expect(chunks.at(-1)).not.toHaveProperty('isError');
+  });
+
+  describe('teardown', () => {
+    async function directoryAfter(run: () => Promise<unknown>): Promise<string> {
+      await run().catch(() => undefined);
+      return join(gatedOptions().codexPathOverride, '..');
+    }
+
+    test('removes the channel when the turn fails', async () => {
+      mockRunStreamed.mockImplementation(() => Promise.reject(new Error('bad request')));
+      const { existsSync } = await import('node:fs');
+
+      const directory = await directoryAfter(() =>
+        collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })
+      );
+
+      expect(existsSync(directory)).toBe(false);
+    });
+
+    test('removes the channel when the request is aborted mid-stream', async () => {
+      const abortController = new AbortController();
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'x' } };
+            abortController.abort();
+            yield { type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'y' } };
+          })(),
+        })
+      );
+      const { existsSync } = await import('node:fs');
+      let thrown: unknown;
+
+      const directory = await directoryAfter(() =>
+        collect({
+          toolGate: mock<Gate>(() => Promise.resolve(ALLOW)),
+          abortSignal: abortController.signal,
+        }).catch((error: unknown) => {
+          thrown = error;
+        })
+      );
+
+      expect((thrown as Error).message).toBe('Query aborted');
+      expect(existsSync(directory)).toBe(false);
+    });
+
+    test('removes the channel when the consumer stops reading', async () => {
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'item.completed', item: { id: 'm1', type: 'agent_message', text: 'x' } };
+            yield { type: 'item.completed', item: { id: 'm2', type: 'agent_message', text: 'y' } };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        })
+      );
+      const { existsSync } = await import('node:fs');
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        toolGate: mock<Gate>(() => Promise.resolve(ALLOW)),
+      })) {
+        break;
+      }
+
+      expect(existsSync(join(gatedOptions().codexPathOverride, '..'))).toBe(false);
+    });
+
+    test('removes the channel when the Codex client cannot be built', async () => {
+      const { readdirSync } = await import('node:fs');
+      const gateDirs = (): string[] =>
+        readdirSync(tmpdir()).filter(
+          name => name.startsWith('archon-codex-gate-') && !name.includes('test')
+        );
+      const before = gateDirs();
+      MockCodex.mockImplementationOnce(() => {
+        throw new Error('constructor failed');
+      });
+
+      await expect(collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })).rejects.toThrow(
+        'constructor failed'
+      );
+
+      expect(gateDirs().filter(name => !before.includes(name))).toEqual([]);
+    });
+  });
+
+  test('refuses a gated request on Windows instead of running ungated', async () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      await expect(collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })).rejects.toThrow(
+        /not supported for Codex on Windows/
+      );
+    } finally {
+      if (platform) Object.defineProperty(process, 'platform', platform);
+    }
+    expect(MockCodex).not.toHaveBeenCalled();
   });
 });

@@ -22,7 +22,9 @@ import type {
 import { clampEffort } from '@archon/paths/effort';
 import { CODEX_EFFORTS, parseCodexConfig } from './config';
 import { CODEX_CAPABILITIES } from './capabilities';
-import { resolveCodexBinaryPath } from './binary-resolver';
+import { resolveCodexBinaryPath, resolveSdkBundledCodexCommand } from './binary-resolver';
+import { openCodexToolGateBridge, type CodexToolGateBridge } from './tool-gate-bridge';
+import type { CodexToolCategory } from './tool-gate-request';
 import { createLogger } from '@archon/paths';
 import { loadMcpConfig } from '../mcp/config';
 import {
@@ -445,6 +447,58 @@ interface CodexStreamState {
   completedToolItemIds: Set<string>;
 }
 
+/** Stream items that are tool calls Codex runs a PreToolUse hook for. */
+const HOOKED_ITEM_TYPES: ReadonlySet<string> = new Set([
+  'command_execution',
+  'file_change',
+  'mcp_tool_call',
+]);
+
+/** The hook calls those items come from. `other` tools have no stream item. */
+const HOOKED_ITEM_CATEGORIES: readonly CodexToolCategory[] = ['command', 'file_change', 'mcp'];
+
+const TOOL_GATE_INACTIVE_MESSAGE =
+  "Codex ran a tool without asking Archon's tool gate, so the turn was stopped. " +
+  'The gate reaches Codex through a PreToolUse hook, and that hook did not run for this tool call: ' +
+  'check that hooks are enabled in your Codex configuration (`features.hooks`) and that the Codex CLI is recent enough to support them. ' +
+  'What that tool call did was not checked.';
+
+/**
+ * Watches one attempt of a gated turn for a tool that ran unasked.
+ *
+ * The hook is Codex's to run, and Codex skips it without an error when hooks
+ * are disabled, untrusted or unknown to that version. So its running is
+ * observed rather than assumed: every hook call reaches the bridge before its
+ * tool starts, hence before the tool's item appears in the stream, and a
+ * denied call leaves no item. More tool items than hook calls therefore means
+ * one ran without the gate.
+ *
+ * The count is not kept per kind of tool: Codex applies a patch the model
+ * pipes to `apply_patch` in the shell itself, so a `Bash` hook call can
+ * surface as a `file_change` item.
+ */
+interface ToolGateMonitor {
+  /** Records a stream item; true when it is a tool call the gate was never asked about. */
+  ranUngated(itemType: string, itemId: string): boolean;
+}
+
+function createToolGateMonitor(bridge: CodexToolGateBridge): ToolGateMonitor {
+  const hookCalls = (): number => {
+    const counts = bridge.hookCallCounts();
+    return HOOKED_ITEM_CATEGORIES.reduce((total, category) => total + counts[category], 0);
+  };
+  // Calls from an earlier attempt of the same request must not cover this one.
+  const baseline = hookCalls();
+  const seen = new Set<string>();
+  return {
+    ranUngated(itemType, itemId): boolean {
+      if (!HOOKED_ITEM_TYPES.has(itemType)) return false;
+      seen.add(itemId);
+      return seen.size > hookCalls() - baseline;
+    },
+  };
+}
+
 function getMcpToolName(item: Record<string, unknown>): string {
   const server = item.server as string | undefined;
   const tool = item.tool as string | undefined;
@@ -461,7 +515,8 @@ async function* streamCodexEvents(
   hasOutputFormat: boolean,
   threadId: string | null | undefined,
   abortSignal?: AbortSignal,
-  surfaceMcpClientErrors = false
+  surfaceMcpClientErrors = false,
+  toolGateMonitor?: ToolGateMonitor
 ): AsyncGenerator<MessageChunk> {
   const state: CodexStreamState = {
     startedToolItemIds: new Set<string>(),
@@ -512,6 +567,26 @@ async function* streamCodexEvents(
         getLog().warn({ snapshotThreadId: resolvedThreadId }, 'codex.thread_started_missing_id');
       }
       continue;
+    }
+
+    if (toolGateMonitor && (event.type === 'item.started' || event.type === 'item.completed')) {
+      const item = event.item as Record<string, unknown>;
+      const itemType = item.type as string;
+      const itemId = item.id as string;
+      if (toolGateMonitor.ranUngated(itemType, itemId)) {
+        // Returning ends the SDK's event iterator, which kills the Codex
+        // process. Reported as a result rather than thrown so the retry loop
+        // cannot start another ungated attempt.
+        getLog().error({ itemType, itemId }, 'codex.tool_gate_inactive');
+        yield {
+          type: 'result',
+          sessionId: resolvedThreadId ?? undefined,
+          isError: true,
+          errorSubtype: 'codex_tool_gate_inactive',
+          errors: [TOOL_GATE_INACTIVE_MESSAGE],
+        };
+        return;
+      }
     }
 
     if (event.type === 'item.started') {
@@ -886,22 +961,37 @@ export class CodexProvider implements IAgentProvider {
     this.retryBaseDelayMs = options?.retryBaseDelayMs ?? RETRY_BASE_DELAY_MS;
   }
 
+  /**
+   * `toolGateBridge` is taken here, not merged by the caller, so that every
+   * client a gated request builds — the first one and the skill-catalog
+   * fallback alike — starts Codex through the launcher with the hook installed.
+   */
   private async createCodexClient(
     configCodexBinaryPath: string | undefined,
     requestEnv?: Record<string, string>,
-    codexConfigOverrides?: CodexConfigOverrides
+    codexConfigOverrides?: CodexConfigOverrides,
+    toolGateBridge?: CodexToolGateBridge
   ): Promise<Codex> {
-    if ((!requestEnv || Object.keys(requestEnv).length === 0) && !codexConfigOverrides) {
+    if (
+      (!requestEnv || Object.keys(requestEnv).length === 0) &&
+      !codexConfigOverrides &&
+      !toolGateBridge
+    ) {
       return getCodex(configCodexBinaryPath);
     }
 
     try {
+      const config = toolGateBridge
+        ? { ...(codexConfigOverrides ?? {}), ...toolGateBridge.configOverrides }
+        : codexConfigOverrides;
       const codexOptions: CodexOptions = {
-        codexPathOverride: await resolveCodexBinaryPath(configCodexBinaryPath),
+        codexPathOverride: toolGateBridge
+          ? toolGateBridge.launcherPath
+          : await resolveCodexBinaryPath(configCodexBinaryPath),
         ...(requestEnv && Object.keys(requestEnv).length > 0
           ? { env: buildCodexEnv(requestEnv) }
           : {}),
-        ...(codexConfigOverrides ? { config: codexConfigOverrides } : {}),
+        ...(config ? { config } : {}),
       };
       return new Codex(codexOptions);
     } catch (error) {
@@ -922,6 +1012,42 @@ export class CodexProvider implements IAgentProvider {
     cwd: string,
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
+  ): AsyncGenerator<MessageChunk> {
+    const toolGate = requestOptions?.toolGate;
+    if (!toolGate) {
+      yield* this.runQuery(prompt, cwd, resumeSessionId, requestOptions);
+      return;
+    }
+
+    if (process.platform === 'win32') {
+      // The launcher and hook are POSIX shell scripts. Refusing is the only
+      // safe answer: running without them would run every tool unasked.
+      throw new Error(
+        'Codex query failed: the tool gate is not supported for Codex on Windows. Turn the tool gate off for Codex, or run Archon on macOS or Linux.'
+      );
+    }
+
+    const codexConfig = parseCodexConfig(requestOptions.assistantConfig ?? {});
+    const pinnedBinary = await resolveCodexBinaryPath(codexConfig.codexBinaryPath);
+    const bridge = await openCodexToolGateBridge({
+      toolGate,
+      codexCommand: pinnedBinary ? [pinnedBinary] : resolveSdkBundledCodexCommand(),
+    });
+    try {
+      yield* this.runQuery(prompt, cwd, resumeSessionId, requestOptions, bridge);
+    } finally {
+      // Runs on completion, on a thrown error, and when the consumer stops
+      // iterating (abort): the generator's return unwinds through here.
+      await bridge.close();
+    }
+  }
+
+  private async *runQuery(
+    prompt: string,
+    cwd: string,
+    resumeSessionId?: string,
+    requestOptions?: SendQueryOptions,
+    toolGateBridge?: CodexToolGateBridge
   ): AsyncGenerator<MessageChunk> {
     const assistantConfig = requestOptions?.assistantConfig ?? {};
     const codexConfig = parseCodexConfig(assistantConfig);
@@ -960,7 +1086,8 @@ export class CodexProvider implements IAgentProvider {
     let codex = await this.createCodexClient(
       codexConfig.codexBinaryPath,
       requestOptions?.env,
-      initialConfigOverrides
+      initialConfigOverrides,
+      toolGateBridge
     );
     const threadOptions = buildThreadOptions(
       cwd,
@@ -1073,7 +1200,8 @@ export class CodexProvider implements IAgentProvider {
                   hasOutputFormat,
                   thread.id,
                   attemptController.signal,
-                  Boolean(requestOptions?.nodeConfig?.mcp)
+                  Boolean(requestOptions?.nodeConfig?.mcp),
+                  toolGateBridge ? createToolGateMonitor(toolGateBridge) : undefined
                 ),
                 // Stamp from the attempt that produced the result: any retry
                 // (attempt > 0) re-runs on a fresh startThread (cold), so the prior
@@ -1109,7 +1237,8 @@ export class CodexProvider implements IAgentProvider {
               codex = await this.createCodexClient(
                 codexConfig.codexBinaryPath,
                 requestOptions?.env,
-                declaredMcpConfigOverrides
+                declaredMcpConfigOverrides,
+                toolGateBridge
               );
               if (resumeSessionId) {
                 try {
