@@ -88,7 +88,7 @@ describe('targetHost', () => {
     [['-h', '10.20.4.17', '-d', 'orders'], 'unknown'],
     [['https://api.example.com/v1/users/42'], 'unknown'],
   ])('%p → %s', (args, expected) => {
-    expect(targetHost(args)).toBe(expected);
+    expect<string | undefined>(targetHost(args)).toBe(expected);
   });
 
   test('arguments that name no host and no database state nothing', () => {
