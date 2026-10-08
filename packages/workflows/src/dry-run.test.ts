@@ -2697,6 +2697,90 @@ describe('dryRunWorkflow — effective provider/model per node', () => {
   });
 });
 
+describe('dryRunWorkflow — the model router never changes the reported resolution', () => {
+  const config = {
+    assistant: 'claude',
+    assistants: { claude: {}, codex: {} },
+    commands: {},
+    defaults: { loadDefaultCommands: false, loadDefaultWorkflows: false },
+  };
+  const aiProfile = buildAiProfile('claude', {
+    repoTiers: {
+      small: { provider: 'claude', model: 'haiku' },
+      medium: { provider: 'claude', model: 'sonnet' },
+    },
+  });
+  const nodes = [
+    { id: 'routable', prompt: 'p', model: 'medium' },
+    { id: 'pinned', prompt: 'p', model: 'sonnet' },
+    { id: 'frontier', prompt: 'p', model: 'large' },
+    {
+      id: 'group',
+      model: 'medium',
+      loop_group: {
+        until_bash: 'exit 0',
+        max_iterations: 1,
+        nodes: [{ id: 'body', prompt: 'p' }],
+      },
+    },
+  ];
+
+  async function dryRun(modelRouter?: {
+    tiers: ('small' | 'medium' | 'large')[];
+    mode: 'off' | 'shadow' | 'apply';
+  }): Promise<Awaited<ReturnType<typeof dryRunWorkflow>>> {
+    return dryRunWorkflow({
+      workflow: makeTestWorkflow({ name: 'routed', nodes }),
+      userMessage: 'go',
+      cwd: process.cwd(),
+      stubs: { routable: 'ok', pinned: 'ok', frontier: 'ok', body: 'ok' },
+      config: { ...config, ...(modelRouter ? { modelRouter } : {}) },
+      aiProfile,
+    });
+  }
+  const resolutions = (
+    result: Awaited<ReturnType<typeof dryRunWorkflow>>
+  ): Map<string, DryRunResolution | undefined> =>
+    new Map(result.trace.map(entry => [entry.nodeId, entry.resolution]));
+
+  test('reports the same resolution with the router on, and names the nodes it may lower', async () => {
+    const unrouted = resolutions(await dryRun());
+    const applied = await dryRun({ tiers: ['medium'], mode: 'apply' });
+    const byId = resolutions(applied);
+
+    for (const id of ['routable', 'pinned', 'frontier', 'group', 'body']) {
+      const { modelRouter: _note, ...resolution } = byId.get(id) ?? {};
+      expect(resolution).toEqual(unrouted.get(id) ?? {});
+      expect(unrouted.get(id)?.modelRouter).toBeUndefined();
+    }
+    expect(byId.get('routable')?.model).toBe('sonnet');
+    expect(byId.get('routable')?.modelRouter).toEqual({ mode: 'apply', ceiling: 'medium' });
+    // A literal model, a tier the operator did not name, and a loop_group with its body
+    // are never routed, so nothing is said about them.
+    for (const id of ['pinned', 'frontier', 'group', 'body']) {
+      expect(byId.get(id)?.modelRouter).toBeUndefined();
+    }
+    expect(formatDryRunTrace(applied)).toContain(
+      "model router: apply mode may run this step below 'medium'; the model above is its ceiling"
+    );
+  });
+
+  test('says a shadow route is only recorded, and says nothing when the router is off', async () => {
+    const shadow = await dryRun({ tiers: ['medium'], mode: 'shadow' });
+    expect(resolutions(shadow).get('routable')?.modelRouter).toEqual({
+      mode: 'shadow',
+      ceiling: 'medium',
+    });
+    expect(formatDryRunTrace(shadow)).toContain(
+      'model router: shadow mode records a route for this step; it runs on the model above'
+    );
+
+    const off = await dryRun({ tiers: ['medium'], mode: 'off' });
+    expect(resolutions(off).get('routable')?.modelRouter).toBeUndefined();
+    expect(formatDryRunTrace(off)).not.toContain('model router');
+  });
+});
+
 describe('resolveWorkflowModelScope — the origin names the value that won', () => {
   const assistantModels = { claude: 'claude-default', codex: 'codex-default' };
   const profile = buildAiProfile('claude', {

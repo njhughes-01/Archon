@@ -25,7 +25,7 @@ export type ModelRouterConfigInput = z.infer<typeof modelRouterConfigInputSchema
  * lower; a node on any other tier, on a literal model or on an `@alias` is never routed.
  */
 export interface ModelRouterConfig {
-  tiers: readonly TierName[];
+  tiers: TierName[];
   mode: ModelRouterMode;
 }
 
@@ -36,7 +36,7 @@ export const DEFAULT_MODEL_ROUTER_MODE: ModelRouterMode = 'shadow';
 
 export function resolveModelRouterConfig(input: ModelRouterConfigInput): ModelRouterConfig {
   return {
-    tiers: input.tiers ?? DEFAULT_MODEL_ROUTER_TIERS,
+    tiers: input.tiers ?? [...DEFAULT_MODEL_ROUTER_TIERS],
     mode: input.mode ?? DEFAULT_MODEL_ROUTER_MODE,
   };
 }

@@ -232,6 +232,7 @@ describe('routingCeiling: which nodes the router may touch at all', () => {
     ['no model at all', { node: agentNode({ model: undefined }) }],
     ['a tier the operator did not name', { node: agentNode({ model: 'large' }) }],
     ['a named session resume', { node: agentNode({ context: { resume: 'earlier' } }) }],
+    ['a router the operator switched off', { config: { tiers: ['medium'], mode: 'off' } }],
     ['a node another node resumes from', { isResumeSource: true }],
     ['a node whose session persists across runs', { usesPersistedScope: true }],
     ['no AI profile to resolve tiers with', { aiProfile: undefined }],

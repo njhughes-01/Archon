@@ -32,6 +32,16 @@ describe('bunTestEnv', () => {
     expect(bunTestEnv({ ARCHON_TELEMETRY_DISABLED: '' }).ARCHON_TELEMETRY_DISABLED).toBe('');
     expect(bunTestEnv({ PATH: '/bin' }).PATH).toBe('/bin');
   });
+
+  it('turns the model router off even when the caller inherited it on', () => {
+    expect(bunTestEnv({}).JEV_ROUTER_ENABLED).toBe('0');
+    expect(bunTestEnv({ JEV_API_KEY: 'k', JEV_ROUTER_ENABLED: '1' }).JEV_ROUTER_ENABLED).toBe('0');
+  });
+
+  it('leaves the switch every other Jev feature shares as the caller set it', () => {
+    expect(bunTestEnv({}).JEV_ENABLED).toBeUndefined();
+    expect(bunTestEnv({ JEV_ENABLED: '1' }).JEV_ENABLED).toBe('1');
+  });
 });
 
 describe('every bun test entry point preloads the telemetry opt-out', () => {

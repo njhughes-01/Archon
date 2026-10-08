@@ -148,10 +148,29 @@ export interface RoutingCandidate {
 }
 
 /**
- * The tier a node may be lowered from, or `undefined` when the router must leave it alone.
+ * The ceiling a node's own definition and the operator's config give it, or `undefined`
+ * when they rule routing out. This is everything a dry run can know; `routingCeiling`
+ * adds what only a run knows.
  *
  * Only a tier keyword the operator named is a ceiling. A literal model and an `@alias` are
  * the author pinning one exact model, so they resolve with no `tier` and never get here.
+ */
+export function authoredCeiling(
+  node: Pick<AgentNode, 'context'>,
+  resolution: Pick<NodeModelResolution, 'tier' | 'preset'>,
+  config: ModelRouterConfig
+): TierName | undefined {
+  const ceiling = resolution.tier;
+  if (ceiling === undefined || resolution.preset === undefined) return undefined;
+  if (config.mode === 'off' || !config.tiers.includes(ceiling)) return undefined;
+  // The consumer of a named session resume must run on its source's provider.
+  if (isNodeContextResume(node.context)) return undefined;
+  return ceiling;
+}
+
+/**
+ * The tier a node may be lowered from, or `undefined` when the router must leave it alone.
+ *
  * A node in a named resume pair or with a persisted session is left alone entirely: its
  * session outlives the attempt, and the provider and model that own a session are not the
  * router's to change.
@@ -161,13 +180,9 @@ export function routingCeiling(
   getCapabilities: CapabilityLookup = registeredCapabilities
 ): TierName | undefined {
   const { node, resolution, aiProfile, config } = candidate;
-  const ceiling = resolution.tier;
-  if (aiProfile === undefined || ceiling === undefined || resolution.preset === undefined) {
-    return undefined;
-  }
-  if (!config.tiers.includes(ceiling)) return undefined;
-  if (isNodeContextResume(node.context) || candidate.isResumeSource) return undefined;
-  if (candidate.usesPersistedScope) return undefined;
+  const ceiling = authoredCeiling(node, resolution, config);
+  if (aiProfile === undefined || ceiling === undefined) return undefined;
+  if (candidate.isResumeSource || candidate.usesPersistedScope) return undefined;
   // An unregistered ceiling fails the node today. Routing it elsewhere would turn that
   // failure into a success on a provider the author never named.
   if (getCapabilities(resolution.provider) === undefined) return undefined;

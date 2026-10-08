@@ -29,6 +29,10 @@ import {
   workflowRunContinuationConfigSchema,
   type WorkflowRunConfigLayer,
 } from '@archon/workflows/schemas/run-config';
+import type {
+  ModelRouterConfig,
+  ModelRouterConfigInput,
+} from '@archon/workflows/schemas/model-router';
 
 export type {
   ClaudeProviderDefaults,
@@ -38,6 +42,7 @@ export type {
   ProviderDefaultsMap,
 };
 export type { RawAliasesConfig, RawTiersConfig };
+export type { ModelRouterConfig, ModelRouterConfigInput };
 
 /**
  * Intersection type: generic `ProviderDefaultsMap` (any string key) with
@@ -207,6 +212,12 @@ export interface GlobalConfig {
 
   /** Default-off policy for continuing terminal quota failures after time passes. */
   workflows?: WorkflowContinuationConfig;
+
+  /**
+   * Opt-in for the cost-aware model router. Writing this block is the opt-in: without it
+   * no workflow step is classified and nothing is sent to the classifier.
+   */
+  modelRouter?: ModelRouterConfigInput;
 }
 
 // Ordinary global/repo config remains forward-compatible: unlike the explicitly
@@ -238,6 +249,9 @@ export interface RepoConfig {
 
   /** Project override for quota-failure continuation. */
   workflows?: WorkflowContinuationConfig;
+
+  /** Project override for the model router; each field overrides the install's. */
+  modelRouter?: ModelRouterConfigInput;
 
   /**
    * Commands configuration
@@ -425,6 +439,11 @@ export interface MergedConfig {
     quotaMaxAttempts: number;
     quotaDeadlineMs: number;
   };
+  /**
+   * The model router's opt-in with defaults applied (repo > global, per field). Undefined
+   * when neither config file has a `modelRouter:` block, which leaves the router off.
+   */
+  modelRouter?: ModelRouterConfig;
   commands: {
     /**
      * Additional command folder to search (relative to repo root)

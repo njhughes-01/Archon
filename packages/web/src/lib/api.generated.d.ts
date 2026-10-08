@@ -3424,6 +3424,27 @@ export interface components {
           sessionPreview?: string;
           /** @enum {string} */
           sessionOrigin?: 'fresh' | 'resumed' | 'resume-failed-cold';
+          route?: {
+            /** @enum {string} */
+            mode: 'shadow' | 'apply';
+            /** @enum {string} */
+            source: 'jev' | 'fallback' | 'disabled';
+            /** @enum {string} */
+            authoredTier: 'small' | 'medium' | 'large';
+            /** @enum {string} */
+            routedTier: 'small' | 'medium' | 'large';
+            applied: boolean;
+            /** @enum {string} */
+            chosenTier?: 'small' | 'medium' | 'large';
+            probability?: number;
+            confidence?: number;
+            riskNoul?: number;
+            ambiguityNoul?: number;
+            reason?: string;
+            /** @enum {string} */
+            escalatedFrom?: 'small' | 'medium' | 'large';
+            escalationReason?: string;
+          };
         };
         timing: {
           /** Format: date-time */

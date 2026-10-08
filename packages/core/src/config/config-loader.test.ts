@@ -184,6 +184,34 @@ workflows:
       expect(config.workflows).toEqual({ autoResumeOnQuotaReset: true });
     });
 
+    test('keeps a modelRouter block as written, without filling in defaults', async () => {
+      mockFsReadFile.mockResolvedValue(`
+modelRouter:
+  mode: apply
+  futureKnob: 1
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.modelRouter).toEqual({ mode: 'apply' });
+    });
+
+    test.each([
+      ['an unknown tier', 'tiers: [medium, huge]'],
+      ['an unknown mode', 'mode: sometimes'],
+      ['tiers that are not a list', 'tiers: medium'],
+    ])('rejects a modelRouter block with %s at config ingress', async (_label, line) => {
+      mockFsReadFile.mockResolvedValue(`
+modelRouter:
+  ${line}
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config).toEqual({});
+      expect(mockLogger.error).toHaveBeenCalled();
+    });
+
     test('caches config on subsequent calls', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
 
@@ -393,6 +421,37 @@ recommendedWorkflows: "archon-plan"
         quotaMaxAttempts: 1,
         quotaDeadlineMs: 86_400_000,
       });
+    });
+
+    test('leaves the model router unconfigured when neither file names it', async () => {
+      mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
+    });
+
+    test('a modelRouter block opts in, on the medium tier in shadow mode by default', async () => {
+      mockFsReadFile.mockResolvedValueOnce('modelRouter: {}').mockResolvedValueOnce('');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'shadow' });
+    });
+
+    test('merges global and repo modelRouter settings per field', async () => {
+      mockFsReadFile.mockResolvedValueOnce(`
+modelRouter:
+  tiers: [medium, large]
+  mode: shadow
+`).mockResolvedValueOnce(`
+modelRouter:
+  mode: apply
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium', 'large'], mode: 'apply' });
     });
 
     test('merges global and repo quota continuation policy per field', async () => {

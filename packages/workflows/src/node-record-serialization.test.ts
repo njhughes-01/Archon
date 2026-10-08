@@ -146,6 +146,57 @@ describe('node record serializers', () => {
     });
   });
 
+  it('carries the model route through persistence, the emitter and a resume read, and adds no key without one', () => {
+    const route = {
+      mode: 'apply' as const,
+      source: 'jev' as const,
+      authoredTier: 'medium' as const,
+      routedTier: 'medium' as const,
+      applied: false,
+      chosenTier: 'small' as const,
+      // Boundary values: the resume reader throws on a record it cannot parse.
+      probability: 1,
+      confidence: 0,
+      riskNoul: 0.02,
+      ambiguityNoul: 1,
+      escalatedFrom: 'small' as const,
+      escalationReason: 'output_contract',
+    };
+    const routed = { ...record(), binding: { ...record().binding, route } };
+
+    const serialized = serializeNodeStateRecord(routed);
+    expect(serialized.data.binding?.route).toEqual(route);
+    const wire = JSON.parse(JSON.stringify(serialized)) as typeof serialized;
+    expect(readNodeRecordEvent(wire)?.metadata?.binding.route).toEqual(route);
+    const emitted = serializeNodeEmitter(routed);
+    expect(
+      emitted && 'execution' in emitted ? emitted.execution?.binding.route : undefined
+    ).toEqual(route);
+
+    const unrouted = serializeNodeStateRecord(record());
+    expect(unrouted.data.binding && 'route' in unrouted.data.binding).toBe(false);
+    expect(JSON.stringify(unrouted)).not.toContain('route');
+  });
+
+  it('refuses a route whose numbers are not probabilities', () => {
+    const base = record();
+    const bad = {
+      ...base,
+      binding: {
+        ...base.binding,
+        route: {
+          mode: 'apply' as const,
+          source: 'jev' as const,
+          authoredTier: 'medium' as const,
+          routedTier: 'small' as const,
+          applied: true,
+          probability: 1.2,
+        },
+      },
+    };
+    expect(() => serializeNodeOutput(bad)).toThrow();
+  });
+
   it('only exposes a short provider session preview', () => {
     const started = startNodeExecution({
       runId: 'run',

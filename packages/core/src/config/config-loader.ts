@@ -54,6 +54,10 @@ import {
   rawAliasesConfigSchema,
   rawTiersConfigSchema,
 } from '@archon/workflows/schemas/model-binding';
+import {
+  modelRouterConfigInputSchema,
+  resolveModelRouterConfig,
+} from '@archon/workflows/schemas/model-router';
 
 /**
  * A per-key patch for the `tiers:` config. Unlike `RawTiersConfig`, a tier value
@@ -311,6 +315,25 @@ function validateWorkflowContinuationConfig(parsed: unknown, configPath: string)
   config.workflows = result.data;
 }
 
+/**
+ * Validate a `modelRouter:` block where it is read. A mistyped tier or mode must be
+ * refused here: read leniently, it would either widen which steps may be lowered or
+ * leave the operator believing a mode is on that is not.
+ */
+function validateModelRouterConfig(parsed: unknown, configPath: string): void {
+  if (typeof parsed !== 'object' || parsed === null || !('modelRouter' in parsed)) return;
+  const config = parsed as { modelRouter?: unknown };
+  if (config.modelRouter === undefined) return;
+  const result = modelRouterConfigInputSchema.safeParse(config.modelRouter);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map(issue => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+      .join('; ');
+    throw new InvalidConfigError('Invalid modelRouter config', configPath, issues);
+  }
+  config.modelRouter = result.data;
+}
+
 function isConfigRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -396,6 +419,7 @@ async function readGlobalConfigOrDegrade(configPath: string): Promise<GlobalConf
     const content = await readConfigFile(configPath);
     const parsed = parseYaml(content);
     validateWorkflowContinuationConfig(parsed, configPath);
+    validateModelRouterConfig(parsed, configPath);
     validateModelBindingConfig(parsed, configPath);
     return (parsed as GlobalConfig | null) ?? {};
   } catch (error) {
@@ -462,6 +486,7 @@ async function readRepoConfigOrDegrade(configPath: string): Promise<RepoConfig> 
     const content = await readConfigFile(configPath);
     const raw = parseYaml(content);
     validateWorkflowContinuationConfig(raw, configPath);
+    validateModelRouterConfig(raw, configPath);
     validateModelBindingConfig(raw, configPath);
     const parsed = (raw as RepoConfig | null) ?? {};
     const recommendedWorkflows = sanitizeRecommendedWorkflows(
@@ -690,6 +715,11 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.workflows = { ...result.workflows, ...global.workflows };
   }
 
+  // The block's presence is the opt-in, so defaults are applied only once one exists.
+  if (global.modelRouter) {
+    result.modelRouter = resolveModelRouterConfig(global.modelRouter);
+  }
+
   // Container backend defaults (folder projects)
   if (global.container) {
     result.container = { ...global.container };
@@ -726,6 +756,10 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
 
   if (repo.workflows) {
     result.workflows = { ...result.workflows, ...repo.workflows };
+  }
+
+  if (repo.modelRouter) {
+    result.modelRouter = resolveModelRouterConfig({ ...merged.modelRouter, ...repo.modelRouter });
   }
 
   // Commands config
@@ -958,6 +992,7 @@ export async function updateGlobalConfig(
     // degrade: a bad value from the settings UI would otherwise brick every later
     // config load, and a bad block already on disk must be repaired, not kept.
     validateWorkflowContinuationConfig(merged, configPath);
+    validateModelRouterConfig(merged, configPath);
     validateModelBindingConfig(merged, configPath);
     validateAssistantDefaults(merged, configPath);
 

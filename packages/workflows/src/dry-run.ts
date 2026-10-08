@@ -43,6 +43,9 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
+import { authoredCeiling } from './jev/model-router';
+import { MODEL_ROUTER_RECORDED_MODES, type ModelRouterConfig } from './schemas/model-router';
+import { tierNameSchema } from './schemas/model-binding';
 import {
   assertWorkflowSourceIntegrity,
   liveSourceRoots,
@@ -392,6 +395,15 @@ const dryRunResolutionSchema = z.object({
   providerConflict: z
     .object({ declared: z.string(), resolved: z.string(), modelRef: z.string() })
     .optional(),
+  /**
+   * Set when the model router is on and may consider this node. A dry run makes no
+   * network call, so it never knows the route: everything above is the unrouted
+   * resolution, which is the most the node can run on. In `apply` mode a real run may
+   * use a tier below `ceiling`; in `shadow` mode it records a route and runs as reported.
+   */
+  modelRouter: z
+    .object({ mode: z.enum(MODEL_ROUTER_RECORDED_MODES), ceiling: tierNameSchema })
+    .optional(),
 });
 export type DryRunResolution = z.infer<typeof dryRunResolutionSchema>;
 
@@ -566,6 +578,11 @@ interface DryRunContext {
   scope: WorkflowModelScope;
   assistantModels: Readonly<Record<string, string | undefined>>;
   aiProfile?: ResolvedAiProfile;
+  /**
+   * The operator's model-router opt-in while the simulation is at the top level of the
+   * DAG, the only place a real run routes. Cleared inside a loop_group body.
+   */
+  modelRouter?: ModelRouterConfig;
 }
 
 async function loadDryRunCommand(ctx: DryRunContext, command: string): Promise<string> {
@@ -662,6 +679,13 @@ function resolutionFor(node: DagNode, ctx: DryRunContext): DryRunResolution | un
     ctx.assistantModels,
     ctx.aiProfile
   );
+  // Only single-shot agent nodes are routed; a loop keeps one binding for all its turns.
+  const router = isAgentNode(node) ? ctx.modelRouter : undefined;
+  const ceiling = router && authoredCeiling(node, resolved, router);
+  const routerNote =
+    router && ceiling
+      ? { mode: router.mode === 'apply' ? ('apply' as const) : ('shadow' as const), ceiling }
+      : undefined;
   return {
     provider: resolved.provider,
     ...(resolved.model !== undefined ? { model: resolved.model } : {}),
@@ -671,6 +695,7 @@ function resolutionFor(node: DagNode, ctx: DryRunContext): DryRunResolution | un
     effortFrom: resolved.effortOrigin,
     ...(resolved.authoredIn !== undefined ? { authoredIn: resolved.authoredIn } : {}),
     ...(resolved.providerConflict ? { providerConflict: resolved.providerConflict } : {}),
+    ...(routerNote ? { modelRouter: routerNote } : {}),
   };
 }
 
@@ -1054,14 +1079,17 @@ async function simulateLoopGroup(
   // Restoring in `finally` keeps the group's own trace entry on the enclosing scope and
   // nests correctly when a body contains another loop_group.
   const outerScope = ctx.scope;
+  const outerModelRouter = ctx.modelRouter;
   let lastOutput = '';
   for (let current = 1; current <= node.loop_group.max_iterations; current++) {
     const bodyOutputs = new Map(outputs);
     ctx.scope = bodyScope;
+    ctx.modelRouter = undefined;
     try {
       await simulateNodes(bodyPlan, bodyOutputs, ctx, current);
     } finally {
       ctx.scope = outerScope;
+      ctx.modelRouter = outerModelRouter;
     }
     lastOutput =
       bodyPlan.sinks
@@ -1499,6 +1527,7 @@ export async function dryRunWorkflow(options: {
     consumedStubs: new Set<string>(),
     missingStubs: new Set<string>(),
     toleratedMissingStubs: new Set<string>(),
+    ...(options.config?.modelRouter ? { modelRouter: options.config.modelRouter } : {}),
     scope: resolveWorkflowModelScope(
       options.workflow,
       options.config?.assistant ?? 'claude',
@@ -1565,6 +1594,13 @@ export function formatDryRunTrace(result: DryRunResult): string {
         `  runs on: ${r.provider} (${r.providerFrom}) / ${model} (${r.modelFrom})${authored}`
       );
       if (r.effort) lines.push(`  effort: ${r.effort} (${r.effortFrom})`);
+      if (r.modelRouter) {
+        lines.push(
+          r.modelRouter.mode === 'apply'
+            ? `  model router: apply mode may run this step below '${r.modelRouter.ceiling}'; the model above is its ceiling`
+            : '  model router: shadow mode records a route for this step; it runs on the model above'
+        );
+      }
       if (r.providerConflict) {
         const c = r.providerConflict;
         lines.push(

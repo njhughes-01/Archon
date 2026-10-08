@@ -25,7 +25,18 @@ export function bunTestCommand(
  * starts a real CLI or engine with a temp `ARCHON_HOME` would otherwise mint a
  * fresh install id per run and report it as a real install. A test that covers
  * telemetry itself re-enables it by setting the variable in its own child env.
+ *
+ * Tests never call the model router's classifier either. A test that runs a workflow
+ * in-process with the router configured would otherwise send its prompts to the live
+ * service whenever the developer's shell has a `JEV_API_KEY`. Forced rather than defaulted,
+ * because an inherited `JEV_ROUTER_ENABLED=1` must not win. It is the router's own switch,
+ * not `JEV_ENABLED`, so other Jev features' tests keep whatever they set. A test that
+ * covers routing lifts the switch in-process and fakes the HTTP call.
  */
 export function bunTestEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  return { ...env, ARCHON_TELEMETRY_DISABLED: env.ARCHON_TELEMETRY_DISABLED ?? '1' };
+  return {
+    ...env,
+    ARCHON_TELEMETRY_DISABLED: env.ARCHON_TELEMETRY_DISABLED ?? '1',
+    JEV_ROUTER_ENABLED: '0',
+  };
 }
