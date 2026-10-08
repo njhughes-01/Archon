@@ -120,6 +120,21 @@ describe('values assigned to secret-named keys', () => {
     'if (token === expected) return;',
     'const length = (token) => token.length;',
     'retry 1 of 3: true path /srv/app/build failed in production',
+    // An error's class name is not a key, and its message is the evidence.
+    "KeyError: 'access_token'",
+    'AuthError: invalid credentials for user ci',
+    'TokenExpiredError: jwt expired',
+    'JsonWebTokenError: invalid signature',
+    'jwt.exceptions.InvalidTokenError: Signature verification failed',
+    'botocore.exceptions.NoCredentialsError: Unable to locate credentials',
+    'java.security.InvalidKeyException: Illegal key size',
+    'DeprecationWarning: passwordless sudo is going away',
+    // A secret word that does not end the name describes something else.
+    'auth_mode: basic',
+    'SSH_AUTH_SOCK=/tmp/ssh-abc123/agent.4242',
+    'key_count: 12 items',
+    'max_tokens: 4096',
+    'input_tokens: 406',
   ])('leaves an ordinary failure line as it is: %s', line => {
     expect(redact(line)).toBe(line);
   });
@@ -329,6 +344,8 @@ describe('values of secret-named variables', () => {
         OLDPWD: '/srv/app/build',
         NODE_ENV: 'production',
         KEY: '/srv/app/build',
+        SSH_AUTH_SOCK: '/srv/app/build',
+        GPG_KEY_ID: '/srv/app/build',
       })
     ).toBe(text);
   });

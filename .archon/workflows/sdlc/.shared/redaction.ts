@@ -23,8 +23,8 @@ export const REDACTED = '[REDACTED]';
 export const REDACTED_KEY = '[REDACTED PRIVATE KEY]';
 
 /**
- * Name parts that mark a secret wherever they appear, alone or inside a longer name, and
- * as the end of a run-together one (`dbpassword`, `authToken`).
+ * Name parts that mark a secret wherever they stand in a name (`SECRET_KEY_BASE`), and as
+ * the end of a run-together part (`dbpassword`, `authToken`).
  */
 const SECRET_WORDS = [
   'PASSWORD',
@@ -37,14 +37,23 @@ const SECRET_WORDS = [
   'CREDENTIALS',
   'COOKIE',
 ];
-/** Parts that mark a secret alone or in a longer name, but only as a whole part. */
-const SECRET_PARTS = new Set(['AUTH', 'SIG', 'SIGNATURE', 'DSN']);
 /**
- * Parts that mark a secret only inside a longer name (`DB_PASS`, `ENCRYPTION_KEY`,
+ * Parts that mark a secret when they end the name, alone or after others (`auth`,
+ * `X-Amz-Signature`). Earlier in a name they describe something else (`auth_mode`,
+ * `SSH_AUTH_SOCK`).
+ */
+const SECRET_ENDINGS = new Set(['AUTH', 'SIG', 'SIGNATURE', 'DSN']);
+/**
+ * Parts that mark a secret only as the end of a longer name (`DB_PASS`, `ENCRYPTION_KEY`,
  * `DB_PWD`). Alone they are ordinary words: `pass: 12` is a test count, `key:` is any map
  * key, and `PWD` is the working directory.
  */
-const SECRET_IN_COMPOUND = new Set(['KEY', 'PASS', 'PWD']);
+const SECRET_COMPOUND_ENDINGS = new Set(['KEY', 'PASS', 'PWD']);
+/**
+ * What ends the name of an error's class. `TokenExpiredError: jwt expired` and
+ * `KeyError: 'access_token'` read like assignments and are the failure itself.
+ */
+const ERROR_NAME_ENDINGS = new Set(['ERROR', 'EXCEPTION', 'WARNING', 'FAILURE', 'FAULT']);
 
 type Strength = 'strong' | 'weak';
 
@@ -59,9 +68,11 @@ function secretName(name: string): Strength | null {
     .toUpperCase()
     .split(/[^A-Z0-9]+/)
     .filter(Boolean);
+  const last = parts.at(-1);
+  if (last === undefined || ERROR_NAME_ENDINGS.has(last)) return null;
   if (parts.some(part => SECRET_WORDS.some(word => part.endsWith(word)))) return 'strong';
-  if (parts.some(part => SECRET_PARTS.has(part))) return 'weak';
-  if (parts.length > 1 && parts.some(part => SECRET_IN_COMPOUND.has(part))) return 'weak';
+  if (SECRET_ENDINGS.has(last)) return 'weak';
+  if (parts.length > 1 && SECRET_COMPOUND_ENDINGS.has(last)) return 'weak';
   return null;
 }
 

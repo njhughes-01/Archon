@@ -664,7 +664,7 @@ Before that cut, recognisable secrets are replaced with `[REDACTED]`:
 - the password in a URL (`scheme://user:password@host`), and a token in front of a host;
 - well-known token formats, among them OpenAI, GitHub, GitLab, Slack, Stripe, Google, SendGrid, Twilio and npm tokens, AWS key ids, and JSON Web Tokens.
 
-A name counts as secret when one of its parts is `PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL`, `COOKIE`, `AUTH`, `SIGNATURE`, `SIG` or `DSN`, or when `KEY`, `PASS` or `PWD` appears inside a longer name. This is a filter over known shapes, not a guarantee: a credential that a failing command printed in some other shape is sent as it is. For a project where that matters, leave the second opinion off or point `JEV_API_BASE` at a service you host. Neither the record nor the key is written to the run's output.
+A name counts as secret when one of its parts is `PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL` or `COOKIE`, when it ends in `AUTH`, `SIGNATURE`, `SIG` or `DSN`, or when a longer name ends in `KEY`, `PASS` or `PWD`. The name of an error class (`TokenExpiredError: ...`) is never one, so the error's message stays. This is a filter over known shapes, not a guarantee: a credential that a failing command printed in some other shape is sent as it is. For a project where that matters, leave the second opinion off or point `JEV_API_BASE` at a service you host. Neither the record nor the key is written to the run's output.
 
 | Variable | Description | Default |
 | --- | --- | --- |
