@@ -180,10 +180,10 @@ describe('openCodexToolGateBridge', () => {
     expect(JSON.stringify(bridge.configOverrides).includes(token)).toBe(false);
   });
 
-  test('turns off unified exec so every shell command is a separate hooked call', async () => {
+  test('turns off TTY sessions, so a running command cannot be fed unhooked input', async () => {
     const bridge = await openBridge(mock<Gate>(() => Promise.resolve(ALLOW)));
 
-    expect(bridge.configOverrides.features).toEqual({ unified_exec: false });
+    expect(bridge.configOverrides.features).toEqual({ unified_exec_tty: false });
   });
 
   test('gives Codex longer than the hook needs, and the hook longer than the gate', async () => {
@@ -334,7 +334,7 @@ describe('the hook program', () => {
     expect(run.exitCode).toBe(2);
     expect(run.stderr).toMatch(UNREACHABLE);
     expect(gate).not.toHaveBeenCalled();
-    expect(bridge.hookCallCounts().command).toBe(0);
+    expect(bridge.allowedCallCounts().command).toBe(0);
     expect(mockLogger.warn).toHaveBeenCalledWith('codex.tool_gate_bad_token');
   });
 
@@ -399,6 +399,24 @@ describe('the hook program', () => {
     expect(gate).not.toHaveBeenCalled();
   });
 
+  test('a hook that fails before reading still takes all of its input', async () => {
+    // Codex writes the payload to the hook's stdin. A hook that exits first
+    // breaks that pipe, and what Codex does with a hook it could not write to
+    // is not something to depend on. Larger than a pipe buffer, so an unread
+    // payload cannot be written at all.
+    const bridge = await openBridge(
+      mock<Gate>(() => Promise.resolve(ALLOW)),
+      {
+        runtimePath: '/nonexistent/bun',
+      }
+    );
+
+    const run = await runHook(bridge, JSON.stringify(bashPayload('x'.repeat(1024 * 1024))));
+
+    expect(run.exitCode).toBe(2);
+    expect(run.stderr).toMatch(UNREACHABLE);
+  });
+
   test('a runtime that dies without deciding: the wrapper denies', async () => {
     const dir = await tempDir();
     const crashing = join(dir, 'crashing-runtime');
@@ -436,12 +454,16 @@ describe('the hook program', () => {
     expect(existsSync(marker)).toBe(false);
   });
 
-  test('counts each authenticated call by the kind of tool', async () => {
-    const bridge = await openBridge(mock<Gate>(() => Promise.resolve(DENY)));
+  test('counts the calls it lets through, by the kind of tool', async () => {
+    const gate = mock<Gate>(request =>
+      Promise.resolve(request.command === 'rm -rf .' ? DENY : ALLOW)
+    );
+    const bridge = await openBridge(gate);
     const patch = '*** Begin Patch\n*** Add File: a.txt\n+a\n*** End Patch';
 
     await runHook(bridge, JSON.stringify(bashPayload('ls')));
     await runHook(bridge, JSON.stringify(bashPayload('ls -la')));
+    await runHook(bridge, JSON.stringify(bashPayload('rm -rf .')));
     await runHook(
       bridge,
       JSON.stringify({
@@ -454,9 +476,14 @@ describe('the hook program', () => {
       bridge,
       JSON.stringify({ ...bashPayload('x'), tool_name: 'mcp__fs__write', tool_input: { p: 1 } })
     );
+    await runHook(
+      bridge,
+      JSON.stringify({ ...bashPayload('x'), tool_name: 'update_plan', tool_input: {} })
+    );
 
-    // Denied calls count too: the count says the hook ran, not that the tool did.
-    expect(bridge.hookCallCounts()).toEqual({ command: 2, file_change: 1, mcp: 1, other: 0 });
+    // A denied call is not counted: it leaves no tool item in Codex's stream,
+    // so counting it would let a later, unasked tool call pass as covered.
+    expect(bridge.allowedCallCounts()).toEqual({ command: 2, file_change: 1, mcp: 1, other: 1 });
   });
 
   test('answers concurrent calls independently', async () => {
@@ -476,11 +503,10 @@ describe('the hook program', () => {
   });
 
   test('a call still waiting when the bridge closes is denied', async () => {
-    const bridge = await openBridge(
-      mock<Gate>(() => new Promise<ToolActionDecision>(() => undefined))
-    );
+    const gate = mock<Gate>(() => new Promise<ToolActionDecision>(() => undefined));
+    const bridge = await openBridge(gate);
     const pending = runHook(bridge, JSON.stringify(bashPayload('git push')));
-    while (bridge.hookCallCounts().command === 0) {
+    while (gate.mock.calls.length === 0) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
 
@@ -637,7 +663,7 @@ describe('the Codex launcher', () => {
     expect(args).toContain(
       `hooks.PreToolUse=[{hooks = [{type = "command", command = ${JSON.stringify(handler.command)}, timeout = ${String(handler.timeout)}}]}]`
     );
-    expect(args).toContain('features.unified_exec=false');
+    expect(args).toContain('features.unified_exec_tty=false');
     expect(args).toContain('approval_policy="never"');
   });
 });

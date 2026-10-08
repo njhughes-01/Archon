@@ -106,8 +106,11 @@ export interface CodexToolGateBridge {
   readonly launcherPath: string;
   /** Merge into the run's Codex config: installs the hook and closes the ungated shell path. */
   readonly configOverrides: CodexConfigOverrides;
-  /** Hook calls received so far that carried the run's token, by kind of tool. */
-  hookCallCounts(): Readonly<Record<CodexToolCategory, number>>;
+  /**
+   * Tool calls this run's hook has let through so far, by kind of tool. Each
+   * is counted before its answer is sent, so before the tool can start.
+   */
+  allowedCallCounts(): Readonly<Record<CodexToolCategory, number>>;
   /** Stops answering, denies calls still waiting, and removes the directory. Safe to call twice. */
   close(): Promise<void>;
 }
@@ -234,8 +237,8 @@ export async function openCodexToolGateBridge(
       return undefined;
     }
     const translation = translateCodexHookCall(message.payload);
-    counts[translation.category] += 1;
     const verdict = await decide(translation, options.toolGate, timeouts.decisionTimeoutMs);
+    if (verdict.decision === 'allow') counts[translation.category] += 1;
     return `${JSON.stringify({ token, ...verdict })}\n`;
   }
 
@@ -345,17 +348,20 @@ export async function openCodexToolGateBridge(
           },
         ],
       },
-      // Unified exec lets the model start a shell through one hooked call and
-      // then feed it commands with `write_stdin`, which runs no hook. With it
-      // off, every command is its own hooked call.
-      features: { unified_exec: false },
+      // `write_stdin` runs no hook, and with a TTY the model can start a shell
+      // through one hooked call and then type anything into it (seen in a real
+      // run). Without a TTY Codex closes a command's stdin, so there is nothing
+      // to type into and every command is its own hooked call. Turning
+      // `unified_exec` itself off does not do this: the model catalog decides
+      // the shell tool, and the models in use keep unified exec either way.
+      features: { unified_exec_tty: false },
     };
 
     return {
       directory,
       launcherPath,
       configOverrides,
-      hookCallCounts: () => ({ ...counts }),
+      allowedCallCounts: () => ({ ...counts }),
       close,
     };
   } catch (error) {

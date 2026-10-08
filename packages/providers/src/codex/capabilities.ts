@@ -32,10 +32,11 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   //     the stream and stops the turn with `codex_tool_gate_inactive`.
   //   - The gate is told the session's working directory, not a directory the
   //     model may have chosen for one command.
-  // Gated turns run with `features.unified_exec=false`, because `write_stdin`
-  // to a running command is not hooked, and with Codex's hook-trust check
-  // bypassed for that invocation, so hooks the user has configured but not yet
-  // reviewed run as well.
+  // Gated turns run with `features.unified_exec_tty=false`, because
+  // `write_stdin` to a running command is not hooked and a TTY session would
+  // let the model type commands into an approved shell; and with Codex's
+  // hook-trust check bypassed for that invocation, so hooks the user has
+  // configured but not yet reviewed run as well.
   toolActionGate: true,
   structuredOutput: 'enforced', // SDK outputSchema grammar-constrains decoding
   requiresAllPropertiesRequired: true, // OpenAI strict-mode: every key in properties must appear in required

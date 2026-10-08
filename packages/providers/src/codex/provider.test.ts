@@ -2939,7 +2939,7 @@ describe('tool gate', () => {
     const options = gatedOptions();
     expect(Object.keys(options).sort()).toEqual(['codexPathOverride', 'config']);
     expect(Object.keys(options.config).sort()).toEqual(['features', 'hooks']);
-    expect(options.config.features).toEqual({ unified_exec: false });
+    expect(options.config.features).toEqual({ unified_exec_tty: false });
     expect(options.config.hooks.PreToolUse[0].hooks[0].type).toBe('command');
     expect(mockStartThread.mock.calls).toEqual([[EXPECTED_THREAD_OPTIONS]]);
     expect(launcherExisted).toBe(true);
@@ -3022,7 +3022,7 @@ describe('tool gate', () => {
     expect(MockCodex).toHaveBeenCalledTimes(2);
     expect(gatedOptions(1).codexPathOverride).toBe(gatedOptions(0).codexPathOverride);
     expect(gatedOptions(1).config.hooks).toEqual(gatedOptions(0).config.hooks);
-    expect(gatedOptions(1).config.features).toEqual({ unified_exec: false });
+    expect(gatedOptions(1).config.features).toEqual({ unified_exec_tty: false });
     expect('skills' in gatedOptions(1).config).toBe(false);
   });
 
@@ -3172,6 +3172,29 @@ describe('tool gate', () => {
 
     const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
 
+    expect(chunks.at(-1)).toMatchObject({
+      isError: true,
+      errorSubtype: 'codex_tool_gate_inactive',
+    });
+  });
+
+  test('a denied call does not cover a tool that then runs unasked', async () => {
+    const gate = mock<Gate>(() => Promise.resolve(DENY));
+    mockRunStreamed.mockImplementation(() =>
+      Promise.resolve({
+        events: (async function* () {
+          // The hook ran and said no; Codex shows no item for a denied call.
+          // A command item after it therefore had no approval behind it.
+          await callHook('Bash', { command: 'git push origin main' });
+          yield { type: 'item.started', item: commandItem('c1') };
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      })
+    );
+
+    const chunks = await collect({ toolGate: gate });
+
+    expect(gate).toHaveBeenCalledTimes(1);
     expect(chunks.at(-1)).toMatchObject({
       isError: true,
       errorSubtype: 'codex_tool_gate_inactive',

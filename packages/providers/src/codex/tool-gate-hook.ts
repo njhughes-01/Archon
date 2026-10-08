@@ -59,9 +59,11 @@ async function readStdin() {
 }
 
 async function main() {
+  // Read first: every exit below then happens after Codex has finished writing.
+  const input = await readStdin();
   const token = readFileSync(path.join(directory, 'token'), 'utf8').trim();
   if (token === '') block(UNREACHABLE);
-  const payload = JSON.parse(await readStdin());
+  const payload = JSON.parse(input);
   const socket = net.connect(path.join(directory, 'gate.sock'));
   let buffer = '';
   socket.setEncoding('utf8');
@@ -109,7 +111,9 @@ export function renderHookWrapper(options: {
   programPath: string;
   deadlineMs: number;
 }): string {
-  const blocked = `echo ${shellQuote(GATE_UNREACHABLE_REASON)} >&2; exit ${String(HOOK_BLOCK_EXIT_CODE)}`;
+  // Reads whatever is left of the payload before exiting, so Codex is never
+  // left writing to a hook that has gone.
+  const blocked = `cat > /dev/null 2>&1; echo ${shellQuote(GATE_UNREACHABLE_REASON)} >&2; exit ${String(HOOK_BLOCK_EXIT_CODE)}`;
   return `#!/bin/sh
 # Archon tool gate hook for Codex. Written per run; removed when the run ends.
 cd ${shellQuote(options.directory)} || { ${blocked}; }

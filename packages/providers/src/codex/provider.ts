@@ -454,7 +454,7 @@ const HOOKED_ITEM_TYPES: ReadonlySet<string> = new Set([
   'mcp_tool_call',
 ]);
 
-/** The hook calls those items come from. `other` tools have no stream item. */
+/** The kinds of hook call those items come from. `other` tools have no stream item. */
 const HOOKED_ITEM_CATEGORIES: readonly CodexToolCategory[] = ['command', 'file_change', 'mcp'];
 
 const TOOL_GATE_INACTIVE_MESSAGE =
@@ -468,10 +468,10 @@ const TOOL_GATE_INACTIVE_MESSAGE =
  *
  * The hook is Codex's to run, and Codex skips it without an error when hooks
  * are disabled, untrusted or unknown to that version. So its running is
- * observed rather than assumed: every hook call reaches the bridge before its
- * tool starts, hence before the tool's item appears in the stream, and a
- * denied call leaves no item. More tool items than hook calls therefore means
- * one ran without the gate.
+ * observed rather than assumed: the bridge counts a call it lets through
+ * before answering the hook, hence before the tool's item can appear in the
+ * stream, and a denied call leaves no item. More tool items than calls let
+ * through therefore means one ran without the gate.
  *
  * The count is not kept per kind of tool: Codex applies a patch the model
  * pipes to `apply_patch` in the shell itself, so a `Bash` hook call can
@@ -483,18 +483,18 @@ interface ToolGateMonitor {
 }
 
 function createToolGateMonitor(bridge: CodexToolGateBridge): ToolGateMonitor {
-  const hookCalls = (): number => {
-    const counts = bridge.hookCallCounts();
+  const allowedCalls = (): number => {
+    const counts = bridge.allowedCallCounts();
     return HOOKED_ITEM_CATEGORIES.reduce((total, category) => total + counts[category], 0);
   };
   // Calls from an earlier attempt of the same request must not cover this one.
-  const baseline = hookCalls();
+  const baseline = allowedCalls();
   const seen = new Set<string>();
   return {
     ranUngated(itemType, itemId): boolean {
       if (!HOOKED_ITEM_TYPES.has(itemType)) return false;
       seen.add(itemId);
-      return seen.size > hookCalls() - baseline;
+      return seen.size > allowedCalls() - baseline;
     },
   };
 }
