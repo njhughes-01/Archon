@@ -11,6 +11,3 @@ FAIL	example.com/crawler/internal/fetch	0.022s
 2026/02/11 17:03:19 open /workspace/testdata/pages/index.html: too many open files
 FAIL	example.com/crawler/internal/parse	0.009s
 FAIL
-
-$ ulimit -n
-64

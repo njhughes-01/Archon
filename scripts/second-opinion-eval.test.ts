@@ -434,11 +434,10 @@ describe('the shipped fixture', () => {
         lines: true,
       });
       // A log that names its own label would be answering the question for the classifier.
+      // A runner's own word for a retried test is evidence, not a label, and stays.
       expect({
         log: log.name,
-        named: /code_defect|flaky_test|dependency_failure|environment_failure|flaky/i.test(
-          log.text
-        ),
+        named: /code_defect|flaky_test|dependency_failure|environment_failure/i.test(log.text),
       }).toEqual({
         log: log.name,
         named: false,

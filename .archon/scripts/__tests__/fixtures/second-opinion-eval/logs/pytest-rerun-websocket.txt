@@ -21,6 +21,3 @@ INFO     realtime.client:client.py:104 resubscribed: orders, stock
 =========================== short test summary info ============================
 FAILED tests/realtime/test_reconnect.py::test_client_resubscribes_after_reconnect - AssertionError: assert set() == {'orders', 'stock'}
 1 failed, 15 passed, 2 rerun in 3.91s
-rerun 1: reconnected after 0.21s, assertion read at 0.20s -> failed
-rerun 2: reconnected after 0.23s, assertion read at 0.20s -> failed
-the same test passed on the previous 6 runs of this job (reconnected after 0.16s to 0.19s)

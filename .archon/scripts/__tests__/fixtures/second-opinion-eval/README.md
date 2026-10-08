@@ -10,8 +10,8 @@ repository ignores `*.log`:
   linter errors at the project's own lines, an exception thrown from the
   project's own function;
 - timing- and order-dependent tests: a pass on retry, a failure under one random
-  order, a run that crossed midnight, a sleep racing a timer, a bound on a random
-  sample;
+  order, an expectation on today's date, a sleep racing a timer, a bound on a
+  random sample;
 - dependency failures: a package that cannot be found or imported, a lockfile
   that disagrees with its manifest, a version that does not exist, versions that
   conflict, a native module built for another runtime;
@@ -36,13 +36,21 @@ tail of `validation.md` itself, which wraps that output in a few lines of
 Markdown: the check's name, its command and its exit status. The evaluation does
 not reproduce that wrapper.
 
-A single failing run cannot show that a test is intermittent, so a log is only
-classifiable as timing- or order-dependent when the log itself shows it. These do:
-through a runner's retry output, a random seed, timestamps, or a line a wrapper
-script printed about earlier runs. A real intermittent failure whose log shows
-none of that reads as a code defect, to a classifier and to a person.
+Each log holds what the command itself printed and nothing added afterwards: no
+diagnosis, no shell commands run after the failure, no note about earlier runs.
+One code-defect log starts with the changed-files list its gate script prints.
 
-No log names its own class, and none contains a credential: the evaluation's
+A single failing run often cannot show that a test is intermittent, so a log is
+only classifiable as timing- or order-dependent when its own output shows it.
+These do, the way real runners show it: a retry that passed, repeated runs of one
+test that disagree, a random-order seed beside leftover state, an assertion on
+elapsed time or on the clock, a wait that gave up. That makes this class easier
+here than in the field. A real intermittent failure whose log shows none of that
+reads as a code defect, to a classifier and to a person, and a timeout labelled
+here as timing can in the field be a defect that never calls back.
+
+No log names its own class (one carries a runner's own word for a retried test),
+and none contains a credential: the evaluation's
 tests check that each is sent exactly as written, with nothing for the redaction
 to remove. Nothing here is real output from a real project, and no file is named
 like a test, so the repository's own test, lint and type-check runs pass over it.

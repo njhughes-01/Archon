@@ -25,5 +25,3 @@ A worker process has failed to exit gracefully and has been force exited. This i
 Test Suites: 1 failed, 1 passed, 2 total
 Tests:       1 failed, 22 passed, 23 total
 Time:        11.02 s
-
-history: this test passed in 19 of the last 20 runs of this suite on the same commit

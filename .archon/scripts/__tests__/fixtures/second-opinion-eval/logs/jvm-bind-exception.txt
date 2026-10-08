@@ -24,6 +24,3 @@ Caused by: org.springframework.boot.web.server.PortInUseException: Port 8080 is 
 Caused by: java.net.BindException: Address already in use
 	at java.base/sun.nio.ch.Net.bind0(Native Method)
 	at java.base/sun.nio.ch.Net.bind(Net.java:565)
-
-$ ss -ltnp | grep 8080
-LISTEN 0 4096 *:8080 *:* users:(("java",pid=4377,fd=12))

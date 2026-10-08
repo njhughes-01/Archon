@@ -1,112 +1,100 @@
 {
   "logs": {
-    "jest-cart-total.txt": {
+    "bun-undefined-member.txt": {
       "class": "code_defect",
-      "why": "Two assertions report expected values that differ from the ones received, in the test of a file the change touched."
-    },
-    "pytest-slugify.txt": {
-      "class": "code_defect",
-      "why": "An assertion with a string diff: the function returns the wrong value for a fixed input."
-    },
-    "go-parse-duration.txt": {
-      "class": "code_defect",
-      "why": "Table-driven subtests report got/want mismatches from a pure function."
+      "why": "A TypeError thrown from the project's own function on an input the test supplies."
     },
     "cargo-page-count.txt": {
       "class": "code_defect",
       "why": "An assert_eq panic (left 5, right 4) at a line of the crate's own source: an off-by-one."
     },
-    "tsc-argument-type.txt": {
-      "class": "code_defect",
-      "why": "The type checker reports errors at files and lines of the project's own source."
-    },
     "eslint-floating-promise.txt": {
       "class": "code_defect",
       "why": "The linter reports rule violations at files and lines of the project's own source."
     },
-    "rspec-invoice-number.txt": {
+    "go-parse-duration.txt": {
       "class": "code_defect",
-      "why": "Expected and got strings differ for a deterministic formatting method."
+      "why": "Table-driven subtests report got/want mismatches from a pure function."
+    },
+    "jest-cart-total.txt": {
+      "class": "code_defect",
+      "why": "Two assertions report expected values that differ from the ones received, in the test of a file the change touched."
     },
     "junit-stock-reservation.txt": {
       "class": "code_defect",
       "why": "AssertionFailedError with expected 12 but was 9, from the project's own test of its own logic."
     },
-    "bun-undefined-member.txt": {
+    "mypy-return-type.txt": {
       "class": "code_defect",
-      "why": "A TypeError thrown from the project's own function on an input the test supplies."
+      "why": "The type checker reports incompatible types at lines of the project's own source."
+    },
+    "pytest-slugify.txt": {
+      "class": "code_defect",
+      "why": "An assertion with a string diff: the function returns the wrong value for a fixed input."
+    },
+    "rspec-invoice-number.txt": {
+      "class": "code_defect",
+      "why": "Expected and got strings differ for a deterministic formatting method."
+    },
+    "tsc-argument-type.txt": {
+      "class": "code_defect",
+      "why": "The type checker reports errors at files and lines of the project's own source."
     },
     "xunit-shipping-rate.txt": {
       "class": "code_defect",
       "why": "Assert.Equal failure with expected and actual amounts from a pure calculation."
     },
-    "mypy-return-type.txt": {
-      "class": "code_defect",
-      "why": "The type checker reports incompatible types at lines of the project's own source."
-    },
-    "playwright-retry-passed.txt": {
+    "cypress-detached-element.txt": {
       "class": "flaky_test",
-      "why": "The test timed out waiting for a button on its first attempt and passed on the retry, unchanged."
-    },
-    "jest-debounce-timeout.txt": {
-      "class": "flaky_test",
-      "why": "A test waiting on a debounce timer exceeded its timeout; the same test passed in 19 of the last 20 runs on the same commit."
-    },
-    "pytest-random-order.txt": {
-      "class": "flaky_test",
-      "why": "Fails only under a random order that runs another file first; passes alone and in default order."
+      "why": "Three attempts, the last failing because the element was re-rendered while the click was in flight."
     },
     "go-count-intermittent.txt": {
       "class": "flaky_test",
-      "why": "The same test passed 8 of 10 repeated runs; it sleeps 50ms and reads a counter a 40ms ticker updates."
+      "why": "The same test passed four of six repeated runs and failed two, each time reading a counter after a fixed 50ms."
     },
-    "rspec-midnight-boundary.txt": {
+    "jest-debounce-timeout.txt": {
       "class": "flaky_test",
-      "why": "The expectation reads the current date and the run crossed midnight between creating the record and checking it."
+      "why": "A test waiting on a debounce timer exceeded its timeout, with an act() warning and a worker that would not exit: a wait that was not ready in time."
     },
-    "cypress-detached-element.txt": {
+    "jest-snapshot-timestamp.txt": {
       "class": "flaky_test",
-      "why": "Two attempts failed on a re-rendered element and a late message, the third passed; the gate fails on any retry."
+      "why": "Expected and received differ only in a timestamp taken from the clock one millisecond apart."
     },
     "junit-elapsed-budget.txt": {
       "class": "flaky_test",
-      "why": "Asserts on wall-clock elapsed time around a sleep; failed 3 of its last 50 runs on the same assertion."
+      "why": "Asserts that wall-clock time around a 100ms wait stays under 120ms; it was 163ms."
     },
-    "vitest-random-sample.txt": {
+    "playwright-retry-passed.txt": {
       "class": "flaky_test",
-      "why": "Asserts a tight bound on a share computed from 100 freshly generated random ids."
+      "why": "The test timed out waiting for a button to become enabled and passed on a retry; the runner reports it as flaky and was told to fail on that."
     },
-    "bun-leftover-rows.txt": {
+    "pytest-random-order.txt": {
       "class": "flaky_test",
-      "why": "Under one random seed another test file's row is still in the shared table; with the neighbouring seed everything passes."
-    },
-    "xunit-eventually-poll.txt": {
-      "class": "flaky_test",
-      "why": "A polling assertion gave up after 500ms and the same test passed on an immediate rerun."
+      "why": "Under a random test order the registry already holds entries when the test that expects it empty runs: state another test left behind."
     },
     "pytest-rerun-websocket.txt": {
       "class": "flaky_test",
-      "why": "The assertion is read after a fixed 0.2s sleep while the reconnect takes 0.16s to 0.23s; it passed on the previous six runs."
+      "why": "The assertion is read after a fixed 0.2s sleep and the captured log shows the reconnect took 0.21s; it failed through two reruns."
     },
-    "node-module-not-found.txt": {
-      "class": "dependency_failure",
-      "why": "ERR_MODULE_NOT_FOUND for a third-party package before any test body runs."
+    "rspec-midnight-boundary.txt": {
+      "class": "flaky_test",
+      "why": "The expectation compares against Date.today and is off by exactly one day."
+    },
+    "vitest-random-sample.txt": {
+      "class": "flaky_test",
+      "why": "Asserts a tight bound on a share computed from 100 freshly generated random ids, and missed it by 0.01."
+    },
+    "xunit-eventually-poll.txt": {
+      "class": "flaky_test",
+      "why": "A polling assertion gave up at 500ms; the captured output shows the delivery landing at 531ms."
     },
     "bun-frozen-lockfile.txt": {
       "class": "dependency_failure",
-      "why": "The frozen lockfile disagrees with the manifest's version range."
+      "why": "The frozen lockfile would change: it disagrees with the manifest."
     },
-    "npm-eresolve-peer.txt": {
+    "bundler-locked-version.txt": {
       "class": "dependency_failure",
-      "why": "ERESOLVE: a package's peer dependency range conflicts with the installed major version."
-    },
-    "pip-no-matching-distribution.txt": {
-      "class": "dependency_failure",
-      "why": "A pinned version does not exist among the published versions."
-    },
-    "pytest-import-error.txt": {
-      "class": "dependency_failure",
-      "why": "ModuleNotFoundError for a third-party module during collection."
+      "why": "Version solving failed, and the locked gem version can no longer be found."
     },
     "cargo-version-conflict.txt": {
       "class": "dependency_failure",
@@ -116,65 +104,77 @@
       "class": "dependency_failure",
       "why": "go.sum has no entry for imported third-party modules."
     },
-    "bundler-locked-version.txt": {
-      "class": "dependency_failure",
-      "why": "Version solving failed, and the locked gem version can no longer be found."
-    },
     "maven-missing-artifact.txt": {
       "class": "dependency_failure",
-      "why": "A requested artifact version was never published; the registry answered and the newest version is lower."
+      "why": "A requested artifact version cannot be found in the registry, which answered: the version is absent."
+    },
+    "node-module-not-found.txt": {
+      "class": "dependency_failure",
+      "why": "ERR_MODULE_NOT_FOUND for a third-party package before any test body runs."
     },
     "node-native-abi-mismatch.txt": {
       "class": "dependency_failure",
       "why": "A native module was compiled against a different runtime ABI version than the one running."
     },
+    "npm-eresolve-peer.txt": {
+      "class": "dependency_failure",
+      "why": "ERESOLVE: a package's peer dependency range conflicts with the installed major version."
+    },
+    "pip-no-matching-distribution.txt": {
+      "class": "dependency_failure",
+      "why": "A pinned version does not exist among the published versions."
+    },
     "pnpm-outdated-lockfile.txt": {
       "class": "dependency_failure",
       "why": "The lockfile's specifiers do not match the manifest under a frozen install."
     },
-    "node-port-in-use.txt": {
-      "class": "environment_failure",
-      "why": "EADDRINUSE: another process already listens on the port the test server needs."
-    },
-    "postgres-connection-refused.txt": {
-      "class": "environment_failure",
-      "why": "ECONNREFUSED to the local database port in global setup; no test ran."
-    },
-    "missing-env-variable.txt": {
-      "class": "environment_failure",
-      "why": "The app under test exits because a required environment variable is not set on this machine."
+    "pytest-import-error.txt": {
+      "class": "dependency_failure",
+      "why": "ModuleNotFoundError for a third-party module during collection."
     },
     "disk-full.txt": {
       "class": "environment_failure",
-      "why": "The compiler cannot write its output: no space left on device, and the filesystem is at 100%."
-    },
-    "permission-denied.txt": {
-      "class": "environment_failure",
-      "why": "Fixture setup cannot create a directory owned by root while running as an unprivileged user."
-    },
-    "out-of-memory-killed.txt": {
-      "class": "environment_failure",
-      "why": "The worker was SIGKILLed and the kernel log shows the out-of-memory killer took it."
+      "why": "The compiler cannot write its output: no space left on device."
     },
     "docker-daemon-unreachable.txt": {
       "class": "environment_failure",
       "why": "The container-backed test cannot find a Docker socket on the machine."
     },
-    "registry-dns-failure.txt": {
+    "go-too-many-open-files.txt": {
       "class": "environment_failure",
-      "why": "Name resolution for the package registry fails and the configured name server does not answer: the network, not the package."
+      "why": "Sockets and files cannot be opened: too many open files."
+    },
+    "jvm-bind-exception.txt": {
+      "class": "environment_failure",
+      "why": "The application cannot start because port 8080 is already in use."
+    },
+    "missing-env-variable.txt": {
+      "class": "environment_failure",
+      "why": "The app under test exits because a required environment variable is not set."
+    },
+    "node-port-in-use.txt": {
+      "class": "environment_failure",
+      "why": "EADDRINUSE: another process already listens on the port the test server needs."
+    },
+    "out-of-memory-killed.txt": {
+      "class": "environment_failure",
+      "why": "The test worker was terminated by another process with SIGKILL."
+    },
+    "permission-denied.txt": {
+      "class": "environment_failure",
+      "why": "Fixture setup cannot create a directory under /var/lib: permission denied."
+    },
+    "postgres-connection-refused.txt": {
+      "class": "environment_failure",
+      "why": "ECONNREFUSED to the local database port in global setup; no test ran."
     },
     "redis-unreachable.txt": {
       "class": "environment_failure",
       "why": "Every test errors in setup with connection refused to the local cache service."
     },
-    "go-too-many-open-files.txt": {
+    "registry-dns-failure.txt": {
       "class": "environment_failure",
-      "why": "Sockets and files cannot be opened under a process file-descriptor limit of 64."
-    },
-    "jvm-bind-exception.txt": {
-      "class": "environment_failure",
-      "why": "The application cannot start because another process holds port 8080."
+      "why": "Name resolution for the package registry fails (EAI_AGAIN): the network, not the package."
     }
   }
 }

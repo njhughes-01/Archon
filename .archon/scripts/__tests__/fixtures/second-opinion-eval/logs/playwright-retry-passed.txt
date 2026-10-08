@@ -1,4 +1,4 @@
-$ npx playwright test --retries=2 --reporter=line
+$ npx playwright test --retries=2 --fail-on-flaky-tests --reporter=line
 Running 48 tests using 4 workers
 
   1) [chromium] › tests/checkout.spec.ts:31:5 › checkout › shows the order summary after payment
@@ -18,13 +18,7 @@ Running 48 tests using 4 workers
     > 40 |     await page.getByRole('button', { name: 'Place order' }).click();
          |                                                             ^
 
-    Retry #1 ───────────────────────────────────────────────────────────────
-
-  ✓  [chromium] › tests/checkout.spec.ts:31:5 › checkout › shows the order summary after payment (retry #1) (4.2s)
-
+  1 flaky
+    [chromium] › tests/checkout.spec.ts:31:5 › checkout › shows the order summary after payment
   47 passed (1.6m)
-  1 passed after a retry
-      [chromium] › tests/checkout.spec.ts:31:5 › checkout › shows the order summary after payment
-
-ci-gate: a test needed a retry to pass; retried tests fail this gate
 error: script "e2e" exited with code 1

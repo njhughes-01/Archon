@@ -5,26 +5,34 @@ $ npx cypress run --spec cypress/e2e/inbox.cy.ts
     ✓ lists unread conversations first (812ms)
     (Attempt 1 of 3) archives a conversation from the list
     (Attempt 2 of 3) archives a conversation from the list
-    ✓ archives a conversation from the list (2140ms)
+    1) archives a conversation from the list
     ✓ restores an archived conversation (1033ms)
 
-  3 passing (9s)
+  2 passing (19s)
+  1 failing
 
-  Attempt 1 of 3 failed:
+  1) inbox
+       archives a conversation from the list:
      CypressError: Timed out retrying after 4000ms: `cy.click()` failed because the page updated while this command was executing. It expected to find the element still attached to the DOM, but it had been re-rendered.
+
+Cypress requires elements be attached in the DOM to interact with them.
+
+The previous command that ran was:
+
+  > `cy.contains()`
+
+This DOM element likely became detached somewhere between the previous and current command.
       at cypress/e2e/inbox.cy.ts:27:48
-  Attempt 2 of 3 failed:
-     AssertionError: Timed out retrying after 4000ms: Expected to find content: 'Conversation archived' but never did.
-      at cypress/e2e/inbox.cy.ts:28:12
-  Attempt 3 of 3 passed.
 
   (Results)
+
   ┌────────────────────────────────────────────────────────────────────────────┐
   │ Tests:        3                                                            │
-  │ Passing:      3                                                            │
-  │ Failing:      0                                                            │
-  │ Retried:      1                                                            │
+  │ Passing:      2                                                            │
+  │ Failing:      1                                                            │
+  │ Pending:      0                                                            │
+  │ Skipped:      0                                                            │
+  │ Screenshots:  3                                                            │
+  │ Duration:     19 seconds                                                   │
+  │ Spec Ran:     inbox.cy.ts                                                  │
   └────────────────────────────────────────────────────────────────────────────┘
-
-verify-e2e: 1 test passed only after retrying; the gate requires a clean first attempt
-error: script "verify-e2e" exited with code 1

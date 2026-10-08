@@ -7,8 +7,6 @@ RateLimiterTest > refillsOneTokenPerInterval() FAILED
         at org.junit.jupiter.api.Assertions.assertTrue(Assertions.java:214)
         at com.acme.cache.RateLimiterTest.refillsOneTokenPerInterval(RateLimiterTest.java:41)
 
-    Thread.sleep(100) returned after 163 ms (wall clock)
-
 41 tests completed, 1 failed
 
 > Task :cache:test FAILED
@@ -20,5 +18,3 @@ Execution failed for task ':cache:test'.
 > There were failing tests. See the report at: file:///workspace/cache/build/reports/tests/test/index.html
 
 BUILD FAILED in 14s
-
-test-history: RateLimiterTest.refillsOneTokenPerInterval failed 3 of its last 50 runs on main, each time on the elapsed-time assertion

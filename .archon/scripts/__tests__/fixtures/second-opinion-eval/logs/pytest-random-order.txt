@@ -26,6 +26,3 @@ tests/plugins/test_registry.py:21: AssertionError
 =========================== short test summary info ============================
 FAILED tests/plugins/test_registry.py::test_registry_starts_empty - AssertionError: assert ['csv-export', 'pdf-export'] == []
 ======================== 1 failed, 117 passed in 6.02s =========================
-note: the two extra names are registered by tests/plugins/test_loader.py, which this seed ran first
-note: `pytest tests/plugins/test_registry.py` on its own: 4 passed
-note: rerun with -p randomly -p "randomly_seed=1" (default file order): 118 passed

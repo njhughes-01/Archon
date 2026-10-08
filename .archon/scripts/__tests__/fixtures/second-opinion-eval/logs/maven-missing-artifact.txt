@@ -11,7 +11,6 @@ $ mvn -B verify
 [INFO] ------------------------------------------------------------------------
 [ERROR] Failed to execute goal on project pricing-service: Could not resolve dependencies for project com.acme:pricing-service:jar:1.14.0-SNAPSHOT: The following artifacts could not be resolved: com.acme:money-types:jar:2.7.0 (absent): Could not find artifact com.acme:money-types:jar:2.7.0 in central (https://repo.maven.apache.org/maven2) -> [Help 1]
 [ERROR]
-[ERROR] The newest published version of com.acme:money-types is 2.6.4.
 [ERROR]
 [ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
 [ERROR] Re-run Maven using the -X switch to enable full debug logging.

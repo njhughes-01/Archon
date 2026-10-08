@@ -260,23 +260,31 @@ answers from the answer key and sends nothing. See
 [`scripts/second-opinion-eval.ts`](../../../scripts/second-opinion-eval.ts).
 
 That measures whether the classifier names the right kind of failure. It does
-not measure whether an agent that is handed the opinion makes fewer unnecessary
-edits, and no unit test or classifier evaluation can: that is a property of
-whole runs. To measure it, run paired workflows by hand:
+not measure whether the opinion leads to fewer unnecessary edits, and no unit
+test or classifier evaluation can: that is a property of whole runs.
+
+It is also a property the bundled workflows only reach indirectly. The opinion
+is read by `classify`, which edits nothing. No agent that edits code reads it in
+the same run: in `archon-deliver`, validation is the last local gate, an
+`introduced` red stops the run there, and the corrections that follow CI work
+from CI's results. The opinion's one route to an edit is through the
+`red_cause` and `summary` that `classify` writes, which the operator or the next
+run acts on. So the measurement has two halves, run by hand:
 
 1. Prepare a small repository with a passing gate, and four or more seeded
    reds that need no code change: a port another process holds, a database that
    is down, a lockfile out of step with its manifest, a test that fails one run
    in five. Add as many seeded real defects, so that "never edit" is not the
-   winning strategy.
-2. For each seed, start two runs of a workflow that validates and then corrects
-   (`archon-deliver` from the same starting commit), one with
-   `JEV_OPINION_ENABLED=0` and one with the opinion on. Repeat each pair at
-   least three times; agent runs vary.
-3. For each run record: the `red_cause` validation declared and whether it
-   matches the seed; the files the correction step changed (`git diff --stat`
-   against the starting commit); and whether the gate was green afterwards.
-4. Count an edit as unnecessary when the seed needed no code change and the run
+   winning answer.
+2. For each seed, run `archon-validate` on that checkout twice, once with
+   `JEV_OPINION_ENABLED=0` and once with the opinion on. Repeat each pair at
+   least three times; agent runs vary. Record the `red_cause` and `summary` each
+   run declares, and whether the cause matches the seed.
+3. Hand each run's `summary` to the same fixing run, for instance
+   `archon-implement` with the summary as its brief, from the same starting
+   commit. Record the files it changed (`git diff --stat`) and whether the gate
+   was green afterwards.
+4. Count an edit as unnecessary when the seed needed no code change and the fix
    changed code anyway. Compare that count, and the count of real defects left
    unfixed, between the two arms.
 

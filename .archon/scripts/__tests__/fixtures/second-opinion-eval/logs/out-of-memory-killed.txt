@@ -15,7 +15,3 @@ A jest worker process (pid=48213) was terminated by another process: signal=SIGK
 Test Suites: 1 failed, 2 passed, 3 total
 Tests:       31 passed, 31 total
 Time:        48.2 s
-
-$ dmesg | tail -2
-[812331.204417] Out of memory: Killed process 48213 (node) total-vm:9843212kB, anon-rss:3981440kB, file-rss:0kB, shmem-rss:0kB, UID:1001 pgtables:21412kB oom_score_adj:0
-[812331.391102] oom_reaper: reaped process 48213 (node), now anon-rss:0kB, file-rss:0kB, shmem-rss:0kB

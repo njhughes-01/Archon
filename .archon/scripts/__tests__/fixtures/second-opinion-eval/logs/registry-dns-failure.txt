@@ -5,14 +5,3 @@ npm error syscall getaddrinfo
 npm error errno EAI_AGAIN
 npm error request to https://registry.npmjs.org/typescript/-/typescript-5.5.3.tgz failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org
 npm error A complete log of this run can be found in: /home/ci/.npm/_logs/2026-06-21T03_40_55_902Z-debug-0.log
-
-$ getent hosts registry.npmjs.org
-$ echo $?
-2
-$ cat /etc/resolv.conf
-nameserver 10.0.0.2
-$ ping -c1 -W2 10.0.0.2
-PING 10.0.0.2 (10.0.0.2) 56(84) bytes of data.
-
---- 10.0.0.2 ping statistics ---
-1 packets transmitted, 0 received, 100% packet loss, time 0ms

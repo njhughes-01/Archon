@@ -20,4 +20,3 @@ E   PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
 ERROR tests/test_export.py::test_export_writes_one_file - PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
 ERROR tests/test_export.py::test_export_overwrites_stale - PermissionError: [Errno 13] Permission denied: '/var/lib/exports'
 22 passed, 2 errors in 1.07s
-running as uid=1001(ci); /var/lib/exports is owned by root:root, mode 0755

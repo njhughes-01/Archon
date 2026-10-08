@@ -644,7 +644,7 @@ An unusable number makes the classification report `unavailable` and name the va
 
 ### Second opinion -- Jev (optional)
 
-When a project gate goes red in `archon-validate`, a classifier can say which kind of failure the record shows before the agent that classifies the red reads it: `code_defect`, `flaky_test`, `dependency_failure` or `environment_failure`. The agent gets that answer as a hypothesis to check first, which is meant to keep it from editing code over a failure the machine or a package caused. It uses the same [Jev](https://docs.typesafe.ai/) key, endpoint and model as the context scout.
+When a project gate goes red in `archon-validate`, a classifier can say which kind of failure the record shows before the agent that classifies the red reads it: `code_defect`, `flaky_test`, `dependency_failure` or `environment_failure`. The agent gets that answer as a hypothesis to check first, which is meant to keep a failure the machine or a package caused from being written up as a defect and sent back for a code fix. It uses the same [Jev](https://docs.typesafe.ai/) key, endpoint and model as the context scout.
 
 **It is advisory.** The agent must verify the answer against the log before acting on it, and where the two disagree the log wins and the agent says so in its summary. No class decides the validation verdict: the agent still declares `red_cause` under the same evidence rules, and a failure the classifier calls an environment failure is not thereby one. The validation result carries the class as `advisory_failure_class`, beside `red_cause`, only when a classifier answered. Nothing in the bundled workflows reads that field to decide anything. `confidence` reports how concentrated the classifier's answer was, not the chance that it is right.
 
@@ -662,7 +662,7 @@ With a key set, a red gate adds one classifier request before the agent starts, 
 
 `JEV_API_KEY`, `JEV_ENABLED`, `JEV_API_BASE` and `JEV_MODEL` are shared with the scout and listed above. An unusable number makes the step report `unavailable` and name the variable; it never falls back to the default.
 
-Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it; the SDLC pack's README describes the paired runs that would.
+Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it, and has not been measured: no agent that edits code reads the opinion in the same run, so its effect reaches an edit only through the cause and summary the classifying agent writes. The SDLC pack's README describes the paired runs that would measure it.
 
 ### Telemetry
 

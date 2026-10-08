@@ -24,5 +24,3 @@ AssertionError: expected 0.61 to be less than 0.6
  Test Files  1 failed | 1 passed (2)
       Tests  1 failed | 9 passed (10)
    Duration  1.12s
-
- the sample is 100 freshly generated random ids on every run; the share of 'B' varies between runs
