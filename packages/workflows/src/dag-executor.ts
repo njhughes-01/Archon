@@ -169,6 +169,8 @@ import {
   type IncludeCommandContent,
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
+import { providerReadsWebSearchMode, unsupportedNodeFields } from './node-capability-checks';
+import { collectCredentialValues, redactCredentialValues } from './redaction';
 import {
   logNodeComplete,
   logAssistant,
@@ -1691,15 +1693,10 @@ async function resolveNodeProviderAndModel(
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
 
-  // `webSearchMode:` is Codex's alone — no other provider reads it, and #2556
-  // decided it keeps no node-level form, making it the single workflow-level
-  // field with no per-node counterpart. There is deliberately no
-  // ProviderCapabilities axis for one provider's one field.
-  //
-  // Reasoning depth is NOT in this category any more: the loader translates the
-  // deprecated `modelReasoningEffort:` into `effort:`, so the executor sees one
-  // provider-agnostic field and needs no Codex branch for it.
-  const isCodex = provider === 'codex';
+  // Reasoning depth needs no provider branch: the loader translates the deprecated
+  // `modelReasoningEffort:` into `effort:`, so the executor sees one provider-agnostic
+  // field. `webSearchMode:` is the one field that still does.
+  const readsWebSearchMode = providerReadsWebSearchMode(provider);
 
   // The one reasoning depth this node will run at, before any preset fallback.
   const declaredEffort = resolution.declaredEffort;
@@ -1716,43 +1713,15 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  // Capability warnings — inform users when features are unsupported
-  const capChecks: [string, keyof ProviderCapabilities, boolean][] = [
-    [
-      'allowed_tools/denied_tools',
-      'toolRestrictions',
-      node.allowed_tools !== undefined || node.denied_tools !== undefined,
-    ],
-    ['hooks', 'hooks', node.hooks !== undefined],
-    ['mcp', 'mcp', node.mcp !== undefined],
-    ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
-    ['agents', 'agents', node.agents !== undefined],
-    ['effort', 'effortControl', declaredEffort !== undefined],
-    ['maxBudgetUsd', 'costControl', node.maxBudgetUsd !== undefined],
-    [
-      'fallbackModel',
-      'fallbackModel',
-      (node.fallbackModel ?? workflowLevelOptions.fallbackModel) !== undefined,
-    ],
-    ['sandbox', 'sandbox', (node.sandbox ?? workflowLevelOptions.sandbox) !== undefined],
-    ['settingSources', 'settingSources', node.settingSources !== undefined],
-    ['env', 'envInjection', (config.envVars && Object.keys(config.envVars).length > 0) === true],
-  ];
-
-  const unsupported: string[] = [];
-  for (const [field, cap, isSet] of capChecks) {
-    if (isSet && !caps[cap]) {
-      unsupported.push(field);
-    }
-  }
-
-  // `webSearchMode` has no ProviderCapabilities axis, so capChecks above cannot
-  // see it. Surfacing it here reuses the existing loud-mismatch path so a
-  // workflow that declares it on a node that cannot read it gets the same
-  // warning every other capability mismatch produces, instead of a silent no-op.
-  if (!isCodex && workflowLevelOptions.webSearchMode !== undefined) {
-    unsupported.push('webSearchMode');
-  }
+  // Capability warnings — inform users when features are unsupported. The list lives in
+  // node-capability-checks.ts, which the model router also reads.
+  const unsupported = unsupportedNodeFields(node, provider, caps, {
+    declaredEffort,
+    workflowFallbackModel: workflowLevelOptions.fallbackModel,
+    workflowSandbox: workflowLevelOptions.sandbox,
+    webSearchMode: workflowLevelOptions.webSearchMode,
+    hasEnvVars: (config.envVars && Object.keys(config.envVars).length > 0) === true,
+  });
 
   if (unsupported.length > 0) {
     getLog().warn({ nodeId: node.id, provider, unsupported }, 'dag.unsupported_capabilities');
@@ -1839,7 +1808,7 @@ async function resolveNodeProviderAndModel(
   applyPresetOptions(provider, effectivePreset, node, declaredEffort, nodeConfig);
   // `webSearchMode:` has no node-level form and no other consumer, so the
   // workflow-level value is the only value — written only where it is read.
-  if (isCodex && workflowLevelOptions.webSearchMode !== undefined) {
+  if (readsWebSearchMode && workflowLevelOptions.webSearchMode !== undefined) {
     assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
   }
 
@@ -3300,36 +3269,6 @@ function isSubprocessTimeout(error: RawSubprocessRejection): boolean {
   return error.killed === true && error.code === null;
 }
 
-const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
-const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
-
-function collectSubprocessCredentialValues(
-  env: NodeJS.ProcessEnv,
-  protectedEnvKeys: readonly string[] | undefined,
-  protectedCredentialValues: readonly string[] | undefined
-): string[] {
-  const explicitlyProtected = new Set(protectedEnvKeys);
-  const values = Object.entries(env).flatMap(([key, value]) =>
-    value &&
-    (explicitlyProtected.has(key) ||
-      CREDENTIAL_ENV_KEYS.has(key) ||
-      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
-      ? [value]
-      : []
-  );
-  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
-    .filter(value => value.length > 0)
-    .sort((a, b) => b.length - a.length);
-}
-
-function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
-  let result = input;
-  for (const value of credentialValues) {
-    result = result.replaceAll(value, '[REDACTED]');
-  }
-  return result;
-}
-
 /**
  * Scrub credentials from every subprocess rejection field that can carry
  * subprocess text. The exact values come from the engine's injected-credential
@@ -3409,7 +3348,7 @@ async function runSubprocess(
   // Both outcomes redact against the same values, so the credential set is resolved
   // once here rather than separately per path — a success path that redacted less than
   // the failure path would be the security hole, not a style difference.
-  const credentialValues = collectSubprocessCredentialValues(
+  const credentialValues = collectCredentialValues(
     subprocessEnv,
     options.protectedEnvKeys,
     options.protectedCredentialValues
