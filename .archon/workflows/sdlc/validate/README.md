@@ -17,6 +17,15 @@ checkout. Its `scope` input narrows that ordinary path, which has three steps:
    caused it (`introduced`), the base already had it (`inherited`) or the machine
    did (`environment`).
 
+Between the last two, on a red gate only, `failure-class` (script) may ask a
+classifier which kind of failure the record shows. It is optional and advisory:
+with no classifier configured it reports `unavailable` and `classify` works as it
+always has. With one, `classify` gets the answer as a hypothesis to check against
+the log, and the result carries it as `advisory_failure_class` beside
+`red_cause`. That field never decides anything; see
+[Second opinion](../README.md#second-opinion) for what is sent and how to turn it
+off.
+
 Green comes from exit statuses alone: every declared check exited 0. When no check
 failed but not every check ran, the result is `green: false` with
 `red_cause: incomplete`. That happens when a check cannot start, or when the `run`

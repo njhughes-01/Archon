@@ -179,6 +179,110 @@ classifier, so it needs `JEV_API_KEY` and is not part of the test suite;
 `--dry` answers from the answer key and sends nothing. See
 [`scripts/context-scout-eval.ts`](../../../scripts/context-scout-eval.ts).
 
+## Second opinion
+
+A second opinion is one bounded question put to a classifier at a checkpoint
+where a workflow is about to make a judgment call, so the agent that makes it
+starts from a hypothesis instead of from its first guess.
+[`.shared/second-opinion.ts`](.shared/second-opinion.ts) is the whole of it: a
+question, two or more named choices each with a criterion, and a piece of
+evidence go in; `{ status, reason, choice, probabilities, confidence, advisory }`
+comes out. It is a script, so it works the same under every provider.
+
+The one checkpoint today is a red gate. In
+[archon-validate](validate/archon-validate.yaml), `failure-class` runs after
+`run` on the same condition that sends a red gate to `classify`, and asks which
+kind of failure the record shows: `code_defect`, `flaky_test`,
+`dependency_failure` or `environment_failure`. The question and each criterion
+are authored on that node. A new checkpoint is a new node with its own question
+and a wrapper script in its workflow's `scripts/`; do not add one to every step.
+An opinion is worth a request where a wrong first guess is expensive, which is
+at an explicit point of uncertainty.
+
+Three rules hold it together:
+
+- **It is advisory, and the result says so.** `advisory` is always `true`.
+  `classify` receives the opinion through `with:` as a hypothesis to test
+  against the log, under a prompt that keeps its own evidence bar: no class
+  settles `red_cause`, `environment_failure` is not evidence for `environment`,
+  and where the log disagrees the log wins and the summary says so. `result`
+  carries the class beside the verdict as `advisory_failure_class`, present only
+  when a classifier answered. Nothing reads that field to decide anything:
+  delivery binds `green`, `red_cause` and `summary` by name, and
+  `sdlc-validation-run.test.ts` fails if a pack file starts to read it. A
+  classifier's `confidence` is how concentrated its answer was, never the chance
+  it is right.
+- **Without a classifier it costs one script start, and it never fails the run
+  on purpose.** No `JEV_API_KEY`, `JEV_ENABLED` or `JEV_OPINION_ENABLED` off, an
+  unusable setting, evidence it may not read, a timeout, an HTTP error or an
+  answer that is not one of the choices: each is a result with
+  `status: unavailable` and the reason, and the script exits 0. No AI turn is
+  spent either way, which is why no gate node stands in front of it as one does
+  in front of the scout. The node's own timeout skips rather than fails, and
+  `classify` reads its `if_skipped` value. It is still an ordinary node: a crash
+  the script does not catch would fail the run like any other.
+- **What is sent is bounded and filtered, and only that.** One request to
+  `JEV_API_BASE` per red gate: the question, the criteria, and the last
+  `JEV_OPINION_MAX_EVIDENCE_CHARS` characters of `validation.md`, which is the
+  failing check's recorded output tail. Before the cut, recognisable secrets are
+  replaced with a marker: the value of every secret-named variable in the
+  script's environment (the classifier key among them), private-key blocks,
+  `Authorization` and bearer credentials, the user and password in a URL, values
+  assigned to secret-named keys, and well-known token formats. A path given as
+  evidence must be a regular file inside the run's artifacts directory, never a
+  link and never a secret-shaped name; the secret-path vocabulary is the scout's
+  `isSecretPath`, and there is no second list. The filter is a filter: a
+  credential in a shape it does not describe is sent as it is. Where that
+  matters, leave the opinion off or point `JEV_API_BASE` at a service you host.
+  Neither the evidence nor the key is ever printed.
+
+Every fixture that reaches `failure-class` stubs it. A fixture run inherits the
+operator's environment, key included, so an unstubbed one would send its log to
+the live classifier. `second-opinion-script.test.ts` is what proves the authored
+node reaches its script: it builds the node's environment from the workflow
+file's own `with:` values and runs the real wrapper against a local stand-in.
+
+[`.shared/jev-settings.ts`](.shared/jev-settings.ts) reads the key, the endpoint,
+the model and the switches for both this and the scout, so the defaults have one
+owner.
+
+### What is measured, and what is not
+
+`bun run second-opinion-eval` asks the workflow's own question about seeded
+failure logs of every class, across several languages and test runners, and
+reports accuracy overall and per class, the confusion matrix, mean confidence
+and characters sent. It passes at or above its accuracy floor (`ACCURACY_FLOOR`
+in the script) with no log labelled as a dependency or environment failure
+classified as a code defect, which is the one mistake that sends an agent to
+edit code that was never wrong. It calls the real
+classifier, so it needs `JEV_API_KEY` and is not part of the test suite; `--dry`
+answers from the answer key and sends nothing. See
+[`scripts/second-opinion-eval.ts`](../../../scripts/second-opinion-eval.ts).
+
+That measures whether the classifier names the right kind of failure. It does
+not measure whether an agent that is handed the opinion makes fewer unnecessary
+edits, and no unit test or classifier evaluation can: that is a property of
+whole runs. To measure it, run paired workflows by hand:
+
+1. Prepare a small repository with a passing gate, and four or more seeded
+   reds that need no code change: a port another process holds, a database that
+   is down, a lockfile out of step with its manifest, a test that fails one run
+   in five. Add as many seeded real defects, so that "never edit" is not the
+   winning strategy.
+2. For each seed, start two runs of a workflow that validates and then corrects
+   (`archon-deliver` from the same starting commit), one with
+   `JEV_OPINION_ENABLED=0` and one with the opinion on. Repeat each pair at
+   least three times; agent runs vary.
+3. For each run record: the `red_cause` validation declared and whether it
+   matches the seed; the files the correction step changed (`git diff --stat`
+   against the starting commit); and whether the gate was green afterwards.
+4. Count an edit as unnecessary when the seed needed no code change and the run
+   changed code anyway. Compare that count, and the count of real defects left
+   unfixed, between the two arms.
+
+A lower unnecessary-edit count with no rise in unfixed defects is the result the
+checkpoint is for. Until those runs are done, the claim is unproven.
+
 ## Evidence never carries credentials
 
 The engine retains what every exec node prints, so a node's output is the record

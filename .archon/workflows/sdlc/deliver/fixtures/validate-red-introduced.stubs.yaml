@@ -42,6 +42,16 @@ review__publish:
 # The real runner executes a check that exits 1, so it reports red and classify
 # is reached; only the classification itself is stubbed.
 validate__discover: { checks: [{ name: "project gate", argv: ["bun", "-e", "process.exitCode = 1"] }], quarantine: [], notes: "stub: the project's aggregate gate" }
+# The classifier blamed the machine, and was sure of it. Were the gate to read that,
+# this red would pass as `environment`. It does not: the opinion is advisory, the
+# agent declared `introduced`, and the real gate script refuses on that alone.
+validate__failure-class:
+  status: ok
+  reason: ""
+  choice: environment_failure
+  probabilities: { code_defect: 0.01, flaky_test: 0.01, dependency_failure: 0.01, environment_failure: 0.97 }
+  confidence: 0.97
+  advisory: true
 validate__classify:
   red_cause: introduced
   summary: "stub: the full gate caught two type errors this change added"

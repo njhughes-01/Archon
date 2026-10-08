@@ -1,0 +1,29 @@
+# A failing check with a second opinion: the real runner reports red, the
+# classifier's answer is stubbed, and it binds into the classify prompt as the
+# hypothesis to check. The classifier blamed the machine; the agent, holding no
+# evidence for that, declared `introduced`. The real result script reports the
+# agent's cause and carries the classifier's class beside it, unchanged by either.
+discover:
+  checks:
+    - { name: "tests", argv: ["bun", "-e", "console.error('connect ECONNREFUSED 127.0.0.1:5432'); process.exitCode = 1"] }
+  quarantine: []
+  notes: "stub: the project's test command"
+failure-class:
+  status: ok
+  reason: ""
+  choice: environment_failure
+  probabilities: { code_defect: 0.05, flaky_test: 0.04, dependency_failure: 0.03, environment_failure: 0.88 }
+  confidence: 0.81
+  advisory: true
+classify:
+  red_cause: introduced
+  summary: >-
+    stub: tests failed with a refused database connection. The classifier chose
+    environment_failure, but nothing shows another process holding the database
+    and this change edits the connection settings, so the cause is introduced.
+fixture:
+  expect: completed
+  reached: [mode, discover, run, failure-class, classify, result]
+  resolved-text-contains:
+    classify: '"status":"ok","reason":"","choice":"environment_failure"'
+exec-code: true

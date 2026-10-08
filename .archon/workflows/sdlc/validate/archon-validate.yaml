@@ -65,6 +65,13 @@ nodes:
                 run_id: { type: string }
                 path: { type: string }
               required: [type, run_id, path]
+        # Optional, and only ever on ordinary validation's red path: the kind of
+        # failure a classifier saw in the record (`failure-class` below). Advisory.
+        # It rides beside `red_cause` and no gate reads it; delivery binds `green`,
+        # `red_cause` and `summary` by name.
+        advisory_failure_class:
+          type: string
+          enum: &failure_classes [code_defect, flaky_test, dependency_failure, environment_failure]
       required: [green, red_cause, summary, evidence]
 
   # Ordinary validation is three nodes. Finding the gate is judgement, so an agent
@@ -122,10 +129,103 @@ nodes:
         summary: { type: string }
       required: [status, summary]
 
-  - id: classify
-    command: classify-red
+  # An optional second opinion on a red gate, asked before the agent that
+  # classifies it reads anything. A classifier sorts the end of the failing
+  # check's record into one of four kinds of failure. `classify` receives that as
+  # a hypothesis to test against the log, and `result` carries it beside the
+  # verdict as an advisory field no gate reads.
+  #
+  # Without a classifier (no JEV_API_KEY, or JEV_ENABLED / JEV_OPINION_ENABLED
+  # off) the script sends nothing and reports `unavailable`. It spends no AI turn
+  # either way, so no gate node stands in front of it. It never fails the run on
+  # purpose: every way it cannot answer is an `unavailable` result, its own
+  # request deadline ends it well inside this timeout, and the timeout skips
+  # rather than fails.
+  - id: failure-class
+    script: failure-class
+    runtime: bun
     depends_on: [run]
     when: "$run.output.status == 'red'"
+    timeout: 120000
+    on_timeout: skip
+    with:
+      question: >-
+        A project check failed. Which one of these kinds of failure does its
+        recorded output show?
+      # A list, not a map: an object in a script's `with:` is a binding directive.
+      # Each criterion names what a failure log of that kind shows.
+      choices:
+        - name: code_defect
+          criterion: >-
+            The project's own code or a test of it is wrong, and the same failure
+            would happen on every run: an assertion reports an expected value that
+            differs from the one received, a compiler, type checker or linter
+            reports an error at a file and line of the project's source, or a test
+            throws from the project's own code.
+        - name: flaky_test
+          criterion: >-
+            The outcome depends on timing or order rather than on the code: a test
+            timed out or read something before it was ready, failed on one attempt
+            and passed on a retry, depends on the order the tests ran in or on
+            state another test left behind, or compares against the current time
+            or a random value.
+        - name: dependency_failure
+          criterion: >-
+            A third-party package is missing, mismatched or broken before the
+            project's own logic is exercised: a module or package cannot be found
+            or imported, the lockfile disagrees with the manifest, a requested
+            version does not exist or cannot be resolved, or installed versions
+            conflict with each other, with the runtime or with the toolchain.
+        - name: environment_failure
+          criterion: >-
+            The machine or its surroundings stopped the check, not any code or
+            package: a port is already in use, a database, service, network host
+            or registry refuses the connection or cannot be reached, a required
+            environment variable or credential is missing, the disk is full, a
+            file permission is denied, or the process was killed for memory or by
+            a signal.
+      # The record `run` writes, named relative to the run's artifacts directory.
+      # The script sends a bounded tail of it with recognisable secrets removed.
+      evidence_path: validation.md
+    output_format:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, unavailable] }
+        reason: { type: string }
+        choice:
+          anyOf:
+            - type: "null"
+            - type: string
+              enum: *failure_classes
+        probabilities:
+          type: object
+          additionalProperties: { type: number, minimum: 0, maximum: 1 }
+        confidence:
+          anyOf:
+            - type: "null"
+            - { type: number, minimum: 0, maximum: 1 }
+        advisory: { type: boolean, const: true }
+      required: [status, reason, choice, probabilities, confidence, advisory]
+      additionalProperties: false
+
+  - id: classify
+    command: classify-red
+    depends_on: [run, failure-class]
+    # The opinion is skipped when its timeout stops it, and a skipped dependency
+    # blocks the default all_success. A failed one still blocks this node.
+    trigger_rule: none_failed_min_one_success
+    when: "$run.output.status == 'red'"
+    with:
+      # `if_skipped` is what the prompt reads when no opinion was produced.
+      opinion:
+        from: "$failure-class.output"
+        if_skipped:
+          status: unavailable
+          reason: not_run
+          choice: null
+          probabilities: {}
+          confidence: null
+          advisory: true
     output_format:
       type: object
       properties:
@@ -140,11 +240,13 @@ nodes:
     runtime: bun
     # `discover` keeps this join eligible when the timeout skipped `run`: every
     # other producer is skipped then too.
-    depends_on: [compare, discover, run, classify]
+    depends_on: [compare, discover, run, failure-class, classify]
     trigger_rule: none_failed_min_one_success
     with:
       comparison: { from: "$compare.output", if_skipped: null }
       run: { from: "$run.output", if_skipped: null }
       classification: { from: "$classify.output", if_skipped: null }
+      # Advisory: passed through as a side field, never read to decide the verdict.
+      opinion: { from: "$failure-class.output", if_skipped: null }
     output_type: validation
     output_format: *composition_verdict
