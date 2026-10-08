@@ -3,6 +3,8 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import { removeTempTree } from '@archon/paths/test-utils';
+
 import type { ToolActionDecision, ToolActionRequest } from '../../types';
 import { resolvePiSkills, resolvePiThinkingLevel, resolvePiTools } from './options-translator';
 import { gatePiBuiltinTools, gatePiNativeTools } from './tool-gate';
@@ -447,8 +449,8 @@ describe('gatePiBuiltinTools / gatePiNativeTools', () => {
     beforeAll(() => {
       dir = mkdtempSync(join(tmpdir(), 'pi-gate-'));
     });
-    afterAll(() => {
-      rmSync(dir, { recursive: true, force: true });
+    afterAll(async () => {
+      await removeTempTree(dir);
     });
 
     const writeTool = (
