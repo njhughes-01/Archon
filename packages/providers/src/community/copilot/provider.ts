@@ -19,6 +19,7 @@ import type {
   CopilotSession,
   CustomAgentConfig,
   MCPServerConfig,
+  PermissionHandler,
   SessionConfig,
   SystemMessageConfig,
 } from '@github/copilot-sdk';
@@ -177,6 +178,24 @@ function applyToolRestrictions(
 }
 
 /**
+ * Translate the request's provider-neutral `restrictFileWrites` to Copilot's
+ * permission channel: a `write` permission request — what the runtime raises
+ * before a built-in tool changes a file — is rejected, and every other kind
+ * still goes to `decide`. Deciding on the typed request kind avoids naming
+ * built-in tools, which the SDK does not enumerate.
+ */
+function rejectFileWrites(decide: PermissionHandler): PermissionHandler {
+  return (request, invocation) =>
+    request.kind === 'write'
+      ? {
+          kind: 'reject',
+          feedback:
+            'File writes are not available in chat. Launch a workflow for work that changes files.',
+        }
+      : decide(request, invocation);
+}
+
+/**
  * Translate Archon's `nodeConfig.mcp` (JSON-file path) to Copilot's
  * `SessionConfig.mcpServers`. Reuses the shared `loadMcpConfig` helper so
  * env-var expansion and missing-var detection behave consistently across
@@ -293,7 +312,7 @@ async function buildSessionConfig(
   copilotConfig: CopilotProviderDefaults,
   requestOptions: SendQueryOptions | undefined,
   cwd: string,
-  approveAll: SessionConfig['onPermissionRequest'],
+  approveAll: PermissionHandler,
   warnings: ProviderWarning[]
 ): Promise<SessionConfig> {
   const reasoning = resolveCopilotReasoning(requestOptions?.nodeConfig, copilotConfig);
@@ -317,7 +336,9 @@ async function buildSessionConfig(
     streaming: true,
     systemMessage: resolveSystemMessage(requestOptions),
     enableConfigDiscovery: copilotConfig.enableConfigDiscovery ?? false,
-    onPermissionRequest: approveAll,
+    onPermissionRequest: requestOptions?.restrictFileWrites
+      ? rejectFileWrites(approveAll)
+      : approveAll,
   };
 
   applyToolRestrictions(sessionConfig, requestOptions?.nodeConfig);

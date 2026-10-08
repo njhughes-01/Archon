@@ -20,7 +20,11 @@ import type {
   PiProviderDefaults,
   ProviderDefaultsMap,
 } from '@archon/providers/types';
-import type { RawAliasesConfig, RawTiersConfig } from '@archon/workflows/model-validation';
+import type {
+  RawAliasesConfig,
+  RawTiersConfig,
+  TierName,
+} from '@archon/workflows/model-validation';
 import {
   workflowRunContinuationConfigSchema,
   type WorkflowRunConfigLayer,
@@ -139,6 +143,18 @@ export interface GlobalConfig {
    * workflow/node `model:` fields.
    */
   tiers?: RawTiersConfig;
+
+  /**
+   * Tier the main direct-chat turn runs on, on every chat surface. Chat only:
+   * workflows keep the tiers their nodes name and title generation stays on
+   * `small`. Install-level — a repo config cannot set it. A user's own default
+   * chat model still wins.
+   *
+   * Unset, chat asks for `large` and `assistants.<provider>.model` stands in
+   * when that tier is not configured. An explicit `chatTier: large` asks for
+   * the same tier but never substitutes `assistants.<provider>.model`.
+   */
+  chatTier?: TierName;
 
   /**
    * Platform streaming preferences (can be overridden per conversation)
@@ -385,6 +401,12 @@ export interface MergedConfig {
    * Undefined when no tiers are configured anywhere.
    */
   tiers?: RawTiersConfig;
+  /**
+   * Tier the main chat turn asks for, from global `chatTier`. Undefined when
+   * the install does not set it: chat then asks for `large` and lets
+   * `assistants.<provider>.model` stand in for an unconfigured tier.
+   */
+  chatTier?: TierName;
   streaming: {
     telegram: 'stream' | 'batch';
     discord: 'stream' | 'batch';

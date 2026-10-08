@@ -144,6 +144,9 @@
         "toolRestrictions": {
           "type": "boolean"
         },
+        "fileWriteRestriction": {
+          "type": "boolean"
+        },
         "knownToolNames": {
           "readOnly": true,
           "type": "array",

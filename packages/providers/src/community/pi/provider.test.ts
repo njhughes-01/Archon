@@ -1803,6 +1803,52 @@ describe('PiProvider', () => {
     expect('noTools' in callArgs).toBe(false);
   });
 
+  test('restrictFileWrites leaves the chat read and bash, not edit or write', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        restrictFileWrites: true,
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    const tools = callArgs.customTools as Array<{ __piTool: string }>;
+    // Pi's defaults must be suppressed, or its own edit/write would come back.
+    expect(callArgs.noTools).toBe('builtin');
+    expect(tools.map(t => t.__piTool)).toEqual(['read', 'bash']);
+  });
+
+  test('restrictFileWrites holds when native tools re-supply the base tool set', async () => {
+    // Attaching a native tool forces customTools; the base set rebuilt alongside
+    // it must be the restricted one, not Pi's full defaults.
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp', undefined, {
+        model: 'google/gemini-2.5-pro',
+        restrictFileWrites: true,
+        env: { DATABASE_URL: 'postgres://managed' },
+        nativeTools: [
+          {
+            name: 'manage_run',
+            description: 'Manage runs',
+            inputSchema: { properties: {}, required: [] },
+            handler: () => Promise.resolve('ok'),
+          },
+        ],
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    const tools = callArgs.customTools as Array<{ __piTool?: string; name?: string }>;
+    expect(callArgs.noTools).toBe('builtin');
+    expect(tools.map(t => t.__piTool ?? t.name)).toEqual(['read', 'bash', 'manage_run']);
+  });
+
   test('requestOptions.env with no tool restrictions overrides Pi defaults with env-aware bash', async () => {
     process.env.GEMINI_API_KEY = 'sk-test';
     resetScript(scriptedAgentEnd());

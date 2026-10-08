@@ -486,6 +486,16 @@ export interface AgentRequestOptions {
    * `nativeTools` capability.
    */
   nativeTools?: NativeTool[];
+  /**
+   * The turn must not write files with the provider's built-in file-editing
+   * tools. Stated once by the caller in provider-neutral terms — direct chat
+   * sets it, because chat answers and researches while workflows change files —
+   * and translated by each provider into its own mechanism. The shell is not
+   * restricted, so this narrows the turn rather than sandboxing it. Workflow
+   * nodes never set it. Gated on the `fileWriteRestriction` capability: a
+   * provider without it ignores the option.
+   */
+  restrictFileWrites?: boolean;
 }
 
 /**

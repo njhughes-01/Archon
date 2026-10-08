@@ -1197,6 +1197,21 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options).toMatchObject({ agentProgressSummaries: false });
     });
 
+    test('an explicit agentProgressSummaries wins on a call that is not a workflow node', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: { agentProgressSummaries: true },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options).toMatchObject({ agentProgressSummaries: true });
+    });
+
     test('does not set agentProgressSummaries for direct chat (no nodeConfig)', async () => {
       mockQuery.mockImplementation(async function* () {
         // Empty
@@ -3094,6 +3109,70 @@ describe('sendQuery decomposition behaviors', () => {
       expect(options.skills).toBeUndefined();
       expect(options.strictMcpConfig).toBeUndefined();
       expect(options.tools).toEqual([]);
+    });
+
+    // ─── restrictFileWrites: the provider-neutral "no file writes" intent ────
+
+    test('restrictFileWrites removes the file-writing built-ins and stays a chat call', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('chat', workflowCwd, undefined, {
+        restrictFileWrites: true,
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.disallowedTools).toEqual(['Write', 'Edit', 'NotebookEdit']);
+      // The shell stays, and nothing about the call becomes a workflow node.
+      expect(options.disallowedTools).not.toContain('Bash');
+      expect(options.tools).toBeUndefined();
+      expect(options.skills).toBeUndefined();
+      expect(options.strictMcpConfig).toBeUndefined();
+      expect(options).not.toHaveProperty('agentProgressSummaries');
+    });
+
+    test('every tool restrictFileWrites removes is in the audited vocabulary', () => {
+      // A name the SDK no longer knows is a silent no-op (#2084).
+      const caps = client.getCapabilities();
+      expect(caps.fileWriteRestriction).toBe(true);
+      for (const name of ['Write', 'Edit', 'NotebookEdit']) {
+        expect(caps.knownToolNames).toContain(name);
+        expect(Object.keys(caps.renamedTools ?? {})).not.toContain(name);
+      }
+    });
+
+    test('restrictFileWrites adds to a nodeConfig denial instead of replacing it', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('chat', workflowCwd, undefined, {
+        restrictFileWrites: true,
+        nodeConfig: { denied_tools: ['WebSearch', 'Write'], effort: 'high' },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.disallowedTools).toEqual(['WebSearch', 'Write', 'Edit', 'NotebookEdit']);
+    });
+
+    test('without restrictFileWrites no tool is removed', async () => {
+      mockQuery.mockImplementation(async function* () {
+        yield { type: 'result', session_id: 'sid' };
+      });
+
+      for await (const _ of client.sendQuery('node', workflowCwd, undefined, {
+        nodeConfig: { nodeId: 'implement' },
+      })) {
+        // consume
+      }
+
+      const options = (mockQuery.mock.calls[0][0] as { options: Record<string, unknown> }).options;
+      expect(options.disallowedTools).toBeUndefined();
     });
 
     test('does not grant Skill to a non-workflow call that carries skills', async () => {

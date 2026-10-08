@@ -16,6 +16,7 @@ export const COPILOT_CAPABILITIES: ProviderCapabilities = {
   skills: true,
   agents: true,
   toolRestrictions: true,
+  fileWriteRestriction: true, // restrictFileWrites → `write` permission requests are rejected
   structuredOutput: 'best-effort', // prompt-augment + repair + validate + reask×3 (no SDK grammar)
   requiresAllPropertiesRequired: false, // best-effort providers never reject schemas at API level
   envInjection: true,

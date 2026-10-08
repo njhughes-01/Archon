@@ -24,6 +24,7 @@ export const PI_CAPABILITIES: ProviderCapabilities = {
   skills: true,
   agents: false,
   toolRestrictions: true,
+  fileWriteRestriction: true, // restrictFileWrites → tool set without Pi's edit/write built-ins
   structuredOutput: 'best-effort', // prompt-augment + repair + validate + reask×3 (no SDK grammar)
   requiresAllPropertiesRequired: false, // best-effort providers never reject schemas at API level
   envInjection: true,

@@ -18,6 +18,14 @@ export const providerCapabilitiesSchema = z.object({
   agents: z.boolean(),
   toolRestrictions: z.boolean(),
   /**
+   * Whether the provider honours `restrictFileWrites` on a request: it removes
+   * or refuses its own built-in file-editing tools for that turn while leaving
+   * the shell available. Direct chat sets the option on every turn; where this
+   * is not `true` the orchestrator logs a warning and the routing rules in the
+   * system prompt are the only control. Omission means unsupported.
+   */
+  fileWriteRestriction: z.boolean().optional(),
+  /**
    * Built-in tool-name vocabulary for advisory validation of
    * `allowed_tools`/`denied_tools` entries. When present, workflow validation
    * warns (never errors) on entries not in this list — after stripping a

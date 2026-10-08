@@ -51,6 +51,7 @@ reporting declarations; absence means unknown, not unsupported.
 | Skills (`skills:`) | ✅ | ❌ | ❌ | ✅ | ✅ |
 | Inline sub-agents (`agents:`) | ✅ | ❌ | ✅¹ | ❌ | ✅ |
 | Tool restrictions (`allowed_tools`/`denied_tools`) | ✅ | ❌ | ✅ | ✅ | ✅ |
+| Direct chat without file-editing tools | ✅ | ❌ | ✅² | ✅ | ✅ |
 | Structured output (`output_format`) | **enforced** | **enforced** | **enforced** | best-effort | best-effort |
 | Env injection (`env:`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Spend limit (`maxBudgetUsd`) | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -70,6 +71,7 @@ reporting declarations; absence means unknown, not unsupported.
 ## Caveats
 
 - ¹ `opencode` — Inline sub-agents (`agents:`) — Config-file-based agent selection (named agents from `opencode.json`) with per-call model/tools overrides — not inline sub-agent definitions.
+- ² `opencode` — Direct chat without file-editing tools — Sent as a per-session permission rule denying `edit`, which stays on that chat session. Wired from the SDK typings and not yet verified against a running OpenCode; a server that answers without the rule is logged as `opencode.file_write_restriction_unconfirmed`.
 
 ## Legend
 

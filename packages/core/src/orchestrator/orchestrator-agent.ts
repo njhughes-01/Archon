@@ -164,6 +164,8 @@ interface ResolvedModelRequest {
   provider: string;
   model: string | undefined;
   preset?: ModelAliasPreset;
+  /** When `modelRef` was a tier: the tier that was asked for. */
+  requestedTier?: TierName;
   /** When `modelRef` was a tier: which tier in the fallback chain matched. */
   matchedTier?: TierName;
 }
@@ -175,7 +177,13 @@ function resolveModelRequest(
 ): ResolvedModelRequest {
   if (isTierName(modelRef)) {
     const { preset, matchedTier } = resolveTierWithFallback(aiProfile, modelRef);
-    return { provider: preset.provider, model: preset.model, preset, matchedTier };
+    return {
+      provider: preset.provider,
+      model: preset.model,
+      preset,
+      requestedTier: modelRef,
+      matchedTier,
+    };
   }
   const spec = resolveModelSpec(aiProfile, modelRef);
   if (isLiteralSpec(spec)) {
@@ -187,27 +195,33 @@ function resolveModelRequest(
 /**
  * Resolve the model request for the MAIN chat turn (#1998).
  *
- * Model precedence (chat call-site only — workflows keep resolving `large`):
+ * The chat tier is the install's `chatTier`, or `large` when it is unset.
+ *
+ * Model precedence (chat call-site only — workflows keep resolving the tiers
+ * their nodes name):
  *   1. per-user `default_model` — applied only when the user's
  *      `default_provider` matches the effective provider (a stale pin must
  *      never ride a different provider). Routed through resolveModelRequest so
  *      `@alias` and tier refs keep working; an unresolvable ref (e.g. deleted
  *      alias) degrades to the tier path with a warning instead of failing chat.
- *   2. tier `large` from CONFIGURED tiers (user > repo > global).
+ *   2. the chat tier from CONFIGURED tiers (user > repo > global).
  *   3. install `assistants.<p>.model` — outranks the BUILT-IN tier default
- *      only, never a configured tier ('inherit' means "SDK default", skip).
+ *      only, never a configured tier ('inherit' means "SDK default", skip),
+ *      and only while `chatTier` is unset: it stands in for the implicit
+ *      `large`, and letting it override a tier the operator chose would turn
+ *      `chatTier` into a silent no-op.
  *   4. built-in tier default.
  *
  * Title generation is NOT routed through this — it keeps the `small` tier.
- * With no user prefs and no `assistants.<p>.model`, this reduces byte-for-byte
- * to the previous `resolveModelRequest(aiProfile, 'large', provider)` call.
+ * With no user prefs, no `chatTier` and no `assistants.<p>.model`, this reduces
+ * byte-for-byte to `resolveModelRequest(aiProfile, 'large', provider)`.
  * Exported for tests.
  */
 export function resolveChatModelRequest(
   aiProfile: ReturnType<typeof buildAiProfile>,
   configuredProviderKey: string,
   userAiPrefs: UserAiPrefs,
-  config: Pick<MergedConfig, 'assistants' | 'tiers'>
+  config: Pick<MergedConfig, 'assistants' | 'tiers' | 'chatTier'>
 ): ResolvedModelRequest {
   if (
     userAiPrefs.defaultModel !== undefined &&
@@ -222,8 +236,8 @@ export function resolveChatModelRequest(
       );
     }
   }
-  const request = resolveModelRequest(aiProfile, 'large', configuredProviderKey);
-  if (request.matchedTier === undefined) return request;
+  const request = resolveModelRequest(aiProfile, config.chatTier ?? 'large', configuredProviderKey);
+  if (request.matchedTier === undefined || config.chatTier !== undefined) return request;
 
   const tierConfigured =
     config.tiers?.[request.matchedTier] !== undefined ||
@@ -316,16 +330,43 @@ export interface ProjectRegistration {
   projectPath: string;
 }
 
+/**
+ * Why a line starting with `/invoke-workflow` started nothing. The names are
+ * the ones the agent wrote, kept so the user can be told what was wrong.
+ */
+type InvokeFailureCause =
+  | { reason: 'malformed' }
+  | { reason: 'unknown_workflow'; workflowName: string }
+  | { reason: 'unknown_project'; workflowName: string; projectName: string };
+
+/** A failed invocation plus the reply text that came before its line. */
+export type WorkflowInvocationFailure = InvokeFailureCause & { precedingText: string };
+
 export interface OrchestratorCommands {
   workflowInvocation: WorkflowInvocation | null;
+  /** Set when the reply tried to invoke a workflow and `workflowInvocation` is null. */
+  workflowInvocationFailure: WorkflowInvocationFailure | null;
   projectRegistration: ProjectRegistration | null;
 }
 
 // ─── Command Parsing ────────────────────────────────────────────────────────
 
-// Prefix patterns: fire as soon as the command keyword is seen.
-const INVOKE_WORKFLOW_PREFIX_RE = /^\/invoke-workflow\s/m;
+// Prefix patterns: fire as soon as the command keyword is seen. The invoke
+// keyword also counts at the very end of the text: a reply can end on the bare
+// keyword, and a stream chunk that ends on it must be held back until the next
+// chunk shows whether it was a command.
+const INVOKE_WORKFLOW_PREFIX_RE = /^\/invoke-workflow(?:\s|$)/m;
 const REGISTER_PROJECT_PREFIX_RE = /^\/register-project\s/m;
+
+// A quoted command value — a `--prompt`, a project path — as the two readers
+// that decide where a command ends take it: closed by the quote that opened
+// it, a backslash escaping the next character, newlines allowed inside. The
+// stream detector (the FULL_RE objects) and textAfterInvokeCommand share it so
+// they cannot disagree. The `--prompt` extractor in parseOrchestratorCommands
+// still stops at the first quote; unescaping there would change prompts that
+// contain backslashes.
+const CLOSED_QUOTED_VALUE_RE = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/s;
+const COMMAND_KEYWORDS = ['/invoke-workflow', '/register-project'] as const;
 
 // Full-command patterns: fire once all required tokens are present.
 // These determine when accumulation can stop — further chunks cannot add
@@ -352,11 +393,8 @@ const INVOKE_WORKFLOW_FULL_RE = {
     const promptKeywordMatch = /--prompt\s+/.exec(line);
     if (promptKeywordMatch) {
       const afterPrompt = line.slice(promptKeywordMatch.index + promptKeywordMatch[0].length);
-      if (afterPrompt.startsWith('"')) {
-        return /^"(?:[^"\\]|\\.)*"/.test(afterPrompt);
-      }
-      if (afterPrompt.startsWith("'")) {
-        return /^'(?:[^'\\]|\\.)*'/.test(afterPrompt);
+      if (afterPrompt.startsWith('"') || afterPrompt.startsWith("'")) {
+        return CLOSED_QUOTED_VALUE_RE.test(afterPrompt);
       }
       // Unquoted --prompt value: require line terminator.
       return !isEos;
@@ -388,12 +426,9 @@ const REGISTER_PROJECT_FULL_RE = {
     if (nameEnd === -1) return false; // no path token yet
     const projectPath = rest.slice(nameEnd).trimStart();
     if (!projectPath) return false;
-    if (projectPath.startsWith('"')) {
+    if (projectPath.startsWith('"') || projectPath.startsWith("'")) {
       // Quoted path: require closing quote
-      return /^"(?:[^"\\]|\\.)*"/.test(projectPath);
-    }
-    if (projectPath.startsWith("'")) {
-      return /^'(?:[^'\\]|\\.)*'/.test(projectPath);
+      return CLOSED_QUOTED_VALUE_RE.test(projectPath);
     }
     // Unquoted path: require line terminator so we don't freeze on a partial path with spaces
     return !isEos;
@@ -415,6 +450,31 @@ function normalizeCommandText(text: string): string {
 function isCommandFullyParsed(accumulated: string): boolean {
   const normalized = normalizeCommandText(accumulated);
   return INVOKE_WORKFLOW_FULL_RE.test(normalized) || REGISTER_PROJECT_FULL_RE.test(normalized);
+}
+
+/**
+ * Whether `text` ends on a line that is the start of a command keyword
+ * (`/invoke-work`). A stream holds such a chunk back: shown now, it would be a
+ * command fragment on screen that the next chunk turns into a command.
+ */
+function endsWithPartialCommandKeyword(text: string): boolean {
+  const lastLine = text.slice(text.lastIndexOf('\n') + 1);
+  return lastLine !== '' && COMMAND_KEYWORDS.some(keyword => keyword.startsWith(lastLine));
+}
+
+/**
+ * The reply as one string. The first `commandEnd` chunks run through the chunk
+ * that completed a command; whatever arrived after it is still part of the
+ * reply — it may hold another command, or show the first was only an example —
+ * and starts on its own line, so it cannot run into the command's last token
+ * and change what the parser reads.
+ */
+function joinReply(chunks: readonly string[], commandEnd: number | undefined): string {
+  if (commandEnd === undefined) return chunks.join('');
+  const throughCommand = chunks.slice(0, commandEnd).join('');
+  const afterCommand = chunks.slice(commandEnd).join('');
+  if (afterCommand === '' || throughCommand.endsWith('\n')) return throughCommand + afterCommand;
+  return `${throughCommand}\n${afterCommand}`;
 }
 
 /**
@@ -532,9 +592,45 @@ function resolveCodebaseName(name: string, codebases: readonly Codebase[]): Code
   );
 }
 
+function endOfLine(text: string, from: number): number {
+  const newline = text.indexOf('\n', from);
+  return newline === -1 ? text.length : newline;
+}
+
+/**
+ * What a reply says after the `/invoke-workflow` command whose line starts at
+ * `lineStart`. The command ends with its line, or — when that line opens a
+ * quoted `--prompt` — with the line that closes the quote, because a prompt
+ * may span lines. An unclosed prompt runs to the end of the reply.
+ */
+function textAfterInvokeCommand(text: string, lineStart: number): string {
+  const lineEnd = endOfLine(text, lineStart);
+  const prompt = /--prompt\s+(?=["'])/.exec(text.slice(lineStart, lineEnd));
+  if (!prompt) return text.slice(lineEnd);
+  const valueStart = lineStart + prompt.index + prompt[0].length;
+  const quoted = CLOSED_QUOTED_VALUE_RE.exec(text.slice(valueStart));
+  return quoted ? text.slice(endOfLine(text, valueStart + quoted[0].length)) : '';
+}
+
+/**
+ * The part of `text` that comes before its first `/invoke-workflow` line, or
+ * empty when no such line starts inside `text`.
+ */
+function textBeforeInvokeLine(text: string): string {
+  const normalized = normalizeCommandText(text);
+  const line = INVOKE_WORKFLOW_PREFIX_RE.exec(normalized);
+  return line ? normalized.slice(0, line.index) : '';
+}
+
 /**
  * Parse orchestrator commands from AI response text.
  * Scans for /invoke-workflow and /register-project patterns.
+ *
+ * An `/invoke-workflow` line that cannot start a workflow is reported as
+ * `workflowInvocationFailure` only when it is the last thing in the reply, which
+ * is where the format puts a real command. A failing line the reply goes on
+ * from is the agent showing the syntax: it is left in the text and reported as
+ * nothing.
  */
 export function parseOrchestratorCommands(
   response: string,
@@ -543,6 +639,7 @@ export function parseOrchestratorCommands(
 ): OrchestratorCommands {
   const result: OrchestratorCommands = {
     workflowInvocation: null,
+    workflowInvocationFailure: null,
     projectRegistration: null,
   };
 
@@ -557,17 +654,33 @@ export function parseOrchestratorCommands(
   // template. Commands with --prompt before --project will not match.
   const invokePattern = /^\/invoke-workflow\s+(\S+)\s+--project[\s=]+(\S+)/m;
   const invokeMatch = invokePattern.exec(normalizedResponse);
+  const invokeLine = INVOKE_WORKFLOW_PREFIX_RE.exec(normalizedResponse);
+  const failInvoke = (cause: InvokeFailureCause, lineStart: number): void => {
+    if (textAfterInvokeCommand(normalizedResponse, lineStart).trim() !== '') {
+      // `cause` holds the reason and the names on the line, never reply text.
+      getLog().debug(cause, 'orchestrator.invoke_example_skipped');
+      return;
+    }
+    result.workflowInvocationFailure = {
+      ...cause,
+      precedingText: normalizedResponse.slice(0, lineStart).trim(),
+    };
+  };
   if (invokeMatch) {
     const workflowName = invokeMatch[1].trim();
     const projectName = invokeMatch[2].trim();
 
     // Validate workflow exists
     const workflow = findWorkflow(workflowName, [...workflows]);
-    if (workflow) {
+    if (!workflow) {
+      failInvoke({ reason: 'unknown_workflow', workflowName }, invokeMatch.index);
+    } else {
       // Validate project exists (case-insensitive, supports partial name matching)
       // e.g., "Archon" matches "coleam00/Archon"
       const matchedCodebase = findCodebaseByName(codebases, projectName);
-      if (matchedCodebase) {
+      if (!matchedCodebase) {
+        failInvoke({ reason: 'unknown_project', workflowName, projectName }, invokeMatch.index);
+      } else {
         // Extract message before the command
         const commandIndex = normalizedResponse.indexOf(invokeMatch[0]);
         const remainingMessage = normalizedResponse.slice(0, commandIndex).trim();
@@ -591,6 +704,10 @@ export function parseOrchestratorCommands(
         };
       }
     }
+  } else if (invokeLine) {
+    // The line is there but the workflow name or `--project` is not where the
+    // format puts them.
+    failInvoke({ reason: 'malformed' }, invokeLine.index);
   }
 
   // Parse /register-project {name} {path}
@@ -2321,21 +2438,25 @@ export async function handleMessage(
         repoAliases: config.aliases,
       });
     }
-    // Main chat model: per-user default_model > configured `large` tier >
-    // install assistants.<p>.model > built-in tier default (#1998).
+    // Main chat model: per-user default_model > the configured chat tier
+    // (`chatTier`, else `large`) > install assistants.<p>.model > built-in tier
+    // default (#1998).
     const chatRequest = resolveChatModelRequest(aiProfile, configuredProviderKey, userAiPrefs, {
       assistants: config.assistants,
       tiers: config.tiers,
+      chatTier: config.chatTier,
     });
-    // Tier-fallback nudge (mirrors dag.model_provider_conflict): chat asks for
-    // 'large'; when that tier is unset and a sibling preset answered, tell the
-    // user ONCE PER CONVERSATION, non-blocking — the dedup Set below is what
-    // keeps it from becoming a per-message banner (review C1). Only the main
-    // chat request nags — the background title model ('small') falls back
-    // silently. Delivery failure must never fail the chat turn.
+    // Tier-fallback nudge (mirrors dag.model_provider_conflict): when the tier
+    // chat asked for is unset and a sibling preset answered, tell the user ONCE
+    // PER CONVERSATION, non-blocking — the dedup Set below is what keeps it
+    // from becoming a per-message banner (review C1). Only the main chat
+    // request nags — the background title model ('small') falls back silently.
+    // Delivery failure must never fail the chat turn.
+    const { requestedTier, matchedTier } = chatRequest;
     if (
-      chatRequest.matchedTier !== undefined &&
-      chatRequest.matchedTier !== 'large' &&
+      requestedTier !== undefined &&
+      matchedTier !== undefined &&
+      matchedTier !== requestedTier &&
       !tierFallbackNudgedConversations.has(conversation.id)
     ) {
       // Mark BEFORE attempting delivery: a failed send shouldn't retry the
@@ -2343,8 +2464,8 @@ export async function handleMessage(
       tierFallbackNudgedConversations.add(conversation.id);
       getLog().warn(
         {
-          requestedTier: 'large',
-          matchedTier: chatRequest.matchedTier,
+          requestedTier,
+          matchedTier,
           provider: chatRequest.provider,
           model: chatRequest.model,
         },
@@ -2353,9 +2474,9 @@ export async function handleMessage(
       try {
         await platform.sendMessage(
           conversationId,
-          `ℹ️ Model tier 'large' isn't configured — using the '${chatRequest.matchedTier}' preset ` +
+          `ℹ️ Model tier '${requestedTier}' isn't configured — using the '${matchedTier}' preset ` +
             `(${chatRequest.provider}/${chatRequest.model ?? ''}). Set it in Settings → Model Tiers ` +
-            'or `archon ai tier set large <provider> <model>`.'
+            `or \`archon ai tier set ${requestedTier} <provider> <model>\`.`
         );
       } catch (nudgeErr) {
         getLog().warn(
@@ -2409,10 +2530,8 @@ export async function handleMessage(
     // Claude supports the preset object for prompt caching; other providers
     // need a plain string (Pi coerces non-string to undefined, Codex ignores it).
     let systemAppend = buildOrchestratorSystemAppend(conversation, codebases, workflows);
-    // Capabilities are only consulted for project-scoped chats (both the native tool
-    // and the CLI pointer are scoped features), so look them up lazily — this also
-    // avoids a registry lookup (and a throw for an unregistered provider) on the
-    // unscoped path.
+    // Run-management capabilities matter only for project-scoped chats: both the
+    // native tool and the CLI pointer are scoped features.
     const scopedCaps =
       conversation.codebase_id !== null ? getProviderCapabilities(providerKey) : null;
     // Providers WITHOUT the in-process manage_run tool (Codex/OpenCode/Copilot) get a
@@ -2436,7 +2555,19 @@ export async function handleMessage(
       protectedEnvKeys: protectedEnvKeys.length > 0 ? protectedEnvKeys : undefined,
       model: chatRequest.model,
       systemPrompt,
+      restrictFileWrites: true,
     };
+    // Chat answers and researches; workflows change files. Stated to every
+    // provider as one neutral option, which each translates into its own
+    // mechanism. A provider that cannot is warned about by name, because there
+    // the routing rules in the system prompt are the only control. Title
+    // generation and workflow nodes build their own options and never carry it.
+    if (getProviderCapabilities(providerKey).fileWriteRestriction !== true) {
+      getLog().warn(
+        { provider: providerKey },
+        'orchestrator.chat_file_write_restriction_unsupported'
+      );
+    }
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
     }
@@ -2694,9 +2825,13 @@ async function handleStreamMode(
   userId?: string
 ): Promise<void> {
   const allMessages: string[] = [];
+  // What the user has actually been sent: chunks from the command prefix on are
+  // withheld, so this can be shorter than the joined reply.
+  let streamedText = '';
   let newSessionId: string | undefined;
   let commandDetected = false;
-  let commandFullyParsed = false;
+  // How many chunks it took to complete the command; see joinReply.
+  let commandEnd: number | undefined;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
   for await (const msg of aiClient.sendQuery(
@@ -2706,12 +2841,7 @@ async function handleStreamMode(
     requestOptions
   )) {
     if (msg.type === 'assistant' && msg.content) {
-      // Accumulate only while the command is not yet fully captured; post-command
-      // trailing chunks would corrupt the project-name token if joined without a
-      // whitespace boundary, causing the parse regex to overshoot.
-      if (!commandFullyParsed) {
-        allMessages.push(msg.content);
-      }
+      allMessages.push(msg.content);
       if (!commandDetected) {
         // Check for orchestrator commands BEFORE streaming to frontend.
         // If detected, suppress this chunk and all future chunks — the full
@@ -2723,20 +2853,19 @@ async function handleStreamMode(
           REGISTER_PROJECT_PREFIX_RE.test(normalizedAccumulated)
         ) {
           commandDetected = true;
-          // If the complete command pattern is already present, stop accumulating —
-          // no more chunks needed. This prevents trailing chunks from corrupting
-          // the project-name token when the command was fully emitted in one chunk.
           if (isCommandFullyParsed(accumulated)) {
-            commandFullyParsed = true;
+            commandEnd = allMessages.length;
           }
-        } else {
-          await platform.sendMessage(conversationId, msg.content);
+        } else if (!endsWithPartialCommandKeyword(normalizedAccumulated)) {
+          // Everything not yet sent, which is this chunk plus any held back
+          // while it could still have become a command keyword.
+          await platform.sendMessage(conversationId, accumulated.slice(streamedText.length));
+          streamedText = accumulated;
         }
-      } else if (!commandFullyParsed) {
-        // Post-prefix: keep accumulating until the full command pattern is present.
-        const accumulated = allMessages.join('');
-        if (isCommandFullyParsed(accumulated)) {
-          commandFullyParsed = true;
+      } else if (commandEnd === undefined) {
+        // Post-prefix: keep reading until the full command pattern is present.
+        if (isCommandFullyParsed(allMessages.join(''))) {
+          commandEnd = allMessages.length;
         }
       }
     } else if (msg.type === 'tool' && msg.toolName) {
@@ -2831,7 +2960,7 @@ async function handleStreamMode(
     return;
   }
 
-  const fullResponse = allMessages.join('');
+  const fullResponse = joinReply(allMessages, commandEnd);
   const commands = parseOrchestratorCommands(
     fullResponse,
     codebases,
@@ -2870,15 +2999,45 @@ async function handleStreamMode(
       fullResponse,
       commands.projectRegistration
     );
+    if (commands.workflowInvocationFailure) {
+      await resolveInvokeAfterRegistration(
+        platform,
+        conversationId,
+        conversation,
+        workflows,
+        fullResponse,
+        originalMessage,
+        isolationHints,
+        issueContext,
+        userId
+      );
+    }
     return;
   }
 
-  // Text was already streamed — nothing more to send.
+  // Nothing was dispatched, so whatever was withheld from the command prefix on
+  // still has to reach the user: nothing the agent said may be dropped.
+  const withheld = fullResponse.slice(streamedText.length);
+  const invokeFailure = commands.workflowInvocationFailure;
+  let unsent = withheld;
+  let delivered = streamedText + withheld;
+  if (invokeFailure) {
+    // A real attempt that started nothing: the command itself is replaced by the
+    // reason. Only the explanation that was withheld along with it goes out —
+    // the part streamed earlier is already on screen.
+    const notice = reportInvokeFailure(platform, conversationId, invokeFailure, codebases);
+    const beforeCommand = textBeforeInvokeLine(withheld);
+    unsent = [beforeCommand.trim(), notice].filter(Boolean).join('\n\n');
+    delivered = [(streamedText + beforeCommand).trim(), notice].filter(Boolean).join('\n\n');
+  }
+  if (unsent.trim() !== '') {
+    await platform.sendMessage(conversationId, unsent);
+  }
   // Persist the assistant reply for non-web platforms so it appears in the
   // Web UI conversation history. The web adapter persists through its
   // MessagePersistence buffer; skip it here to avoid double-write (#1182).
-  if (!isWebAdapter(platform) && fullResponse) {
-    messageDb.addMessage(conversation.id, 'assistant', fullResponse).catch((e: unknown) => {
+  if (!isWebAdapter(platform) && delivered) {
+    messageDb.addMessage(conversation.id, 'assistant', delivered).catch((e: unknown) => {
       const err = e instanceof Error ? e : new Error(String(e));
       getLog().warn(
         { err, errorType: err.constructor.name, conversationId },
@@ -2934,7 +3093,8 @@ async function handleBatchMode(
   let totalChunksTruncated = false;
   let newSessionId: string | undefined;
   let commandDetected = false;
-  let commandFullyParsed = false;
+  // How many chunks it took to complete the command; see joinReply.
+  let commandEnd: number | undefined;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
   for await (const msg of aiClient.sendQuery(
@@ -2944,26 +3104,17 @@ async function handleBatchMode(
     requestOptions
   )) {
     if (msg.type === 'assistant' && msg.content) {
-      // Always record in allChunks for debug logging; accumulate assistantMessages
-      // only while the command is not yet fully captured (same reason as stream mode).
+      // allChunks is the capped debug record; assistantMessages is the reply.
       allChunks.push({ type: 'assistant', content: msg.content });
-      if (!commandFullyParsed) {
-        assistantMessages.push(msg.content);
-      }
+      assistantMessages.push(msg.content);
 
       // Cap assistant-only chunks while no command has been detected.  Once
       // commandDetected flips to true we stop shifting so that all tokens of
-      // the in-flight command are preserved — shifting the prefix away would
-      // break both the prefix and full-command regexes.  As a consequence, if
-      // the AI starts a command prefix but never completes it, assistantMessages
-      // can grow unbounded from the per-assistant perspective; the outer
-      // MAX_BATCH_TOTAL_CHUNKS guard on allChunks (below) is the true hard cap
-      // for that edge case.
-      if (
-        !commandDetected &&
-        !commandFullyParsed &&
-        assistantMessages.length > MAX_BATCH_ASSISTANT_CHUNKS
-      ) {
+      // the in-flight command, and whatever the reply says after it, are
+      // preserved — shifting the prefix away would break both the prefix and
+      // full-command regexes.  As a consequence assistantMessages is not
+      // capped from the command prefix on.
+      if (!commandDetected && assistantMessages.length > MAX_BATCH_ASSISTANT_CHUNKS) {
         assistantMessages.shift();
         assistantChunksTruncated = true;
       }
@@ -2977,13 +3128,12 @@ async function handleBatchMode(
         ) {
           commandDetected = true;
           if (isCommandFullyParsed(accumulated)) {
-            commandFullyParsed = true;
+            commandEnd = assistantMessages.length;
           }
         }
-      } else if (!commandFullyParsed) {
-        const accumulated = assistantMessages.join('');
-        if (isCommandFullyParsed(accumulated)) {
-          commandFullyParsed = true;
+      } else if (commandEnd === undefined) {
+        if (isCommandFullyParsed(assistantMessages.join(''))) {
+          commandEnd = assistantMessages.length;
         }
       }
     } else if (msg.type === 'tool' && msg.toolName) {
@@ -3099,8 +3249,9 @@ async function handleBatchMode(
   // separator lines that break multi-chunk command text (name and path appear on
   // separate lines from '/register-project'). Raw join preserves the command as a
   // contiguous string. User-visible output still comes from filterToolIndicators.
+  const rawReply = joinReply(assistantMessages, commandEnd);
   const commands = parseOrchestratorCommands(
-    assistantMessages.join(''),
+    rawReply,
     codebases,
     workflows.map(ws => ws.workflow)
   );
@@ -3136,17 +3287,41 @@ async function handleBatchMode(
       finalMessage,
       commands.projectRegistration
     );
+    if (commands.workflowInvocationFailure) {
+      await resolveInvokeAfterRegistration(
+        platform,
+        conversationId,
+        conversation,
+        workflows,
+        rawReply,
+        originalMessage,
+        isolationHints,
+        issueContext,
+        userId
+      );
+    }
     return;
   }
 
-  // No orchestrator commands — send the clean response
-  getLog().debug({ messageLength: finalMessage.length }, 'sending_final_message');
-  await platform.sendMessage(conversationId, finalMessage);
+  // No orchestrator commands — send the clean response. A reply that tried to
+  // invoke a workflow and started nothing goes out without the command line and
+  // with the reason in its place, so the user is not left waiting for a run.
+  const invokeFailure = commands.workflowInvocationFailure;
+  const reply = invokeFailure
+    ? [
+        invokeFailure.precedingText,
+        reportInvokeFailure(platform, conversationId, invokeFailure, codebases),
+      ]
+        .filter(Boolean)
+        .join('\n\n')
+    : finalMessage;
+  getLog().debug({ messageLength: reply.length }, 'sending_final_message');
+  await platform.sendMessage(conversationId, reply);
   // Persist the assistant reply for non-web platforms so it appears in the
   // Web UI conversation history. The web adapter persists through its
   // MessagePersistence buffer; skip it here to avoid double-write (#1182).
-  if (!isWebAdapter(platform) && finalMessage) {
-    messageDb.addMessage(conversation.id, 'assistant', finalMessage).catch((e: unknown) => {
+  if (!isWebAdapter(platform) && reply) {
+    messageDb.addMessage(conversation.id, 'assistant', reply).catch((e: unknown) => {
       const err = e instanceof Error ? e : new Error(String(e));
       getLog().warn(
         { err, errorType: err.constructor.name, conversationId },
@@ -3256,19 +3431,104 @@ async function handleWorkflowInvocationResult(
     return;
   }
 
-  // Fallback: send error about missing project or workflow
-  if (!codebase) {
-    const projectList = codebases.map(c => `- ${c.name}`).join('\n');
+  // Parsing resolved both names against these same lists, so this fires only if
+  // the two ever diverge. It reports through the same notice as a parse failure
+  // rather than a second wording.
+  const cause: InvokeFailureCause = codebase
+    ? { reason: 'unknown_workflow', workflowName }
+    : { reason: 'unknown_project', workflowName, projectName };
+  await platform.sendMessage(
+    conversationId,
+    reportInvokeFailure(platform, conversationId, cause, codebases)
+  );
+}
+
+/**
+ * A reply that registered a project and then tried to invoke a workflow was
+ * judged against the project list from before the registration. Judge the
+ * invocation again against the list as it now stands: start the workflow when
+ * its project exists now, otherwise say why it did not start.
+ */
+async function resolveInvokeAfterRegistration(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  conversation: Conversation,
+  workflows: readonly WorkflowWithSource[],
+  reply: string,
+  originalMessage: string,
+  isolationHints: HandleMessageContext['isolationHints'],
+  issueContext?: string,
+  userId?: string
+): Promise<void> {
+  const codebases = await codebaseDb.listCodebases();
+  const { workflowInvocation, workflowInvocationFailure } = parseOrchestratorCommands(
+    reply,
+    codebases,
+    workflows.map(ws => ws.workflow)
+  );
+  if (workflowInvocation) {
+    await handleWorkflowInvocationResult(
+      platform,
+      conversationId,
+      conversation,
+      codebases,
+      workflows,
+      // The text before the commands already went out with the registration.
+      { ...workflowInvocation, remainingMessage: '' },
+      originalMessage,
+      isolationHints,
+      issueContext,
+      userId
+    );
+  } else if (workflowInvocationFailure) {
     await platform.sendMessage(
       conversationId,
-      `I couldn't find a project matching "${projectName}". Here are your registered projects:\n${projectList || '(none)'}\n\nPlease specify which project you'd like to use.`
+      reportInvokeFailure(platform, conversationId, workflowInvocationFailure, codebases)
     );
-  } else if (!workflow) {
-    getLog().warn({ workflowName, projectName }, 'workflow_not_found_in_dispatch');
-    await platform.sendMessage(
-      conversationId,
-      `Workflow \`${workflowName}\` is not available. Use \`${spellWorkflowCommand(platform, 'list')}\` to see available workflows.`
-    );
+  }
+}
+
+/**
+ * Record an `/invoke-workflow` attempt that started nothing and return the
+ * one-line notice that tells the user so.
+ *
+ * The warn event carries the reason and the names the agent wrote, built field
+ * by field: the reply around the command, and its `--prompt`, restate the
+ * user's request and must not reach the log.
+ */
+function reportInvokeFailure(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  cause: InvokeFailureCause,
+  codebases: readonly Codebase[]
+): string {
+  const event = 'orchestrator.workflow_invoke_failed';
+  switch (cause.reason) {
+    case 'malformed':
+      getLog().warn({ conversationId, reason: cause.reason }, event);
+      return 'Workflow not started: the launch command was malformed (it needs a workflow name, then --project <name>). Nothing ran — please ask again.';
+    case 'unknown_workflow':
+      getLog().warn(
+        { conversationId, reason: cause.reason, workflowName: cause.workflowName },
+        event
+      );
+      return `Workflow not started: there is no workflow named "${cause.workflowName}". Use \`${spellWorkflowCommand(platform, 'list')}\` to see the available workflows.`;
+    case 'unknown_project': {
+      getLog().warn(
+        {
+          conversationId,
+          reason: cause.reason,
+          workflowName: cause.workflowName,
+          projectName: cause.projectName,
+        },
+        event
+      );
+      const registered =
+        codebases.length > 0
+          ? `Registered projects: ${codebases.map(c => c.name).join(', ')}.`
+          : 'No projects are registered yet.';
+      return `Workflow not started: no registered project matches "${cause.projectName}". ${registered}`;
+    }
   }
 }
 

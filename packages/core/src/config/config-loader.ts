@@ -48,7 +48,7 @@ import {
   registerBuiltinProviders,
   registerCommunityProviders,
 } from '@archon/providers';
-import { buildAiProfile, TIER_NAMES } from '@archon/workflows/model-validation';
+import { buildAiProfile, isTierName, TIER_NAMES } from '@archon/workflows/model-validation';
 import type { RawAliasEntry, TierName } from '@archon/workflows/model-validation';
 import {
   rawAliasesConfigSchema,
@@ -230,6 +230,9 @@ const DEFAULT_CONFIG_CONTENT = `# Archon Global Configuration
 #   large: { provider: claude, model: opus }
 #   medium: { provider: codex, model: gpt-5.6-terra, effort: high }
 #   small: { provider: pi, model: minimax-m3 }
+
+# Tier the chat agent runs on (small, medium or large). Workflows are unaffected.
+# chatTier: large
 
 # Streaming mode per platform (stream or batch)
 # streaming:
@@ -651,6 +654,19 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
 
   result.aliases = mergeAliases(result.aliases, global.aliases);
   result.tiers = mergeTiers(result.tiers, global.tiers);
+
+  // Chat tier — refused rather than ignored: a typo would otherwise leave chat
+  // on the large tier with nothing to show the setting was dropped.
+  if (global.chatTier !== undefined && global.chatTier !== null) {
+    const chatTier: unknown = global.chatTier;
+    if (typeof chatTier !== 'string' || !isTierName(chatTier)) {
+      throw new Error(
+        `chatTier: '${String(chatTier)}' in global config (~/.archon/config.yaml) ` +
+          `must be one of: ${TIER_NAMES.join(', ')}`
+      );
+    }
+    result.chatTier = chatTier;
+  }
 
   // Streaming preferences
   if (global.streaming) {

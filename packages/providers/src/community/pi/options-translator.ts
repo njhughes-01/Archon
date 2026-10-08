@@ -141,6 +141,9 @@ const PI_DEFAULT_TOOL_NAMES = [
   'write',
 ] as const satisfies readonly PiToolName[];
 
+/** Pi's built-in tools that write files. A turn with `restrictFileWrites` runs without them. */
+const PI_FILE_WRITE_TOOL_NAMES: ReadonlySet<PiToolName> = new Set<PiToolName>(['edit', 'write']);
+
 /**
  * Pi's default coding tools, rebuilt with managed-env injection. Used when
  * attaching native tools to a chat that had no tool restrictions: setting
@@ -170,23 +173,32 @@ export function buildDefaultPiTools(cwd: string, env?: Record<string, string>): 
  * relevant defaults; when non-empty, it is injected into every bash spawn via
  * a `BashSpawnHook`, matching Claude's `options.env` and Codex's constructor
  * `env` behavior so codebase-scoped env vars reach tool subprocesses.
+ *
+ * `restrictFileWrites` (the request's provider-neutral option) removes Pi's
+ * edit and write tools from whatever set the rules above select. It is not
+ * expressed as `denied_tools`: a deny list starts from every built-in, which
+ * would also hand the turn grep/find/ls it does not have by default.
  */
 export function resolvePiTools(
   cwd: string,
   nodeConfig?: NodeConfig,
-  env?: Record<string, string>
+  env?: Record<string, string>,
+  restrictFileWrites = false
 ): ResolvedTools {
   const allowed = nodeConfig?.allowed_tools;
   const denied = nodeConfig?.denied_tools;
   const spawnHook = buildBashSpawnHook(env);
+  const permitted = (name: PiToolName): boolean =>
+    !restrictFileWrites || !PI_FILE_WRITE_TOOL_NAMES.has(name);
 
   if (allowed === undefined && denied === undefined) {
     // No restrictions. Match Pi's default tool set unless env injection forces
     // a custom bash tool (Pi's default bashTool is pre-constructed with no
-    // spawnHook and there's no way to retrofit env onto it).
-    if (!spawnHook) return { tools: undefined, unknownTools: [] };
+    // spawnHook and there's no way to retrofit env onto it), or the default
+    // set itself has to shrink.
+    if (!spawnHook && !restrictFileWrites) return { tools: undefined, unknownTools: [] };
     return {
-      tools: PI_DEFAULT_TOOL_NAMES.map(n => buildPiTool(n, cwd, spawnHook)),
+      tools: PI_DEFAULT_TOOL_NAMES.filter(permitted).map(n => buildPiTool(n, cwd, spawnHook)),
       unknownTools: [],
     };
   }
@@ -219,7 +231,7 @@ export function resolvePiTools(
 
   // Dedupe by name (handles allowed_tools: ['read', 'read'])
   const seen = new Set<PiToolName>();
-  const unique = selected.filter(n => {
+  const unique = selected.filter(permitted).filter(n => {
     if (seen.has(n)) return false;
     seen.add(n);
     return true;

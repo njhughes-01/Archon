@@ -21,6 +21,7 @@ type MockRuntime = {
     session: {
       create: ReturnType<typeof mock>;
       get: ReturnType<typeof mock>;
+      update: ReturnType<typeof mock>;
       promptAsync: ReturnType<typeof mock>;
       abort: ReturnType<typeof mock>;
       message: ReturnType<typeof mock>;
@@ -67,6 +68,7 @@ function createPendingStream(): AsyncIterable<OpencodeEvent> {
 function makeRuntime(overrides?: {
   sessionCreate?: ReturnType<typeof mock>;
   sessionGet?: ReturnType<typeof mock>;
+  sessionUpdate?: ReturnType<typeof mock>;
   promptAsync?: ReturnType<typeof mock>;
   sessionMessage?: ReturnType<typeof mock>;
   sessionAbort?: ReturnType<typeof mock>;
@@ -78,6 +80,8 @@ function makeRuntime(overrides?: {
     overrides?.sessionCreate ?? mock(async () => ({ data: { id: 'session-1' } }));
   const sessionGet =
     overrides?.sessionGet ?? mock(async () => ({ data: { id: 'resumed-session' } }));
+  const sessionUpdate =
+    overrides?.sessionUpdate ?? mock(async () => ({ data: { id: 'resumed-session' } }));
   const promptAsync = overrides?.promptAsync ?? mock(async () => undefined);
   const sessionMessage = overrides?.sessionMessage ?? mock(async () => ({ data: { info: {} } }));
   const sessionAbort = overrides?.sessionAbort ?? mock(async () => undefined);
@@ -94,6 +98,7 @@ function makeRuntime(overrides?: {
       session: {
         create: sessionCreate,
         get: sessionGet,
+        update: sessionUpdate,
         promptAsync,
         abort: sessionAbort,
         message: sessionMessage,
@@ -1556,6 +1561,161 @@ describe('OpencodeProvider', () => {
         agent: 'archon-tools-agent',
       }),
     });
+  });
+
+  // ─── restrictFileWrites: the provider-neutral "no file writes" intent ────
+  // Translated to OpenCode's per-session permission ruleset: `edit` denied.
+
+  const DENY_EDIT = { permission: 'edit', pattern: '*', action: 'deny' };
+  const idle = (sessionID: string): OpencodeEvent => ({
+    type: 'session.idle',
+    properties: { sessionID },
+  });
+  const restrictionWarning = (): unknown =>
+    mockLogger.warn.mock.calls.find(c => c[1] === 'opencode.file_write_restriction_unconfirmed');
+
+  test('restrictFileWrites creates the session with edit denied', async () => {
+    expect(new OpencodeProvider().getCapabilities().fileWriteRestriction).toBe(true);
+
+    const runtime = makeRuntime({
+      sessionCreate: mock(async () => ({ data: { id: 'session-1', permission: [DENY_EDIT] } })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('session-1')];
+
+    const { error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(runtime.client.session.create).toHaveBeenCalledWith({
+      query: { directory: '/tmp' },
+      body: { permission: [DENY_EDIT] },
+    });
+    expect(runtime.client.session.update).not.toHaveBeenCalled();
+    // The restriction is the session's permission, not a guessed tool-id map.
+    const [{ body }] = runtime.client.session.promptAsync.mock.calls[0] as [
+      { body: Record<string, unknown> },
+    ];
+    expect(body).not.toHaveProperty('tools');
+    expect(restrictionWarning()).toBeUndefined();
+  });
+
+  test('restrictFileWrites adds the denial to a resumed session, keeping its other rules', async () => {
+    const existingRule = { permission: 'bash', pattern: 'git push*', action: 'ask' };
+    const runtime = makeRuntime({
+      sessionGet: mock(async () => ({
+        data: { id: 'resumed-session', permission: [existingRule] },
+      })),
+      sessionUpdate: mock(async () => ({
+        data: { id: 'resumed-session', permission: [existingRule, DENY_EDIT] },
+      })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('resumed-session')];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', 'resume-me', {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(runtime.client.session.update).toHaveBeenCalledWith({
+      path: { id: 'resumed-session' },
+      query: { directory: '/tmp' },
+      body: { permission: [existingRule, DENY_EDIT] },
+    });
+    expect(runtime.client.session.create).not.toHaveBeenCalled();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'resumed-session', resumed: true }]);
+    expect(restrictionWarning()).toBeUndefined();
+  });
+
+  test('a resumed session that already denies edit is not updated again', async () => {
+    const runtime = makeRuntime({
+      sessionGet: mock(async () => ({
+        data: { id: 'resumed-session', permission: [DENY_EDIT] },
+      })),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('resumed-session')];
+
+    await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', 'resume-me', {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(runtime.client.session.update).not.toHaveBeenCalled();
+  });
+
+  test('without restrictFileWrites no permission is sent on create or resume', async () => {
+    const fresh = makeRuntime();
+    runtimeQueue.push(fresh);
+    scriptedEvents = [idle('session-1')];
+    await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, { assistantConfig: TEST_MODEL })
+    );
+    expect(fresh.client.session.create).toHaveBeenCalledWith({ query: { directory: '/tmp' } });
+
+    resetEmbeddedRuntime();
+    const resumed = makeRuntime();
+    runtimeQueue.push(resumed);
+    scriptedEvents = [idle('resumed-session')];
+    await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', 'resume-me', { assistantConfig: TEST_MODEL })
+    );
+    expect(resumed.client.session.update).not.toHaveBeenCalled();
+  });
+
+  test('a failed permission update keeps the resumed conversation and reports the restriction', async () => {
+    // Losing the user's conversation because one rule could not be set would
+    // trade a missing guard for a broken chat, and blame the resume for it.
+    const runtime = makeRuntime({
+      sessionUpdate: mock(async () => {
+        throw new Error('unknown field: permission');
+      }),
+    });
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('resumed-session')];
+
+    const { chunks, error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', 'resume-me', {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(chunks).toEqual([{ type: 'result', sessionId: 'resumed-session', resumed: true }]);
+    expect(runtime.client.session.create).not.toHaveBeenCalled();
+    expect(restrictionWarning()).toBeDefined();
+    expect(
+      mockLogger.warn.mock.calls.find(c => c[1] === 'opencode.session_resume_failed')
+    ).toBeUndefined();
+  });
+
+  test('a server that does not echo the denial is reported, not trusted', async () => {
+    // Typings are the only evidence the field is honoured. A server that
+    // ignores it answers without the rule; say so rather than assume.
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('session-1')];
+
+    const { error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    expect(restrictionWarning()).toBeDefined();
   });
 
   test('external baseUrl mode is rejected to enforce managed runtime control', async () => {

@@ -811,7 +811,7 @@ The console **AI Settings** page (Settings in the web UI) has four sections:
 
 When you're logged in (a web identity resolves), the **Model Tiers** and **Model Aliases** panels show a **"This install / Just me"** scope toggle, and **Defaults** gains a just-me "Chat runs on" combo (provider + model). The "Just me" scope stores your personal tiers/aliases/default assistant (and optional chat-model pin) in Archon's database and applies them as the **highest-precedence** layer — your overrides win over the install config for runs and chats *you* start, without changing anyone else's. This needs an identity but **no** `TOKEN_ENCRYPTION_KEY` (model names aren't secrets); on a solo install without web auth the toggle simply doesn't appear and everything behaves exactly as before.
 
-If a chat asks for the `large` tier and only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set `large`.
+Chat asks for the `large` tier unless the install sets [`chatTier`](/reference/configuration/). If only a different tier is configured, Archon uses the nearest preset and posts a one-line notice telling you which tier answered and where to set the one chat asked for.
 
 ### Connecting from the CLI
 
@@ -838,9 +838,11 @@ archon ai default codex --scope user
 archon ai default pi openrouter/minimax/minimax-m2 --scope user
 ```
 
-**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured `large` tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when no `large` tier is configured anywhere) → the built-in tier default (claude and codex only — other providers have none). Workflow nodes are unaffected — `model: large` keeps meaning the tier.
+**How the chat model is resolved.** The provider comes from your personal default (if set), else the conversation's recorded assistant, else the install default. The model then resolves as: your `default_model` pin (only when your default provider matches the effective provider) → the configured chat tier (yours > repo > global) → the install's `assistants.<provider>.model` (only when `chatTier` is unset and no `large` tier is configured anywhere) → the built-in tier default (claude and codex only — other providers have none). The chat tier is `large` unless the install sets `chatTier: small | medium | large` in `~/.archon/config.yaml`; setting it, even to `large`, takes `assistants.<provider>.model` out of the chain. Workflow nodes are unaffected — `model: large` keeps meaning the tier.
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
+
+**What chat can change.** The chat agent answers questions and does read-only research; work that changes files runs in a workflow. Archon tells the agent this in its instructions and also asks the provider to run every chat turn without its built-in file-editing tools. Which providers honour that request is the "Direct chat without file-editing tools" row of the [capability matrix](/reference/provider-capabilities/), generated from the providers themselves. Where the row shows ❌ the restriction is not wired for that provider: the instructions are the only control, and Archon logs `orchestrator.chat_file_write_restriction_unsupported` on each chat turn. The shell stays available on every provider (project setup clones with it, and research reads with it), so this is a guard against the agent quietly editing a project, not a sandbox. Workflow nodes are never restricted this way.
 
 ### Per-run model bindings
 

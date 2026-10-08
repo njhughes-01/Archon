@@ -1256,7 +1256,7 @@ describe('orchestrator-agent handleMessage', () => {
       expect(platform.sendMessage).not.toHaveBeenCalledWith('chat-456', 'This should not appear');
     });
 
-    test('sends partial command text when command is split across chunks', async () => {
+    test('holds back a command keyword that is split across chunks', async () => {
       mockListCodebases.mockResolvedValue([mockCodebase]);
       mockDiscoverWorkflows.mockResolvedValue({ workflows: testWorkflows, errors: [] });
       mockFindWorkflow.mockImplementation(
@@ -1265,7 +1265,8 @@ describe('orchestrator-agent handleMessage', () => {
       );
 
       mockClient.sendQuery.mockImplementation(async function* () {
-        // Chunk 1: partial command — does not match regex yet, so it IS sent
+        // Chunk 1: the start of a command keyword — held back, because shown
+        // now it would be a fragment the next chunk turns into a command
         yield { type: 'assistant', content: '/invoke-work' };
         // Chunk 2: completes the command — accumulated string matches, NOT sent
         yield { type: 'assistant', content: 'flow fix-bug --project test-project' };
@@ -1274,8 +1275,8 @@ describe('orchestrator-agent handleMessage', () => {
 
       await handleMessage(platform, 'chat-456', 'fix the bug');
 
-      // Partial chunk is sent (pre-existing behavior: detection fires on accumulated text)
-      expect(platform.sendMessage).toHaveBeenCalledWith('chat-456', '/invoke-work');
+      // Partial chunk is NOT sent
+      expect(platform.sendMessage).not.toHaveBeenCalledWith('chat-456', '/invoke-work');
       // Completing chunk is NOT sent
       expect(platform.sendMessage).not.toHaveBeenCalledWith(
         'chat-456',

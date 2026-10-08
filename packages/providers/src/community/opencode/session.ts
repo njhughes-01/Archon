@@ -1,4 +1,5 @@
 import { createLogger } from '@archon/paths';
+import type { PermissionRule } from '@opencode-ai/sdk/v2';
 
 import type { MessageChunk, SendQueryOptions } from '../../types';
 
@@ -9,7 +10,7 @@ import {
   type NamedAgentConfig,
 } from './agent-config';
 import { errorMessage, pendingPermissionError } from './errors';
-import type { OpencodeClientLike } from './runtime';
+import type { OpencodeClientLike, OpencodeSessionInfo } from './runtime';
 import { normalizeTokens } from './tokens';
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
@@ -23,10 +24,76 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+/**
+ * The session permission rule for a turn that sets `restrictFileWrites`:
+ * OpenCode's `edit` permission, the category its file-modifying tools ask for,
+ * denied for every path. A session ruleset touches neither the shared embedded
+ * server's config (runtime.ts) nor a per-prompt map of tool ids.
+ *
+ * VERIFIED AGAINST TYPINGS ONLY (@opencode-ai/sdk 1.17.3), never against a
+ * running OpenCode. The `permission` body field and `PermissionRule` are
+ * declared on the SDK's `./v2` surface for `POST /session` and
+ * `PATCH /session/{sessionID}`; this provider's v1 client calls the same two
+ * routes and sends `body` as given. Two things the typings do not say: that
+ * `'*'` is the match-all pattern (OpenCode's convention), and whether an
+ * update replaces the ruleset or appends to it. The update below therefore
+ * sends the session's existing rules plus this one and runs once per session.
+ * `confirmFileWriteDenial` reports a server that answers without the rule.
+ *
+ * The rule is stored on the session and nothing removes it, unlike the other
+ * providers' per-request translations. That is sound only because a chat
+ * conversation's session id is resumed by chat turns alone: workflow nodes
+ * resume ids their own run recorded, never a conversation's.
+ */
+const FILE_WRITE_DENIAL: PermissionRule = { permission: 'edit', pattern: '*', action: 'deny' };
+
+function isFileWriteDenial(rule: unknown): boolean {
+  return (
+    isRecord(rule) &&
+    rule.permission === FILE_WRITE_DENIAL.permission &&
+    rule.pattern === FILE_WRITE_DENIAL.pattern &&
+    rule.action === FILE_WRITE_DENIAL.action
+  );
+}
+
+function rulesOf(session: OpencodeSessionInfo | undefined): unknown[] {
+  return Array.isArray(session?.permission) ? session.permission : [];
+}
+
+function confirmFileWriteDenial(session: OpencodeSessionInfo | undefined, sessionId: string): void {
+  if (rulesOf(session).some(isFileWriteDenial)) return;
+  getLog().warn({ sessionId }, 'opencode.file_write_restriction_unconfirmed');
+}
+
+/**
+ * Add the denial to a session that is being resumed without it. A failure here
+ * is reported and the conversation carries on: dropping the user's session
+ * because one rule could not be set would break the chat to protect it.
+ */
+async function denyFileWritesOnResumedSession(
+  client: OpencodeClientLike,
+  cwd: string,
+  sessionId: string,
+  rules: unknown[]
+): Promise<void> {
+  if (rules.some(isFileWriteDenial)) return;
+  try {
+    const updated = await client.session.update({
+      path: { id: sessionId },
+      query: { directory: cwd },
+      body: { permission: [...rules, FILE_WRITE_DENIAL] },
+    });
+    confirmFileWriteDenial(updated.data, sessionId);
+  } catch (error) {
+    getLog().warn({ err: error, sessionId }, 'opencode.file_write_restriction_unconfirmed');
+  }
+}
+
 export async function resolveSessionId(
   client: OpencodeClientLike,
   cwd: string,
-  resumeSessionId: string | undefined
+  resumeSessionId: string | undefined,
+  restrictFileWrites = false
 ): Promise<{ sessionId: string; resumed: boolean }> {
   if (resumeSessionId) {
     try {
@@ -36,6 +103,9 @@ export async function resolveSessionId(
       });
       const sessionId = existing.data?.id;
       if (typeof sessionId === 'string' && sessionId.length > 0) {
+        if (restrictFileWrites) {
+          await denyFileWritesOnResumedSession(client, cwd, sessionId, rulesOf(existing.data));
+        }
         return { sessionId, resumed: true };
       }
     } catch (error) {
@@ -43,11 +113,15 @@ export async function resolveSessionId(
     }
   }
 
-  const created = await client.session.create({ query: { directory: cwd } });
+  const created = await client.session.create({
+    query: { directory: cwd },
+    ...(restrictFileWrites ? { body: { permission: [FILE_WRITE_DENIAL] } } : {}),
+  });
   const sessionId = created.data?.id;
   if (!sessionId) {
     throw new Error('OpenCode failed to create a session');
   }
+  if (restrictFileWrites) confirmFileWriteDenial(created.data, sessionId);
 
   return { sessionId, resumed: false };
 }
