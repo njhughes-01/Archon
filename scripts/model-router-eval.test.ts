@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Fetch } from '../packages/workflows/src/jev/jev-client';
 import { ROUTER_DEFAULTS } from '../packages/workflows/src/jev/model-router';
+import { packInstances } from './model-router-lowerable';
 import {
   EVAL_CASES,
   MIN_ROUTINE_LOWERED_SHARE,
@@ -121,23 +122,45 @@ describe('the labelled set', () => {
     }
   });
 
-  it('names only commands the pack ships, with unique ids and tasks', async () => {
+  it('names only commands the repository ships, with unique ids and tasks', async () => {
     const cases = await readCases(EVAL_CASES);
     expect(new Set(cases.map(c => c.id)).size).toBe(cases.length);
     expect(new Set(cases.map(c => c.task)).size).toBe(cases.length);
-    for (const node of new Set(cases.map(c => c.node))) {
-      const found = [
+    const repoCommands = join(PACK_ROOT, '../../commands');
+    const dirs = [
+      ...[
         'deliver',
         'implement',
         'investigate',
         'plan',
         'pr',
         'review',
+        'scout',
         'triage',
         'upkeep',
         'validate',
-      ].some(workflow => existsSync(join(PACK_ROOT, workflow, 'commands', `${node}.md`)));
+      ].map(workflow => join(PACK_ROOT, workflow, 'commands')),
+      join(repoCommands, 'defaults'),
+      repoCommands,
+    ];
+    for (const node of new Set(cases.map(c => c.node))) {
+      const found = dirs.some(dir => existsSync(join(dir, `${node}.md`)));
       expect({ node, found }).toEqual({ node, found: true });
+    }
+  });
+
+  it('keeps a second held-out group that shares no command with the tuning half', async () => {
+    const cases = await readCases(EVAL_CASES);
+    const tuned = new Set(cases.filter(c => c.split === 'tuning').map(c => c.node));
+    const fresh = cases.filter(c => c.split === 'heldout2');
+    expect(fresh.length).toBeGreaterThanOrEqual(12);
+    expect(fresh.filter(c => tuned.has(c.node))).toEqual([]);
+    for (const kinds of [
+      ['extraction', 'mechanical'],
+      ['implementation'],
+      ['architecture', 'high_risk'],
+    ]) {
+      expect(fresh.some(c => kinds.includes(c.kind))).toBe(true);
     }
   });
 
@@ -375,6 +398,97 @@ describe('runEval', () => {
   });
 });
 
+describe('which pack steps can be lowered on a tier map', () => {
+  const REPO_ROOT = join(PACK_ROOT, '../../..');
+
+  it('lowers only steps that declare a contract, write the checkout and sit clear of any session', async () => {
+    const instances = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small');
+    const lowerable = instances.filter(instance => instance.lowerable);
+    expect(lowerable.length).toBeGreaterThan(0);
+    for (const instance of lowerable) {
+      const { node } = instance.candidate;
+      expect(node.output_format).toBeDefined();
+      expect(node.mutates_checkout).not.toBe(false);
+      expect(instance.candidate.sameProviderOnly).toBe(false);
+      expect(instance.authoredTier).toBe('medium');
+      expect(instance.target).toBe('small (codex)');
+    }
+    // Every step without an output contract is refused for that reason and no other.
+    for (const instance of instances) {
+      if (instance.authoredTier !== 'medium') continue;
+      if (instance.candidate.node.output_format === undefined) {
+        expect({ id: instance.nodeId, reason: instance.reason }).toEqual({
+          id: instance.nodeId,
+          reason: 'unverifiable',
+        });
+      }
+    }
+  });
+
+  it('never moves a read-only step across providers, and still lowers it within one', async () => {
+    const readOnly = (instances: Awaited<ReturnType<typeof packInstances>>): typeof instances =>
+      instances.filter(
+        i => i.authoredTier === 'medium' && i.candidate.node.mutates_checkout === false
+      );
+    const across = readOnly(await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small'));
+    expect(across.length).toBeGreaterThan(0);
+    expect(across.filter(i => i.lowerable)).toEqual([]);
+    const within = readOnly(await packInstances(REPO_ROOT, PACK_ROOT, 'claude-only'));
+    expect(within.filter(i => i.lowerable).length).toBe(within.length);
+  });
+
+  it('traces a composed step back to the command its own workflow names', async () => {
+    const instances = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small');
+    const composed = instances.filter(i => i.candidate.node.source.kind === 'inline');
+    expect(composed.length).toBeGreaterThan(0);
+    expect(composed.filter(i => i.command === undefined)).toEqual([]);
+  });
+
+  it('prints the report without calling a classifier', async () => {
+    const { fetch, tasks } = classifier(() => ({ choice: 'small' }));
+    const { code, text } = await capture(['--lowerable', 'codex-small'], LIVE_ENV, fetch);
+    expect(code).toBe(0);
+    expect(tasks).toEqual([]);
+    expect(text).toContain("on the 'codex-small' map");
+    expect(text).toMatch(/Single-shot agent steps: \d+; on a routable tier: \d+; lowerable: \d+/);
+    expect((await capture(['--lowerable', 'nope'], {})).code).toBe(2);
+  });
+});
+
+describe('main with a tier map', () => {
+  it('asks only about cases whose step the router would ask about, and says why not for the rest', async () => {
+    const { fetch, tasks } = classifier(() => ({ choice: 'small' }));
+    const { code, text } = await capture(['--map', 'codex-small', '--json'], LIVE_ENV, fetch);
+    const report = JSON.parse(text) as {
+      map: string;
+      ceiling: string;
+      results: { id: string; node: string; offered: boolean; notOfferedReason?: string }[];
+    };
+    expect(report.map).toBe('codex-small');
+    expect(report.ceiling).toBe('medium');
+    const offered = report.results.filter(r => r.offered);
+    expect(tasks).toHaveLength(offered.length);
+    expect(offered.length).toBeGreaterThan(0);
+    expect(offered.length).toBeLessThan(report.results.length);
+    expect(
+      report.results.filter(r => !r.offered).every(r => typeof r.notOfferedReason === 'string')
+    ).toBe(true);
+    // A classifier that says "small" to everything under-routes the offered risky cases.
+    expect(code).toBe(1);
+  });
+
+  it('keeps the lowerable count apart from the agreement verdict', async () => {
+    const { text, code } = await capture(['--map', 'codex-small', '--dry'], {});
+    expect(code).toBe(0);
+    expect(text).toMatch(/Can be lowered on this map: \d+ of \d+ cases/);
+    expect(text).toContain('Not offered, by reason:');
+    expect(text.trim().split('\n').at(-1)).toMatch(
+      /PASS\. No offered case was routed below its label\.$/
+    );
+    expect(text).not.toContain('too few routine cases');
+  });
+});
+
 describe('main', () => {
   it('passes a dry run of the shipped set and labels every result line as dry', async () => {
     const { code, text } = await capture(['--dry'], {});
@@ -442,7 +556,8 @@ describe('main', () => {
     const whole = await capture(['--dry'], {});
     expect(whole.text).toContain('tuning half');
     expect(whole.text).toContain('heldout half');
-    expect(whole.text.match(/passes on its own/g)).toHaveLength(2);
+    expect(whole.text).toContain('heldout2 half');
+    expect(whole.text.match(/passes on its own/g)).toHaveLength(3);
     expect((await capture(['--split', 'nope'], {})).code).toBe(2);
   });
 

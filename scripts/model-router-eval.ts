@@ -31,6 +31,13 @@
  * `tuning` half only; a full run reports each half beside the whole, so a change that only
  * fits the cases it was tuned on shows up as a gap between them.
  *
+ * `--map <tier-map>` changes what is measured. Without it every case is asked, on one
+ * stand-in provider that can run anything: agreement with the labels. With it a case
+ * stands for its command's real step in the pack, on real providers, and is asked only if
+ * the router would ask about that step on that map; the report says which cases could be
+ * lowered at all and why the others could not. `--lowerable <tier-map>` prints that for
+ * every step of the pack and calls no classifier. Maps: see `model-router-lowerable.ts`.
+ *
  * `--ceiling` is the authored tier every case is given (default `large`, so all three
  * tiers are in play; `medium` mirrors the default `modelRouter.tiers`).
  *
@@ -52,9 +59,18 @@ import {
   decideTier,
   readRouterSettings,
   routeAgentNode,
+  routerInactiveReason,
   type RouterThresholds,
+  type RoutingCandidate,
 } from '../packages/workflows/src/jev/model-router';
 import { resolveNodeModel } from '../packages/workflows/src/node-model-resolution';
+import {
+  formatLowerability,
+  isTierMapName,
+  packInstances,
+  type PackInstance,
+  type TierMapName,
+} from './model-router-lowerable';
 import { dagNodeSchema } from '../packages/workflows/src/schemas/dag-node';
 import {
   TIER_NAMES,
@@ -81,7 +97,12 @@ const CASE_KINDS = [
 type CaseKind = (typeof CASE_KINDS)[number];
 const ROUTINE_KINDS: readonly CaseKind[] = ['extraction', 'mechanical'];
 
-const CASE_SPLITS = ['tuning', 'heldout'] as const;
+/**
+ * `tuning` is the half wording and thresholds are tuned against. `heldout` is the other
+ * half of the original set, which shares its commands. `heldout2` was written later from
+ * commands and phrasings the tuning half does not contain.
+ */
+const CASE_SPLITS = ['tuning', 'heldout', 'heldout2'] as const;
 type CaseSplit = (typeof CASE_SPLITS)[number];
 
 const FEATURE_NAMES = [
@@ -174,14 +195,23 @@ export async function readCases(path: string): Promise<EvalCase[]> {
   return cases;
 }
 
-/** The text of a pack command, searched for in every workflow's `commands/` directory. */
+const REPO_ROOT = resolve(import.meta.dir, '..');
+/** Command folders outside the pack, searched after it: the bundled defaults and the repo's own. */
+const EXTRA_COMMAND_DIRS = [
+  join(REPO_ROOT, '.archon/commands/defaults'),
+  join(REPO_ROOT, '.archon/commands'),
+];
+
+/** The text of a command: from a pack workflow's `commands/` directory, or the repo's own. */
 async function readCommandText(packRoot: string, node: string): Promise<string> {
-  for (const entry of await readdir(packRoot, { withFileTypes: true })) {
-    if (!entry.isDirectory()) continue;
-    const file = Bun.file(join(packRoot, entry.name, 'commands', `${node}.md`));
+  const dirs = (await readdir(packRoot, { withFileTypes: true }))
+    .filter(entry => entry.isDirectory())
+    .map(entry => join(packRoot, entry.name, 'commands'));
+  for (const dir of [...dirs, ...EXTRA_COMMAND_DIRS]) {
+    const file = Bun.file(join(dir, `${node}.md`));
     if (await file.exists()) return file.text();
   }
-  throw new Error(`No command named '${node}' under ${packRoot}`);
+  throw new Error(`No command named '${node}' under ${packRoot} or the repository's commands`);
 }
 
 export interface CaseResult {
@@ -192,6 +222,12 @@ export interface CaseResult {
   /** The label, capped at the ceiling: no router can route above it. */
   label: TierName;
   routedTier: TierName;
+  /**
+   * Only with a tier map: whether the router would ask about this step at all on that
+   * map, and why not. Absent in the plain agreement run, where every case is asked.
+   */
+  offered?: boolean;
+  notOfferedReason?: string;
   /** The classifier answered this case. An unanswered case stays at the ceiling. */
   answered: boolean;
   underRouted: boolean;
@@ -410,6 +446,8 @@ export interface EvalReport {
   dry: boolean;
   classifier: string;
   ceiling: TierName;
+  /** The tier map the offer was computed on, when the run used one. */
+  map?: TierMapName;
   thresholds: RouterThresholds;
   results: CaseResult[];
   /** Every case that was run, scored together. This decides the exit code. */
@@ -426,74 +464,123 @@ export interface RunEvalOptions {
   dry: boolean;
   /** HTTP boundary for a live run; a dry run never uses it. */
   fetch?: Fetch;
+  /**
+   * Ask only about the steps the router would ask about on this tier map, using each
+   * command's real step in the pack and the registered providers' real capabilities.
+   * Without it every case is asked, on one stand-in provider that can run anything: that
+   * measures agreement with the labels and nothing about which steps can move.
+   */
+  map?: TierMapName;
+}
+
+/** A closed contract every provider enforces as written, so every case can be asked. */
+const EVAL_CONTRACT = {
+  type: 'object',
+  properties: { result: { type: 'string' } },
+  required: ['result'],
+};
+
+/** The router's input for one case in the agreement run: a stand-in step on one provider. */
+function agreementCandidate(evalCase: EvalCase, ceiling: TierName): RoutingCandidate {
+  // Production only classifies steps that declare an output contract, so the stand-in
+  // always declares one. `features.has_output_format` says what the pack's own step does.
+  const node = dagNodeSchema.parse({
+    id: evalCase.id,
+    command: evalCase.node,
+    model: ceiling,
+    output_format: EVAL_CONTRACT,
+    ...(evalCase.features.tools_declared ? { allowed_tools: ['Read'] } : {}),
+    ...(evalCase.features.mcp_present ? { mcp: 'mcp.json' } : {}),
+    ...(evalCase.features.skills_present ? { skills: ['skill'] } : {}),
+    ...(evalCase.features.mutates_checkout ? {} : { mutates_checkout: false }),
+  });
+  if (node.kind !== 'agent') throw new Error(`Case '${evalCase.id}' did not build an agent node`);
+  return {
+    node,
+    resolution: resolveNodeModel(
+      node,
+      {
+        provider: EVAL_PROVIDER,
+        model: undefined,
+        preset: undefined,
+        tier: undefined,
+        effort: undefined,
+        providerOrigin: 'default assistant',
+      },
+      {},
+      EVAL_PROFILE
+    ),
+    aiProfile: EVAL_PROFILE,
+    config: { tiers: [ceiling], mode: 'apply' },
+    isResumeSource: false,
+    usesPersistedScope: false,
+    sameProviderOnly: true,
+    inContainer: false,
+    capabilityScope: {
+      declaredEffort: undefined,
+      workflowFallbackModel: undefined,
+      workflowSandbox: undefined,
+      webSearchMode: undefined,
+      workflowBetas: undefined,
+      hasEnvVars: false,
+    },
+  };
 }
 
 /** Route every case with the router's own code and score the result. */
 export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
-  const { cases, packRoot, ceiling, dry } = options;
+  const { cases, packRoot, dry, map } = options;
   // A dry run needs no key: it switches the router on for itself and answers locally.
   const env: NodeJS.ProcessEnv = dry
     ? { ...options.env, JEV_API_KEY: 'dry-run', JEV_ENABLED: '1', JEV_ROUTER_ENABLED: '1' }
     : options.env;
   const settings = readRouterSettings(env);
   const thresholds: RouterThresholds = settings.ok ? settings.settings : ROUTER_DEFAULTS;
+  const inactive = routerInactiveReason(env);
   const quiet = {
     info: (): void => undefined,
     warn: (): void => undefined,
     debug: (): void => undefined,
   };
+  // With a map, a case stands for its command's own step in the workflow that declares
+  // it: the first one the pack lists, which for every command is its home workflow.
+  const instances = map === undefined ? [] : await packInstances(REPO_ROOT, packRoot, map);
+  const instanceOf = (command: string): PackInstance | undefined =>
+    instances.find(
+      instance => instance.command === command && instance.candidate.node.source.kind === 'command'
+    );
+  // On a map the ceiling is each step's own authored tier, which the router's default
+  // config only lowers from medium.
+  const ceiling: TierName = map === undefined ? options.ceiling : 'medium';
 
   const results: CaseResult[] = [];
   for (const evalCase of cases) {
-    const stepText = await readCommandText(packRoot, evalCase.node);
-    const node = dagNodeSchema.parse({
+    const label = rank(evalCase.label_min_tier) < rank(ceiling) ? evalCase.label_min_tier : ceiling;
+    const base = {
       id: evalCase.id,
-      command: evalCase.node,
-      model: ceiling,
-      ...(evalCase.features.has_output_format
-        ? {
-            output_format: {
-              type: 'object',
-              properties: { result: { type: 'string' } },
-              required: ['result'],
-            },
-          }
-        : {}),
-      ...(evalCase.features.tools_declared ? { allowed_tools: ['Read'] } : {}),
-      ...(evalCase.features.mcp_present ? { mcp: 'mcp.json' } : {}),
-      ...(evalCase.features.skills_present ? { skills: ['skill'] } : {}),
-      ...(evalCase.features.mutates_checkout ? {} : { mutates_checkout: false }),
-    });
-    if (node.kind !== 'agent') throw new Error(`Case '${evalCase.id}' did not build an agent node`);
+      node: evalCase.node,
+      kind: evalCase.kind,
+      split: evalCase.split,
+      label,
+    };
+    const instance = map === undefined ? undefined : instanceOf(evalCase.node);
+    if (map !== undefined && instance?.lowerable !== true) {
+      results.push({
+        ...base,
+        routedTier: ceiling,
+        offered: false,
+        notOfferedReason: instance?.reason ?? 'no_single_shot_step_in_pack',
+        // Nothing was asked, so there is no answer to wait for and nothing to score.
+        answered: true,
+        underRouted: false,
+        source: 'not_offered',
+      });
+      continue;
+    }
+    const stepText = await readCommandText(packRoot, evalCase.node);
     const routed = await routeAgentNode(
       {
-        node,
-        resolution: resolveNodeModel(
-          node,
-          {
-            provider: EVAL_PROVIDER,
-            model: undefined,
-            preset: undefined,
-            tier: undefined,
-            effort: undefined,
-            providerOrigin: 'default assistant',
-          },
-          {},
-          EVAL_PROFILE
-        ),
-        aiProfile: EVAL_PROFILE,
-        config: { tiers: [ceiling], mode: 'apply' },
-        isResumeSource: false,
-        usesPersistedScope: false,
-        sameProviderOnly: true,
-        inContainer: false,
-        capabilityScope: {
-          declaredEffort: undefined,
-          workflowFallbackModel: undefined,
-          workflowSandbox: undefined,
-          webSearchMode: undefined,
-          hasEnvVars: false,
-        },
+        ...(instance?.candidate ?? agreementCandidate(evalCase, ceiling)),
         loadStepText: () => Promise.resolve(stepText),
         taskText: () => evalCase.task,
         credentialValues: () => [],
@@ -503,29 +590,31 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
         fetch: dry
           ? (): Promise<Response> => Promise.resolve(labelAnswer(evalCase, ceiling))
           : options.fetch,
-        getCapabilities: provider => (provider === EVAL_PROVIDER ? EVAL_CAPABILITIES : undefined),
+        ...(map === undefined
+          ? {
+              getCapabilities: (provider: string): ProviderCapabilities | undefined =>
+                provider === EVAL_PROVIDER ? EVAL_CAPABILITIES : undefined,
+            }
+          : {}),
         log: quiet,
       }
     );
-    if (routed === undefined) throw new Error(`Case '${evalCase.id}' was not routable`);
-    const { route } = routed;
-    const label = rank(evalCase.label_min_tier) < rank(ceiling) ? evalCase.label_min_tier : ceiling;
+    const route = routed?.route;
     results.push({
-      id: evalCase.id,
-      node: evalCase.node,
-      kind: evalCase.kind,
-      split: evalCase.split,
-      label,
-      routedTier: route.routedTier,
-      answered: route.source === 'jev',
-      underRouted: rank(route.routedTier) < rank(label),
-      source: route.source,
-      ...(route.reason !== undefined ? { reason: route.reason } : {}),
-      ...(route.chosenTier !== undefined ? { chosenTier: route.chosenTier } : {}),
-      ...(route.probability !== undefined ? { probability: route.probability } : {}),
-      ...(route.confidence !== undefined ? { confidence: route.confidence } : {}),
-      ...(route.riskNoul !== undefined ? { riskNoul: route.riskNoul } : {}),
-      ...(route.ambiguityNoul !== undefined ? { ambiguityNoul: route.ambiguityNoul } : {}),
+      ...base,
+      ...(map !== undefined ? { offered: true } : {}),
+      routedTier: route?.routedTier ?? ceiling,
+      answered: route?.source === 'jev',
+      underRouted: route !== undefined && rank(route.routedTier) < rank(label),
+      // No route at all means the router is absent here: no key, or a switch is off.
+      source: route?.source ?? 'inactive',
+      ...(route === undefined ? { reason: inactive ?? 'not_routable' } : {}),
+      ...(route?.reason !== undefined ? { reason: route.reason } : {}),
+      ...(route?.chosenTier !== undefined ? { chosenTier: route.chosenTier } : {}),
+      ...(route?.probability !== undefined ? { probability: route.probability } : {}),
+      ...(route?.confidence !== undefined ? { confidence: route.confidence } : {}),
+      ...(route?.riskNoul !== undefined ? { riskNoul: route.riskNoul } : {}),
+      ...(route?.ambiguityNoul !== undefined ? { ambiguityNoul: route.ambiguityNoul } : {}),
     });
   }
 
@@ -535,6 +624,7 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
       ? 'none (dry run: answers come from the labels)'
       : `${settings.ok ? settings.settings.model : ROUTER_DEFAULTS.model} at ${settings.ok ? settings.settings.apiBase : ROUTER_DEFAULTS.apiBase}`,
     ceiling,
+    ...(map !== undefined ? { map } : {}),
     thresholds: {
       minProbability: thresholds.minProbability,
       minConfidence: thresholds.minConfidence,
@@ -581,6 +671,9 @@ export function formatReport(report: EvalReport): string {
       : []),
     `classifier: ${report.classifier}`,
     `ceiling:    ${report.ceiling}`,
+    ...(report.map !== undefined
+      ? [`tier map:   ${report.map} (only steps the router would ask about on it are classified)`]
+      : []),
     `thresholds: risk>=${String(thresholds.riskThreshold)} ambiguity>=${String(thresholds.ambiguityThreshold)} keep the ceiling; probability>=${String(thresholds.minProbability)} confidence>=${String(thresholds.minConfidence)} needed to lower`,
     `cases: ${String(report.results.length)}`,
     '',
@@ -597,7 +690,7 @@ export function formatReport(report: EvalReport): string {
         fixed(result.riskNoul),
         fixed(result.ambiguityNoul).padEnd(5),
         result.kind.padEnd(14),
-        `${result.id}${result.underRouted ? '  UNDER-ROUTED' : ''}${result.answered ? '' : `  no answer (${result.reason ?? result.source})`}`,
+        `${result.id}${result.underRouted ? '  UNDER-ROUTED' : ''}${result.answered ? '' : `  no answer (${result.reason ?? result.source})`}${result.offered === false ? `  not offered (${result.notOfferedReason ?? ''})` : ''}`,
       ].join('  ')
     );
   }
@@ -639,6 +732,38 @@ export function formatReport(report: EvalReport): string {
   );
 
   const result = resultLabel(report);
+  if (report.map !== undefined) {
+    // Two separate facts. How many steps can move at all on this map is a property of the
+    // pack and the providers; whether the ones that can were routed sensibly is the
+    // classifier's. The routine-share bar belongs to the agreement run, not to this one.
+    const offered = report.results.filter(r => r.offered === true);
+    const notOffered = new Map<string, number>();
+    for (const r of report.results.filter(other => other.offered === false)) {
+      const reason = r.notOfferedReason ?? 'unknown';
+      notOffered.set(reason, (notOffered.get(reason) ?? 0) + 1);
+    }
+    lines.push(
+      '',
+      `Can be lowered on this map: ${String(offered.length)} of ${String(report.results.length)} cases (${[...new Set(offered.map(r => r.node))].sort().join(', ') || 'no commands'})`,
+      `Routed below the ceiling: ${String(offered.filter(r => rank(r.routedTier) < rank(report.ceiling)).length)} of ${String(offered.length)} offered`,
+      'Not offered, by reason:',
+      ...[...notOffered]
+        .sort((a, b) => b[1] - a[1])
+        .map(([reason, count]) => `  ${String(count).padStart(3)}  ${reason}`)
+    );
+    if (!score.scored) {
+      lines.push(
+        `${result} NOT SCORED. ${String(score.unanswered.length)} offered case(s) got no answer from the classifier.`
+      );
+    } else if (score.underRouted.length > 0) {
+      lines.push(
+        `${result} FAIL. ${String(score.underRouted.length)} offered case(s) were routed below their label.`
+      );
+    } else {
+      lines.push(`${result} PASS. No offered case was routed below its label.`);
+    }
+    return lines.join('\n');
+  }
   if (!score.scored) {
     const reasons = [
       ...new Set(report.results.filter(r => !r.answered).map(r => r.reason ?? r.source)),
@@ -664,7 +789,7 @@ export function formatReport(report: EvalReport): string {
 }
 
 const USAGE =
-  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--split tuning|heldout] [--cases <file>]';
+  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--split tuning|heldout|heldout2] [--map <tier-map>] [--cases <file>]\n       bun run scripts/model-router-eval.ts --lowerable <tier-map>';
 
 /** The command. Returns the exit code; `write` receives each output line. */
 export async function main(
@@ -678,6 +803,8 @@ export async function main(
   let ceiling: TierName = 'large';
   let casesPath = EVAL_CASES;
   let split: CaseSplit | undefined;
+  let map: TierMapName | undefined;
+  let lowerable: TierMapName | undefined;
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = argv[index + 1];
@@ -686,11 +813,28 @@ export async function main(
     else if (argument === '--ceiling' && isTier(value)) ceiling = argv[++index] as TierName;
     else if (argument === '--split' && CASE_SPLITS.some(known => known === value)) {
       split = argv[++index] as CaseSplit;
+    } else if (argument === '--map' && isTierMapName(value)) {
+      map = value;
+      index++;
+    } else if (argument === '--lowerable' && isTierMapName(value)) {
+      lowerable = value;
+      index++;
     } else if (argument === '--cases' && value !== undefined) {
       casesPath = resolve(argv[++index]);
     } else {
       write(`Unsupported argument: ${argument}`);
       write(USAGE);
+      return 2;
+    }
+  }
+
+  if (lowerable !== undefined) {
+    // A report about the pack and the providers. No classifier is called.
+    try {
+      write(formatLowerability(await packInstances(REPO_ROOT, PACK_ROOT, lowerable), lowerable));
+      return 0;
+    } catch (error) {
+      write(`Cannot build the report: ${messageOf(error)}`);
       return 2;
     }
   }
@@ -705,6 +849,7 @@ export async function main(
       env,
       dry,
       fetch,
+      ...(map !== undefined ? { map } : {}),
     });
   } catch (error) {
     // Deliberately every error: exit 1 means "the classifier was measured and fell
@@ -714,6 +859,7 @@ export async function main(
   }
   write(json ? JSON.stringify(report, null, 2) : formatReport(report));
   if (!report.score.scored) return 2;
+  if (report.map !== undefined) return report.score.underRouted.length === 0 ? 0 : 1;
   return report.score.pass ? 0 : 1;
 }
 
