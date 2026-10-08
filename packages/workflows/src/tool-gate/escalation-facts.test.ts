@@ -75,29 +75,43 @@ describe('targetHost', () => {
   test.each([
     [['-h', 'localhost', '-d', 'app'], 'loopback'],
     [['--host=127.0.0.1', '-c', 'select 1'], 'loopback'],
-    [['http://localhost:3000/api/items'], 'loopback'],
     [['mongodb://[::1]:27017/app'], 'loopback'],
     [['-d', 'app_test'], 'test_or_dev_named'],
+    // A name says more than an address: test on loopback is still stated as test.
+    [['-h', 'localhost', '-d', 'app_test'], 'test_or_dev_named'],
+    [['mongodb://127.0.0.1:27017/widgets_dev'], 'test_or_dev_named'],
     [['-h', 'db.dev.internal', '-d', 'app'], 'test_or_dev_named'],
-    [['https://sandbox.api.example.com/v1/charges'], 'test_or_dev_named'],
     [['-h', 'db.prod.internal', '-d', 'orders'], 'production_named'],
-    [['deploy@prod-1.example.com', 'uptime'], 'production_named'],
-    [['build/app.tar.gz', 'deploy@prod-1.example.com:/srv/app/current.tar.gz'], 'production_named'],
     // A production name wins over a loopback address: a tunnel is still production.
     [['-h', 'localhost', '-d', 'orders_production'], 'production_named'],
     [['-h', '10.20.4.17', '-d', 'orders'], 'unknown'],
+  ])('a database client given %p → %s', (args, expected) => {
+    expect<string | undefined>(targetHost(args, true)).toBe(expected);
+  });
+
+  test.each([
+    [['http://localhost:3000/api/items'], 'loopback'],
+    [['https://sandbox.api.example.com/v1/charges'], 'test_or_dev_named'],
+    [['deploy@prod-1.example.com', 'uptime'], 'production_named'],
+    [['build/app.tar.gz', 'deploy@prod-1.example.com:/srv/app/current.tar.gz'], 'production_named'],
     [['https://api.example.com/v1/users/42'], 'unknown'],
-  ])('%p → %s', (args, expected) => {
-    expect<string | undefined>(targetHost(args)).toBe(expected);
+    // Only the host is a name here: not the user, the path, or a request body.
+    [['-X', 'POST', 'http://127.0.0.1:3000/api/login', '-d', 'user=test'], 'loopback'],
+    [['https://api.example.com/v1/test-fixtures/42'], 'unknown'],
+    [['test@build-1.example.com', 'uptime'], 'unknown'],
+    [['-h', 'http://localhost:8080/'], 'loopback'],
+  ])('any other client given %p → %s', (args, expected) => {
+    expect<string | undefined>(targetHost(args, false)).toBe(expected);
   });
 
   test('arguments that name no host and no database state nothing', () => {
-    expect(targetHost(['-c', 'select 1'])).toBeUndefined();
-    expect(targetHost([])).toBeUndefined();
+    expect(targetHost(['-c', 'select 1'], true)).toBeUndefined();
+    expect(targetHost(['-h'], false)).toBeUndefined();
+    expect(targetHost([], false)).toBeUndefined();
   });
 
   test('a word that only contains a marker is not a marker: products is not prod', () => {
-    expect(targetHost(['-h', 'products-db.internal'])).toBe('unknown');
-    expect(targetHost(['-d', 'contest_entries'])).toBe('unknown');
+    expect(targetHost(['-h', 'products-db.internal'], true)).toBe('unknown');
+    expect(targetHost(['-d', 'contest_entries'], true)).toBe('unknown');
   });
 });

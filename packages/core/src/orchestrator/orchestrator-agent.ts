@@ -2630,7 +2630,8 @@ export async function handleMessage(
             protectedEnvKeys,
             undefined
           ),
-          baseBranch: config.baseBranch,
+          // The branch the project's work is based on is protected like `main`.
+          baseBranch: config.baseBranch ?? scopedCodebase?.default_branch ?? undefined,
           record: event => {
             getLog().info({ conversationId, ...event }, 'orchestrator.tool_gate_decision');
           },

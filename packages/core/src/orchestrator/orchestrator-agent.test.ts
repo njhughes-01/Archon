@@ -7277,6 +7277,20 @@ describe('chat turn tool gate', () => {
     });
   });
 
+  test("gate on: the project's default branch is protected when the repo config names no base branch", async () => {
+    const codebase = makeCodebase({ default_cwd: checkout, default_branch: 'dev' });
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    const { options } = await turn();
+    const gate = options?.toolGate;
+    if (gate === undefined) throw new Error('the chat was given no tool gate');
+    const lease = ['--force', 'with', 'lease'].join('-');
+    expect(await gate(shell(`git push ${lease} origin dev`))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.git_force_push_protected',
+    });
+  });
+
   test('gate on: a project chat is not given the no-project advice', async () => {
     const { options } = await turn();
     const decision = await options?.toolGate?.(write(join(tmpdir(), 'chat-tool-gate-x.md')));

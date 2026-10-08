@@ -332,6 +332,12 @@ posix('plain push: the checked-out branch or another', () => {
     ['git push origin --delete feature/login', 'risk.mutation_verb'],
     ['git push https://github.com/someone/else.git HEAD', 'risk.mutation_verb'],
     ['git push "$REMOTE" HEAD', 'risk.mutation_verb'],
+    // Only options that cannot change where the push goes or what it removes are settled.
+    ['git push --no-verify -q origin HEAD', 'default.no_signal'],
+    ['git push --repo=https://github.com/someone/else.git', 'risk.mutation_verb'],
+    ['git push --prune origin HEAD', 'risk.mutation_verb'],
+    ['git push -o ci.skip origin HEAD', 'risk.mutation_verb'],
+    ['git push --atomic origin HEAD', 'risk.mutation_verb'],
   ])('%s → %s', async (command, expected) => {
     expect(await ruleOf(command, makeTree('feature/login'))).toBe(expected);
   });
@@ -356,8 +362,18 @@ posix('discarding uncommitted work: the whole tree or named paths', () => {
     ['git checkout -f', 'deny.git_discard_worktree'],
     ['git checkout -f main', 'deny.git_discard_worktree'],
     ['git checkout -- :/', 'deny.git_discard_worktree'],
-    ["git checkout -- '*'", 'risk.mutation_verb'],
+    // Git expands a pathspec wildcard itself, so quoting it changes nothing.
+    ["git checkout -- '*'", 'deny.git_discard_worktree'],
     ['git checkout -- *', 'deny.git_discard_worktree'],
+    ["git restore '*'", 'deny.git_discard_worktree'],
+    ["git restore '**/*'", 'deny.git_discard_worktree'],
+    ["git restore ':(glob)**'", 'deny.git_discard_worktree'],
+    // A filtered wildcard, or one in a sub-directory, reaches further than the gate can size.
+    ["git restore '*.ts'", 'deny.git_discard_worktree'],
+    ["git restore -- 'src/*'", 'deny.git_discard_worktree'],
+    ['git restore src/*.ts', 'deny.git_discard_worktree'],
+    ["cd src && git restore '*'", 'deny.git_discard_worktree'],
+    ["git checkout -- 'docs/**'", 'deny.git_discard_worktree'],
     ['git restore .', 'deny.git_discard_worktree'],
     ['git restore --worktree --staged .', 'deny.git_discard_worktree'],
     ['git restore --source=HEAD~1 .', 'deny.git_discard_worktree'],
@@ -403,7 +419,9 @@ posix('facts stated with an escalation', () => {
     ['gh pr merge 5', { githubAction: 'merge_or_close' }],
     ['gh secret set KEY_NAME --body x', { githubAction: 'settings_or_secrets' }],
     ['gh label create triage', { githubAction: 'other' }],
-    ['psql -h localhost -d app_test -c "select 1"', { targetHost: 'loopback' }],
+    ['psql -h localhost -d app -c "select 1"', { targetHost: 'loopback' }],
+    // A name says more than an address: a tunnel puts any database on loopback.
+    ['psql -h localhost -d app_test -c "select 1"', { targetHost: 'test_or_dev_named' }],
     ['psql -d app_test -f migrations/001.sql', { targetHost: 'test_or_dev_named' }],
     ['psql -h db.prod.internal -d orders -c "select 1"', { targetHost: 'production_named' }],
     ['mysql -h db7.internal -e "show tables"', { targetHost: 'unknown' }],
@@ -420,5 +438,65 @@ posix('facts stated with an escalation', () => {
     expect(
       await factsOf('git push origin feature/other && git push origin --delete feature/old')
     ).toEqual({ gitPushTarget: 'deletes_remote_ref' });
+  });
+});
+
+posix('repointing where the checkout pushes', () => {
+  test.each([
+    // `origin` is the remote a settled push goes to, so changing it is denied.
+    [
+      'git remote set-url origin https://github.com/someone/else.git',
+      'deny.git_push_destination_change',
+    ],
+    [
+      'git remote set-url --push origin https://github.com/someone/else.git',
+      'deny.git_push_destination_change',
+    ],
+    ['git remote rename origin upstream', 'deny.git_push_destination_change'],
+    ['git remote remove origin', 'deny.git_push_destination_change'],
+    [
+      'git remote add origin https://github.com/someone/else.git',
+      'deny.git_push_destination_change',
+    ],
+    [
+      'git remote set-url "$REMOTE" https://github.com/someone/else.git',
+      'deny.git_push_destination_change',
+    ],
+    ['git config remote.pushDefault fork', 'deny.git_push_destination_change'],
+    [
+      'git config remote.origin.pushurl https://github.com/someone/else.git',
+      'deny.git_push_destination_change',
+    ],
+    ['git config branch.feature/login.pushRemote fork', 'deny.git_push_destination_change'],
+    [
+      'git config url.https://example.org/.insteadOf https://github.com/',
+      'deny.git_push_destination_change',
+    ],
+    ['git config push.default matching', 'deny.git_push_destination_change'],
+    ['git config --unset remote.origin.url', 'deny.git_push_destination_change'],
+    // Another remote changes no existing push, and a push to it is judged when it happens.
+    ['git remote add fork https://github.com/someone/else.git', 'risk.mutation_verb'],
+    ['git remote set-url fork https://github.com/someone/other.git', 'risk.mutation_verb'],
+    ['git remote remove fork', 'risk.mutation_verb'],
+    ['git remote prune origin', 'risk.mutation_verb'],
+    ['git config "$KEY" value', 'risk.mutation_verb'],
+    // Reading the same keys, and writing unrelated ones, raises nothing.
+    ['git remote -v', 'allow.read_only'],
+    ['git remote show origin', 'allow.read_only'],
+    ['git config --get remote.origin.url', 'default.no_signal'],
+    ['git config remote.origin.url', 'default.no_signal'],
+    ['git config user.name "Agent"', 'default.no_signal'],
+  ])('%s → %s', async (command, expected) => {
+    expect(await ruleOf(command, makeTree())).toBe(expected);
+  });
+
+  test('a push is settled only when it goes to origin', async () => {
+    const tree = makeTree('feature/login');
+    expect(await ruleOf('git push origin HEAD', tree)).toBe('default.no_signal');
+    expect(await ruleOf('git push', tree)).toBe('default.no_signal');
+    expect(await ruleOf('git push fork HEAD', tree)).toBe('risk.mutation_verb');
+    expect(await ruleOf('git push --force-with-lease upstream HEAD', tree)).toBe(
+      'risk.mutation_verb'
+    );
   });
 });

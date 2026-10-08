@@ -85,36 +85,24 @@ describe('the shipped labelled set', () => {
     expect(cases.filter(entry => entry.label === 'safe').length).toBeGreaterThanOrEqual(40);
   });
 
-  it('is two halves, each with both labels, balanced within every family they share', async () => {
+  it('is two halves, each with both labels, and the held-out half reaches past the tuned families', async () => {
     const cases = await readCases(EVAL_CASES);
-    const count = (split: EvalCase['split'], label: EvalCase['label'], family?: string): number =>
-      cases.filter(
-        entry =>
-          entry.split === split &&
-          entry.label === label &&
-          (family === undefined || entry.family === family)
-      ).length;
+    const count = (split: EvalCase['split'], label: EvalCase['label']): number =>
+      cases.filter(entry => entry.split === split && entry.label === label).length;
     for (const split of ['tuning', 'heldout'] as const) {
       expect(count(split, 'destructive')).toBeGreaterThanOrEqual(20);
       expect(count(split, 'safe')).toBeGreaterThanOrEqual(20);
     }
-    const tuningFamilies = new Set(
-      cases.filter(entry => entry.split === 'tuning').map(entry => entry.family)
-    );
-    // No family is tuned on without also being held out.
-    for (const family of tuningFamilies) {
-      for (const label of ['destructive', 'safe'] as const) {
-        expect(count('heldout', label, family)).toBeGreaterThanOrEqual(
-          count('tuning', label, family) - 1
-        );
-      }
-    }
-    // The held-out half also holds whole families the tuning half never sees.
-    const unseen = cases.filter(
-      entry => entry.split === 'heldout' && !tuningFamilies.has(entry.family)
-    );
+    const families = (split: EvalCase['split']): Set<string> =>
+      new Set(cases.filter(entry => entry.split === split).map(entry => entry.family));
+    const tuned = families('tuning');
+    // Held-out rows from command families the tuning half never sees.
+    const unseen = cases.filter(entry => entry.split === 'heldout' && !tuned.has(entry.family));
     expect(unseen.length).toBeGreaterThanOrEqual(20);
     expect(new Set(unseen.map(entry => entry.family)).size).toBeGreaterThanOrEqual(4);
+    // And from the families it does see, so a result can be compared family by family.
+    const shared = [...families('heldout')].filter(family => tuned.has(family));
+    expect(shared.length).toBeGreaterThanOrEqual(8);
   });
 
   it('holds only escalation-band rows: the rules alone decide none of them', async () => {

@@ -103,10 +103,19 @@ export const DENY_RULES = {
   },
   'deny.git_discard_worktree': {
     reason:
-      'It discards every uncommitted change in the working tree, with no way back: the same loss as a hard reset.',
+      'It discards uncommitted changes across the working tree, or across everything a wildcard matches, with no way back: the same loss as a hard reset.',
     alternatives: [
       'Use git stash to set the changes aside, or git restore <path> for the one file you mean.',
       'Commit the work you want to keep first, then discard only what is left by path.',
+    ],
+  },
+  'deny.git_push_destination_change': {
+    reason:
+      "It changes where this checkout's pushes go: the origin remote, a push URL, the default push remote, the push default or a URL rewrite.",
+    alternatives: [
+      'Push to the remote as it is configured.',
+      'To fetch from somewhere else, add a remote under another name: git remote add <name> <url>.',
+      BLOCKED_ALTERNATIVE,
     ],
   },
   'deny.git_clean_force': {
@@ -883,6 +892,18 @@ function pushDestination(refspec: string): string | undefined {
     : destination;
 }
 
+/** Push options that change neither where a push goes nor what it may overwrite or remove. */
+const PLAIN_PUSH_FLAGS: ReadonlySet<string> = new Set([
+  ...['-u', '--set-upstream', '--force-with-lease', '-q', '--quiet', '-v', '--verbose'],
+  '--no-verify',
+]);
+
+const ORIGIN = 'origin';
+
+/** Config keys that decide which remote, URL or branch a later push or fetch uses. */
+const REMOTE_ROUTING_KEY =
+  /^(remote\.|branch\..+\.(remote|pushremote|merge)$|url\..+\.(insteadof|pushinsteadof)$|push\.default$)/i;
+
 async function judgeGitPush(
   parsed: Options,
   scope: ShellScope,
@@ -947,9 +968,22 @@ async function judgeGitPush(
   // The ordinary push of a run: its own checked-out, unprotected branch, to a
   // configured remote, without the force flag. Nothing about it is left to judge.
   const [remote] = parsed.positionals;
-  const configuredRemote =
-    remote === undefined || (!remote.dynamic && /^[A-Za-z0-9_-]+$/.test(remote.text));
-  if (target === 'checked_out_branch' && configuredRemote && judgement.deny === undefined) return;
+  // `origin`, named or implied: the one remote whose address a rule keeps fixed
+  // (see `deny.git_push_destination_change`). Any other remote stays flagged.
+  const configuredRemote = remote === undefined || (!remote.dynamic && remote.text === ORIGIN);
+  // Any other option may change where the push goes or what it removes
+  // (`--repo`, `--prune`, `--receive-pack`), so it leaves the push flagged.
+  const plainOptions =
+    parsed.values.size === 0 &&
+    [...parsed.flags].every(flag => PLAIN_PUSH_FLAGS.has(flag.split('=')[0] ?? flag));
+  if (
+    target === 'checked_out_branch' &&
+    configuredRemote &&
+    plainOptions &&
+    judgement.deny === undefined
+  ) {
+    return;
+  }
   signal(judgement, 'risk.mutation_verb', 'unlikely');
 }
 
@@ -989,29 +1023,43 @@ function gitWriteTargets(subcommand: string, parsed: Options, context: RuleConte
 
 /**
  * Whether one of a checkout's or restore's operands is the whole working tree:
- * the repository root (or a directory holding it), git's `:/`, or a bare glob there.
+ * the repository root (or a directory holding it), git's `:/`, pathspec magic,
+ * or a wildcard that takes everything there.
+ *
+ * Git expands wildcards in a pathspec itself, so a quoted `'*'` reaches as far
+ * as an unquoted one: the quoting is not looked at.
  */
 async function coversWholeTree(operands: readonly Arg[], scope: ShellScope): Promise<boolean> {
   for (const operand of operands) {
     if (operand.dynamic) continue;
-    if (operand.text === ':/' || operand.text.startsWith(':/*')) return true;
-    const text = operand.glob
-      ? /^[*?.[\]!^]+$/.test(operand.text)
-        ? '.'
-        : undefined
-      : operand.text;
-    if (text === undefined) continue;
+    // `:/` is the top of the tree; `:(glob)**` and the rest of the magic are not read here.
+    if (operand.text.startsWith(':/') || operand.text.startsWith(':(')) return true;
+    let text = operand.text;
+    const wildcard = text.search(/[*?[]/);
+    if (wildcard !== -1) {
+      // `*`, `**/*`, `./*`: nothing but wildcards from here on takes the whole directory.
+      if (!/^[*?.[\]!^/]+$/.test(text.slice(wildcard))) continue;
+      text = text.slice(0, wildcard);
+      text = text.slice(0, text.lastIndexOf('/') + 1) || '.';
+    }
     const where = await locate(text, scope.cwd, scope.context);
     if (where.kind === 'resolved' && isInside(where.real, scope.context.repoRoot)) return true;
   }
   return false;
 }
 
+/**
+ * Whether a checkout's or restore's operand is a wildcard, quoted or not. Git
+ * expands a pathspec wildcard across directories, so what it reaches cannot be
+ * sized here: a discard through one is treated like a discard of the tree.
+ */
+function hasWildcard(operands: readonly Arg[]): boolean {
+  return operands.some(operand => !operand.dynamic && /[*?[]/.test(operand.text));
+}
+
 /** How much a path-scoped checkout or restore throws away, as far as its operands show. */
 function discardScope(operands: readonly Arg[]): NonNullable<EscalationFacts['uncommittedWork']> {
-  return operands.some(operand => operand.dynamic || operand.glob)
-    ? 'unknown'
-    : 'discarded_in_named_paths';
+  return operands.some(operand => operand.dynamic) ? 'unknown' : 'discarded_in_named_paths';
 }
 
 /** Raises the signal for git commands that throw away work or history without a deny rule. */
@@ -1060,13 +1108,14 @@ async function judgeGitDiscard(
         hasOption(parsed, '-f', '--force', '-p', '--patch') ||
         raw.some(arg => arg.text === '--') ||
         paths.includes(true);
+      if (discards && hasWildcard(positionals)) deny(judgement, 'deny.git_discard_worktree');
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
       break;
     }
     case 'restore':
       // `--staged` alone only unstages; anything touching the worktree overwrites files.
       discards = !hasOption(parsed, '--staged', '-S') || hasOption(parsed, '--worktree', '-W');
-      if (discards && (await coversWholeTree(positionals, scope))) {
+      if (discards && ((await coversWholeTree(positionals, scope)) || hasWildcard(positionals))) {
         deny(judgement, 'deny.git_discard_worktree');
       }
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
@@ -1100,6 +1149,40 @@ async function judgeGitDiscard(
     case 'prune':
       discards = true;
       break;
+    // Not a loss of work, but a change to where the checkout's pushes go. A push
+    // of the checked-out branch to `origin` raises no signal, which holds only
+    // while `origin` is what the checkout was given: changing it is denied.
+    case 'remote': {
+      const names = positionals.slice(1).filter(arg => !arg.dynamic);
+      if (verb === 'add') {
+        // A new remote under another name changes no existing push; pushes to it stay flagged.
+        if (names.some(arg => arg.text === ORIGIN))
+          deny(judgement, 'deny.git_push_destination_change');
+        discards = true;
+      } else if (verb !== undefined && !['show', 'get-url'].includes(verb)) {
+        const repoints = ['set-url', 'rename', 'remove', 'rm'].includes(verb);
+        const unnamed = positionals.slice(1).some(arg => arg.dynamic);
+        if (repoints && (unnamed || names.some(arg => arg.text === ORIGIN))) {
+          deny(judgement, 'deny.git_push_destination_change');
+        }
+        discards = true;
+      }
+      hint = 'likely';
+      break;
+    }
+    case 'config': {
+      const [key, value] = positionals;
+      const writes =
+        value !== undefined ||
+        hasOption(parsed, '--add', '--replace-all', '--unset', '--unset-all', '--rename-section');
+      if (key !== undefined && !key.dynamic && writes && REMOTE_ROUTING_KEY.test(key.text)) {
+        deny(judgement, 'deny.git_push_destination_change');
+      }
+      // A key in a variable may be one of those: flagged, since it cannot be read.
+      discards = key?.dynamic && writes;
+      hint = 'likely';
+      break;
+    }
     default:
       break;
   }
@@ -1589,9 +1672,12 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   }
   if (HOST_CLIENTS.has(head)) {
     // A database client always connects somewhere: one that names nothing says `unknown`.
+    const database = DATABASE_CLIENTS.has(head);
     const host =
-      targetHost(args.filter(arg => !arg.dynamic).map(arg => arg.text)) ??
-      (DATABASE_CLIENTS.has(head) ? 'unknown' : undefined);
+      targetHost(
+        args.filter(arg => !arg.dynamic).map(arg => arg.text),
+        database
+      ) ?? (database ? 'unknown' : undefined);
     if (host !== undefined) noteFact(judgement.facts, 'targetHost', host);
   }
   if (head.startsWith('mkfs')) signal(judgement, 'risk.mutation_verb', 'unlikely');
