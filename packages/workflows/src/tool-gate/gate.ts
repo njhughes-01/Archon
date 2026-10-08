@@ -12,13 +12,14 @@
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type {
   AgentRequestOptions,
   ToolActionDecision,
   ToolActionKind,
   ToolActionRequest,
 } from '@archon/providers/types';
+import { isInside } from './path-resolution';
 import {
   ESCALATION_TEXT_CAP,
   PREVIEW_TEXT_CAP,
@@ -29,6 +30,7 @@ import {
 import {
   DEFAULT_PROTECTED_BRANCHES,
   DEFAULT_VERIFICATION_COMMANDS,
+  DENY_RULES,
   evaluateRules,
   type AllowRuleId,
   type DenyRuleId,
@@ -103,6 +105,12 @@ export type ToolGateEscalator = (
 
 export type ToolGateDecisionSource = 'rule' | 'jev' | 'fallback';
 
+/**
+ * Most targets the classifier is sent for one call. Their combined length is
+ * held to `ESCALATION_TEXT_CAP` as well, the cap the command itself has.
+ */
+export const MAX_ESCALATION_TARGETS = 20;
+
 /** One audit record per decision. Carries no raw command or input. */
 export interface ToolGateDecisionEvent {
   tool: string;
@@ -114,6 +122,16 @@ export interface ToolGateDecisionEvent {
   score?: number;
   noul?: number;
   confidence?: number;
+  /**
+   * Why a configured classifier gave no usable answer, redacted and capped.
+   * Recorded here and never shown to the agent.
+   */
+  classifierFailure?: string;
+  /**
+   * How many calls this record answers. More than one when identical calls
+   * were made at the same time and judged once.
+   */
+  count: number;
   latencyMs: number;
   /** SHA-256 of the raw request, so repeats can be matched without storing it. */
   commandHash: string;
@@ -134,6 +152,21 @@ export interface ToolGateOptions {
   /** The repository the node works in. Absolute and existing; every path is judged against it. */
   repoRoot: string;
   /**
+   * Absolute directories outside the repository the node may also write into,
+   * such as the run's own artifacts directory. A write that really lands in one
+   * is judged like a write inside the repository, secret-path rules included.
+   * Nothing else is widened: a working directory there is still outside the
+   * repository, and every other path outside stays denied. A target inside one
+   * is shown to the classifier relative to that root. May not exist yet.
+   */
+  extraWriteRoots?: readonly string[];
+  /**
+   * Absolute paths no call may write, move or remove, such as a credential
+   * file the engine delivered into an extra write root. Reading one is judged
+   * by the secret-path vocabulary alone.
+   */
+  protectedPaths?: readonly string[];
+  /**
    * Whether a classifier key is configured. When false the classifier is never
    * called and a risk-signalled call is allowed and recorded as `fallback`.
    * When true and no usable answer comes back, the call is denied.
@@ -141,8 +174,15 @@ export interface ToolGateOptions {
   classifierConfigured: boolean;
   /** Asks the classifier. Called only for the escalation band, with redacted text. */
   escalate: ToolGateEscalator;
-  /** Receives exactly one event per decision. A throw fails the call. */
-  record: (event: ToolGateDecisionEvent) => void;
+  /**
+   * Receives exactly one event per decision. It may return a promise, which the
+   * gate waits for before it answers the call. A throw or a rejection fails the
+   * call: the gate's promise rejects, which every provider treats as a denial.
+   * A decision that could not be recorded is never handed out as an allow.
+   * Typed `unknown` so a sink may return whatever its last statement returns;
+   * only a promise is looked at.
+   */
+  record: (event: ToolGateDecisionEvent) => unknown;
   /** Branches a lease-protected forced push may never target. Default: main, master. */
   protectedBranches?: readonly string[];
   /** Command prefixes known to only verify the repository. Default: the usual runner scripts. */
@@ -153,6 +193,12 @@ export interface ToolGateOptions {
   homeDir?: string;
   thresholds?: { score?: number; noul?: number };
   maxDenialsPerNode?: number;
+  /**
+   * One sentence added to what the agent is told when a call is denied for
+   * writing outside the root, or denied as needing approval. For a caller that
+   * knows why nothing is writable here and what the user can do about it.
+   */
+  outsideRootAdvice?: string;
   /** Share one cache across the gates of a run. Default: a cache private to this gate. */
   cache?: ToolGateCache;
   /** Clock for `latencyMs`. */
@@ -168,10 +214,60 @@ const APPROVAL_ALTERNATIVES: readonly string[] = [
 ];
 const CLASSIFIER_DENIAL =
   'The action classifier rated this call as out of bounds, destructive, or changing production or external state, so it needs human approval.';
+/** The whole of what the agent is told. What the classifier said went wrong is in the record. */
 const NO_ANSWER_DENIAL =
   'This call carries a risk signal and the action classifier gave no usable answer, so it needs human approval.';
-/** How much of a classifier failure reason is shown to the agent. */
-const FAILURE_REASON_CAP = 120;
+/** Recorded when the escalator hands back something that is not a result at all. */
+const MALFORMED_ESCALATION = 'malformed_escalation';
+
+/** Every kind the contract names. A request with any other value cannot be judged. */
+const TOOL_ACTION_KINDS = {
+  shell: true,
+  file_write: true,
+  network: true,
+  mcp: true,
+  other: true,
+} as const satisfies Record<ToolActionKind, true>;
+
+function isToolActionKind(kind: unknown): kind is ToolActionKind {
+  return typeof kind === 'string' && Object.hasOwn(TOOL_ACTION_KINDS, kind);
+}
+
+/**
+ * An escalator is injected code: whatever it resolves to is read as untrusted.
+ * Anything that is not one of the two result shapes becomes a failure, so the
+ * call is denied and recorded instead of crashing the gate.
+ */
+function normaliseEscalation(result: unknown): ToolGateEscalationResult {
+  if (typeof result !== 'object' || result === null) {
+    return { ok: false, reason: MALFORMED_ESCALATION };
+  }
+  const { ok, reason, score, noul, confidence } = result as Record<string, unknown>;
+  if (ok === false && typeof reason === 'string') return { ok: false, reason };
+  if (
+    ok === true &&
+    typeof score === 'number' &&
+    typeof noul === 'number' &&
+    typeof confidence === 'number'
+  ) {
+    return { ok: true, score, noul, confidence };
+  }
+  return { ok: false, reason: MALFORMED_ESCALATION };
+}
+
+/** The targets as the classifier is sent them: redacted, then cut by count and by total length. */
+function boundedTargets(targets: readonly string[], redaction: RedactOptions): string[] {
+  const sent: string[] = [];
+  let length = 0;
+  for (const target of targets) {
+    const text = redactText(target, redaction);
+    if (sent.length === MAX_ESCALATION_TARGETS || length + text.length > ESCALATION_TEXT_CAP) break;
+    sent.push(text);
+    length += text.length;
+  }
+  const dropped = targets.length - sent.length;
+  return dropped === 0 ? sent : [...sent, `… [${String(dropped)} more targets]`];
+}
 
 function sha256(text: string): string {
   return createHash('sha256').update(text).digest('hex');
@@ -248,6 +344,35 @@ function realPathOr(path: string): string {
 }
 
 /**
+ * Where a path that may not exist yet really is: its nearest existing ancestor
+ * resolved, with the missing remainder appended. Nothing below a missing
+ * directory can be a symlink, so this is where a later write there lands.
+ */
+function realPathAllowingMissing(path: string): string {
+  const missing: string[] = [];
+  let current = resolve(path);
+  for (;;) {
+    try {
+      return join(realpathSync(current), ...missing);
+    } catch (error) {
+      const parent = dirname(current);
+      // Anything but a missing segment (a loop, a file in the way) is a path the
+      // gate cannot place, and the filesystem root always exists.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === current) throw error;
+      missing.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
+
+function realPaths(name: string, paths: readonly string[] | undefined): string[] {
+  return (paths ?? []).map(path => {
+    if (!isAbsolute(path)) throw new Error(`toolGate ${name} must be absolute paths, got ${path}`);
+    return realPathAllowingMissing(path);
+  });
+}
+
+/**
  * Builds the gate for one node. Throws on a configuration the gate could not
  * honour, so a bad threshold or root fails at dispatch instead of at the first
  * tool call.
@@ -261,7 +386,19 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
     homeDir: realPathOr(options.homeDir ?? homedir()),
     protectedBranches: options.protectedBranches ?? DEFAULT_PROTECTED_BRANCHES,
     verificationCommands: options.verificationCommands ?? DEFAULT_VERIFICATION_COMMANDS,
+    extraWriteRoots: realPaths('extraWriteRoots', options.extraWriteRoots),
+    protectedPaths: realPaths('protectedPaths', options.protectedPaths),
   };
+  // A root that holds the home directory (the filesystem root included) would
+  // turn "outside the repository" into nearly nothing.
+  const tooWide = context.extraWriteRoots?.find(
+    root => dirname(root) === root || isInside(root, context.homeDir)
+  );
+  if (tooWide !== undefined) {
+    throw new Error(
+      `toolGate extraWriteRoots may not contain the home directory or be a filesystem root, got ${tooWide}`
+    );
+  }
   const scoreThreshold = threshold(
     'score',
     options.thresholds?.score,
@@ -291,18 +428,37 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
   /** An escalator that fails by throwing is the same as one that reports a failure. */
   const ask = async (request: ToolGateEscalationRequest): Promise<ToolGateEscalationResult> => {
     try {
-      return await options.escalate(request);
+      return normaliseEscalation(await options.escalate(request));
     } catch (error) {
       return { ok: false, reason: error instanceof Error ? error.message : 'classifier threw' };
     }
   };
 
-  return async (request: ToolActionRequest): Promise<ToolActionDecision> => {
-    const started = now();
-    const commandHash = hashRequest(request);
-    const redactedPreview = previewOf(request, forPreview);
+  // Identical calls still being judged share that one judgement: one pass over
+  // the rules, one classifier request, one record and one count toward the
+  // repeated-denial guard. A batch of the same call must not trip the guard by
+  // itself, and must not multiply classifier requests. The batch closes when
+  // its record is handed over, so the record's `count` is exact and the same
+  // call made from then on is judged afresh.
+  interface Batch {
+    callers: number;
+    decision: Promise<ToolActionDecision> | undefined;
+  }
+  const inFlight = new Map<string, Batch>();
+  const close = (commandHash: string, batch: Batch): void => {
+    if (inFlight.get(commandHash) === batch) inFlight.delete(commandHash);
+  };
 
-    const finish = (
+  const decide = async (
+    request: ToolActionRequest,
+    commandHash: string,
+    batch: Batch
+  ): Promise<ToolActionDecision> => {
+    const started = now();
+    const redactedPreview = previewOf(request, forPreview);
+    const knownKind = isToolActionKind(request.kind);
+
+    const finish = async (
       verdict:
         | { action: 'allow' }
         | {
@@ -313,8 +469,9 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
           },
       source: ToolGateDecisionSource,
       ruleId: AllowRuleId | DenyRuleId | RiskRuleId,
-      answer?: ToolGateClassifierAnswer
-    ): ToolActionDecision => {
+      answer?: ToolGateClassifierAnswer,
+      classifierFailure?: string
+    ): Promise<ToolActionDecision> => {
       let decision: ToolActionDecision;
       let recordedRule: ToolGateDecisionEvent['ruleId'] = ruleId;
       if (verdict.action === 'allow') {
@@ -337,18 +494,24 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
             ruleId: REPEATED_DENIALS_RULE_ID,
           };
         } else {
+          const advised =
+            options.outsideRootAdvice !== undefined &&
+            (ruleId === 'deny.path_outside_root' || verdict.needsApproval);
+          const advice = advised ? ` ${String(options.outsideRootAdvice)}` : '';
           decision = {
             action: 'deny',
             needsApproval: verdict.needsApproval,
-            reason: `${verdict.reason} ${DENIAL_GUIDANCE}`,
+            reason: `${verdict.reason}${advice} ${DENIAL_GUIDANCE}`,
             alternatives: [...verdict.alternatives],
             ruleId,
           };
         }
       }
-      options.record({
+      close(commandHash, batch);
+      await options.record({
         tool: request.toolName,
-        kind: request.kind,
+        // The record's vocabulary is the contract's: a value outside it is not copied in.
+        kind: knownKind ? request.kind : 'other',
         decision: decision.action,
         needsApproval: decision.action === 'deny' && decision.needsApproval,
         source,
@@ -358,12 +521,30 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
           noul: answer.noul,
           confidence: answer.confidence,
         }),
+        ...(classifierFailure !== undefined && { classifierFailure }),
+        count: batch.callers,
         latencyMs: now() - started,
         commandHash,
         redactedPreview,
       });
       return decision;
     };
+
+    if (!knownKind) {
+      // The rules switch on the kind. A value they do not know must not fall
+      // through them unjudged, whatever the rest of the request says.
+      const rule = DENY_RULES['deny.unreadable_request'];
+      return finish(
+        {
+          action: 'deny',
+          needsApproval: false,
+          reason: rule.reason,
+          alternatives: rule.alternatives,
+        },
+        'rule',
+        'deny.unreadable_request'
+      );
+    }
 
     const outcome = await evaluateRules(request, context);
     if (outcome.outcome === 'allow') return finish({ action: 'allow' }, 'rule', outcome.ruleId);
@@ -390,7 +571,7 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
         request.command === undefined
           ? redactInput(request.input, forClassifier)
           : redactText(request.command, forClassifier),
-      targets: outcome.targets.map(target => redactText(target, forPreview)),
+      targets: boundedTargets(outcome.targets, forPreview),
       repoRelative: outcome.repoRelative,
       reversibleHint: outcome.reversibleHint,
       signals: outcome.signals,
@@ -403,16 +584,17 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
       if (!result.ok || !usableAnswer(result)) {
         // A configured classifier that cannot answer must not become a silent allow.
         const why = result.ok ? 'answer out of range' : result.reason;
-        const shown = redactText(why, { credentialValues, cap: FAILURE_REASON_CAP });
         return finish(
           {
             action: 'deny',
             needsApproval: true,
-            reason: `${NO_ANSWER_DENIAL} (Classifier: ${shown}.)`,
+            reason: NO_ANSWER_DENIAL,
             alternatives: APPROVAL_ALTERNATIVES,
           },
           'fallback',
-          outcome.ruleId
+          outcome.ruleId,
+          undefined,
+          redactText(why, forPreview)
         );
       }
       answer = { score: result.score, noul: result.noul, confidence: result.confidence };
@@ -433,5 +615,21 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
       );
     }
     return finish({ action: 'allow' }, 'jev', outcome.ruleId, answer);
+  };
+
+  return async (request: ToolActionRequest): Promise<ToolActionDecision> => {
+    const commandHash = hashRequest(request);
+    const running = inFlight.get(commandHash);
+    if (running?.decision !== undefined) {
+      running.callers++;
+      return running.decision;
+    }
+    const batch: Batch = { callers: 1, decision: undefined };
+    // Registered before the judgement starts, which may reach its record at once.
+    inFlight.set(commandHash, batch);
+    batch.decision = decide(request, commandHash, batch).finally(() => {
+      close(commandHash, batch);
+    });
+    return batch.decision;
   };
 }

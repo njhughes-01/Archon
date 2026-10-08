@@ -156,6 +156,19 @@ Invalid assistants config in '/Users/you/.archon/config.yaml':
 - **Strict.** A key that is not a registered provider ID, a value that is not a positive integer, or a config file that cannot be parsed refuses every provider attempt with an error naming the problem, instead of silently running uncapped.
 - **Process loss.** A slot belongs to the process that took it. When that process dies, the next admission on the same host releases the slot. A holder from another host is never released by time or guesswork: list it with `archon ai capacity` and, once you have verified that process is gone, release it with `archon ai capacity release <attempt-id>`. Hosts that share one PostgreSQL database need distinct hostnames. A recreated Docker container gets a new hostname unless the compose service sets `hostname:`, so holders left by the old container need an explicit release.
 
+## Tool Action Gate
+
+`toolGate:` switches on a check of every state-changing tool call a workflow agent or chat turn makes, before the call runs. It is off unless `enabled: true`.
+
+```yaml
+toolGate:
+  enabled: true
+  protectedBranches: [dev]               # added to main and master
+  verificationCommands: ["make check"]   # added to the built-in test and lint commands
+```
+
+The block is valid in `~/.archon/config.yaml` and in a repository's `.archon/config.yaml`. The repository file can switch the gate on and add to the lists; it cannot switch off a gate the install switched on. A block that cannot be read fails config loading and names the key. The rules, what the optional classifier is sent, per-provider support and the gate's limits are in [Tool Action Gate](/reference/tool-gate/).
+
 ## Run-scoped configuration
 
 Keep a reusable file such as `config.minimax.yaml` in a repository and select it only for runs that need it:
@@ -183,6 +196,7 @@ Run config accepts settings whose consumers still execute after the run is dispa
 - `commands` and `defaults` already affected workflow and command discovery.
 - `worktree` and `container` already affected isolation.
 - `botName`, `chatTier`, `streaming`, `paths`, and `concurrency` are process-scoped or have no per-run consumer.
+- `toolGate` is a safety switch of the install and the repository; a run may not change it.
 - `recommendedWorkflows` is listing-only.
 - `assistants.pi.env` and `assistants.pi.maxConcurrent` mutate process-lifetime Pi state rather than one request.
 
@@ -641,6 +655,19 @@ Each run is bounded by a file, a window and a character budget. When a budget is
 | `JEV_SCOUT_DEADLINE_MS` | Longest the whole classification may take before it stands down | `120000` |
 
 An unusable number makes the classification report `unavailable` and name the variable; it never falls back to the default, so a mistyped threshold or budget cannot quietly become another policy.
+
+### Tool Action Gate classifier -- Jev (optional)
+
+The [Tool Action Gate](/reference/tool-gate/) is switched on in config (`toolGate.enabled`), not here. These variables only configure the optional classifier that judges the tool calls the gate's fixed rules could only flag. They are read from the environment of the Archon process. `JEV_API_KEY`, `JEV_ENABLED`, `JEV_API_BASE` and `JEV_MODEL` are the same variables the context scout reads.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `JEV_GATE_ENABLED` | Set to `0` or `false` to turn only the gate's classifier off. The gate's rules stay in force. | on when the key is set |
+| `JEV_GATE_TIMEOUT_MS` | Longest one tool call waits for the classifier, at most `60000`. A timeout denies the call as needing approval. | `5000` |
+| `JEV_GATE_SCORE_THRESHOLD` | Deny at or above this score on the four-level scale (`0`--`3`) | `1.5` |
+| `JEV_GATE_NOUL_THRESHOLD` | Deny at or above this likelihood (`0`--`1`) that the call changes production or external state | `0.5` |
+
+An unusable number stops the run or chat turn and names the variable. What is sent to `JEV_API_BASE` is listed under [The classifier](/reference/tool-gate/#the-classifier-optional).
 
 ### Telemetry
 

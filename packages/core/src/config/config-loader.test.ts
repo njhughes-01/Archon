@@ -528,6 +528,77 @@ streaming:
       expect(config.chatTier).toBe('medium');
     });
 
+    test('toolGate is absent by default: the gate is off and nothing is passed along', async () => {
+      mockFsReadFile.mockResolvedValue('defaultAssistant: claude\n');
+
+      const config = await loadConfig('/tmp/test-repo');
+      expect(config.toolGate).toBeUndefined();
+      expect('toolGate' in config).toBe(false);
+    });
+
+    test('toolGate from global config reaches the merged config', async () => {
+      mockFsReadFile.mockResolvedValue(
+        'toolGate:\n  enabled: true\n  protectedBranches: [dev]\n  verificationCommands: ["make check"]\n'
+      );
+
+      const config = await loadConfig();
+      expect(config.toolGate).toEqual({
+        enabled: true,
+        protectedBranches: ['dev'],
+        verificationCommands: ['make check'],
+      });
+    });
+
+    test('a repo config can switch the gate on and add to the lists', async () => {
+      mockFsReadFile.mockImplementation(async (path: string) => {
+        const normalized = path.replace(/\\/g, '/');
+        if (normalized.includes('/tmp/test-repo/.archon/config.yaml')) {
+          return 'toolGate:\n  enabled: true\n  protectedBranches: [release]\n';
+        }
+        return 'toolGate:\n  protectedBranches: [dev]\n';
+      });
+
+      const config = await loadConfig('/tmp/test-repo');
+      expect(config.toolGate).toEqual({
+        enabled: true,
+        protectedBranches: ['dev', 'release'],
+        verificationCommands: [],
+      });
+    });
+
+    test('a repo config cannot switch off a gate the install switched on', async () => {
+      // The repository is what the gated agent can write to.
+      mockFsReadFile.mockImplementation(async (path: string) => {
+        const normalized = path.replace(/\\/g, '/');
+        if (normalized.includes('/tmp/test-repo/.archon/config.yaml')) {
+          return 'toolGate:\n  enabled: false\n';
+        }
+        return 'toolGate:\n  enabled: true\n';
+      });
+
+      const config = await loadConfig('/tmp/test-repo');
+      expect(config.toolGate?.enabled).toBe(true);
+    });
+
+    test('throws on a toolGate block that cannot be read, in either file', async () => {
+      mockFsReadFile.mockResolvedValue('toolGate:\n  enabled: "on"\n');
+      await expect(loadConfig()).rejects.toThrow(
+        /toolGate.enabled in global config \(~\/.archon\/config.yaml\) must be true or false/
+      );
+
+      clearConfigCache();
+      mockFsReadFile.mockImplementation(async (path: string) => {
+        const normalized = path.replace(/\\/g, '/');
+        if (normalized.includes('/tmp/test-repo/.archon/config.yaml')) {
+          return 'toolGate:\n  protectedBranch: [main]\n';
+        }
+        return 'defaultAssistant: claude\n';
+      });
+      await expect(loadConfig('/tmp/test-repo')).rejects.toThrow(
+        /toolGate in repo config \(.archon\/config.yaml\) has unknown key 'protectedBranch'/
+      );
+    });
+
     test('throws on unknown assistant in repo config', async () => {
       mockFsReadFile.mockImplementation(async (path: string) => {
         const normalized = path.replace(/\\/g, '/');

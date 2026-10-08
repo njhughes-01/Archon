@@ -188,6 +188,10 @@ export interface RuleContext {
   protectedBranches: readonly string[];
   /** Command prefixes known to only verify the repository, e.g. `bun run test`. */
   verificationCommands: readonly string[];
+  /** Real paths of directories outside the repository a call may also write into. */
+  extraWriteRoots?: readonly string[];
+  /** Real paths no call may write, move or remove, inside a write root or not. */
+  protectedPaths?: readonly string[];
 }
 
 export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ['main', 'master'];
@@ -573,9 +577,20 @@ async function locate(text: string, cwd: string | undefined, context: RuleContex
   };
 }
 
-/** A path as the secret vocabulary should see it: relative to the root when it is inside. */
+/** The write root `path` lies in: the repository first, then an extra root. */
+function writeRootOf(path: string, context: RuleContext): string | undefined {
+  if (isInside(context.repoRoot, path)) return context.repoRoot;
+  return context.extraWriteRoots?.find(root => isInside(root, path));
+}
+
+function isProtectedPath(path: string, context: RuleContext): boolean {
+  return context.protectedPaths?.some(guarded => isInside(guarded, path)) === true;
+}
+
+/** A path as the secret vocabulary should see it: relative to the write root it is inside. */
 function rootView(path: string, context: RuleContext): string {
-  return isInside(context.repoRoot, path) ? relative(context.repoRoot, path) : path;
+  const root = writeRootOf(path, context);
+  return root === undefined ? path : relative(root, path);
 }
 
 function literalView(text: string, context: RuleContext): string {
@@ -625,11 +640,12 @@ async function judgeWriteTarget(target: ResolvedWord, scope: ShellScope): Promis
     deny(judgement, 'deny.path_unresolvable');
     return;
   }
-  if (!where.inside) {
+  if (writeRootOf(where.real, context) === undefined) {
     deny(judgement, 'deny.path_outside_root');
     return;
   }
   if (
+    isProtectedPath(where.real, context) ||
     isSecretPath(literalView(target.text, context)) ||
     isSecretPath(rootView(where.real, context))
   ) {
@@ -1111,7 +1127,12 @@ async function isRootLikeDirectory(text: string, scope: ShellScope): Promise<boo
   // Where the shell stands is unknown (a `cd` into a variable): `.` and `..` may be the root.
   if (where.kind !== 'resolved') return trimmed === '.' || trimmed === '..';
   // The root itself, the home directory, or anything that contains the root ("/" included).
-  if (where.real === context.homeDir || isInside(where.real, context.repoRoot)) return true;
+  if (
+    where.real === context.homeDir ||
+    [context.repoRoot, ...(context.extraWriteRoots ?? [])].some(root => isInside(where.real, root))
+  ) {
+    return true;
+  }
   // The repository's git data: removing it takes history, stashes and settings with it.
   return isInside(join(context.repoRoot, '.git'), where.real);
 }

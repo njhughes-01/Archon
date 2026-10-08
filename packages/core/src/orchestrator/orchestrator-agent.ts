@@ -58,6 +58,12 @@ import {
   type PreparedWorkflowSource,
 } from '@archon/workflows/executor';
 import { InProcessWorkflowEngine } from '@archon/workflows/in-process-engine';
+import {
+  assertProviderHonoursToolGate,
+  collectCredentialValues,
+  createRunToolGate,
+  emptyToolGateRoot,
+} from '@archon/workflows/tool-gate';
 import type { WorkflowResumeAdmission } from '@archon/workflows/engine-port';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { liveSourceRoots } from '@archon/workflows/workflow-discovery';
@@ -128,6 +134,18 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+
+/**
+ * Told to the agent when the Tool Action Gate denies a write, or a call that
+ * needs approval, in a chat with no project. Cloning a new project is the one
+ * change chat makes itself, and with the gate on it has nowhere to write, so
+ * the denial says how the user gets a project added anyway.
+ */
+const NO_PROJECT_GATE_ADVICE =
+  'This chat has no project, so with the tool gate on nothing can be written from it, a new ' +
+  'clone included. Tell the user: to add a project, clone it in a terminal and register it ' +
+  'with `/register-project <name> <path>` (or Add Project in the web console), or switch the ' +
+  'gate off for the setup (toolGate.enabled in ~/.archon/config.yaml).';
 
 /** Max assistant text chunks to keep in batch mode (oldest are dropped) */
 const MAX_BATCH_ASSISTANT_CHUNKS = 20;
@@ -2570,6 +2588,60 @@ export async function handleMessage(
     }
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
+    }
+
+    // Tool Action Gate: the same option workflow nodes get, held to the checkout
+    // this chat works in. A gate that is on and cannot judge the turn refuses it,
+    // like the missing-directory guards above: an ungated turn is not a fallback.
+    if (config.toolGate?.enabled === true) {
+      try {
+        // A chat with no project works in the workspaces root, which holds every
+        // project with its artifacts and credential directories. Rooting the gate
+        // there would call all of that "inside", so it is rooted at an empty
+        // directory instead: every write is denied and each shell call is flagged.
+        const hasCheckout = scopedCodebase !== undefined;
+        assertProviderHonoursToolGate(
+          config.toolGate,
+          providerKey,
+          getProviderCapabilities(providerKey)
+        );
+        // A chat has no run, so its decisions are recorded as structured log lines.
+        requestOptions.toolGate = createRunToolGate({
+          config: config.toolGate,
+          env: process.env,
+          repoRoot: hasCheckout ? cwd : await emptyToolGateRoot(),
+          ...(!hasCheckout && { outsideRootAdvice: NO_PROJECT_GATE_ADVICE }),
+          credentialValues: collectCredentialValues(
+            { ...process.env, ...effectiveEnv },
+            protectedEnvKeys,
+            undefined
+          ),
+          baseBranch: config.baseBranch,
+          record: event => {
+            getLog().info({ conversationId, ...event }, 'orchestrator.tool_gate_decision');
+          },
+        })?.forStep('chat');
+      } catch (error) {
+        const err = toError(error);
+        getLog().warn(
+          { err, conversationId, provider: providerKey },
+          'orchestrator.tool_gate_refused'
+        );
+        const refusal = `⚠️ ${err.message}`;
+        await platform.sendMessage(conversationId, refusal);
+        // This refusal needs the provider, which is resolved after the user row
+        // was written, so it cannot sit above that write with the other guards.
+        // Storing it as the reply is what keeps that row from being left unanswered.
+        if (!isWebAdapter(platform)) {
+          messageDb.addMessage(conversation.id, 'assistant', refusal).catch((e: unknown) => {
+            getLog().warn(
+              { err: toError(e), conversationId },
+              'orchestrator.assistant_message_persist_failed'
+            );
+          });
+        }
+        return;
+      }
     }
 
     if (!conversation.title && !trimmedMessage.startsWith('/')) {

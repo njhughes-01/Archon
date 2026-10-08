@@ -137,7 +137,7 @@ const TOKEN_SHAPES = new RegExp(
 const AWS_SECRET_KEY =
   /(?<![A-Za-z0-9/+=])(?=[A-Za-z0-9/+]{0,39}[a-z])(?=[A-Za-z0-9/+]{0,39}[A-Z])(?=[A-Za-z0-9/+]{0,39}[0-9])[A-Za-z0-9/+]{40}(?![A-Za-z0-9/+=])/g;
 
-function maskCredentialValues(text: string, credentialValues: readonly string[]): string {
+export function maskCredentialValues(text: string, credentialValues: readonly string[]): string {
   const ordered = [...new Set(credentialValues)]
     .filter(value => value.length > 0)
     .sort((a, b) => b.length - a.length);

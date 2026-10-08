@@ -25,6 +25,7 @@ import type {
   RawTiersConfig,
   TierName,
 } from '@archon/workflows/model-validation';
+import type { ToolGateConfig, ToolGateConfigInput } from '@archon/workflows/deps';
 import {
   workflowRunContinuationConfigSchema,
   type WorkflowRunConfigLayer,
@@ -157,6 +158,14 @@ export interface GlobalConfig {
   chatTier?: TierName;
 
   /**
+   * Tool Action Gate: checks each state-changing tool call of workflow agent
+   * nodes and direct chat against fixed rules before it runs. Off unless
+   * `enabled: true`. A repo config may also switch it on and add to the lists,
+   * and can never switch it off.
+   */
+  toolGate?: ToolGateConfigInput;
+
+  /**
    * Platform streaming preferences (can be overridden per conversation)
    */
   streaming?: {
@@ -238,6 +247,14 @@ export interface RepoConfig {
 
   /** Project override for quota-failure continuation. */
   workflows?: WorkflowContinuationConfig;
+
+  /**
+   * Tool Action Gate settings for this repository. Can switch the gate on and
+   * add protected branches or verification commands to the install's; cannot
+   * switch off a gate the install switched on, because this file is one the
+   * gated agent can edit.
+   */
+  toolGate?: ToolGateConfigInput;
 
   /**
    * Commands configuration
@@ -407,6 +424,11 @@ export interface MergedConfig {
    * `assistants.<provider>.model` stand in for an unconfigured tier.
    */
   chatTier?: TierName;
+  /**
+   * Tool Action Gate settings, global and repo layers combined. Undefined when
+   * neither file has a `toolGate:` block, which is the gate being off.
+   */
+  toolGate?: ToolGateConfig;
   streaming: {
     telegram: 'stream' | 'batch';
     discord: 'stream' | 'batch';

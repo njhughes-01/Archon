@@ -49,6 +49,7 @@ import {
   registerCommunityProviders,
 } from '@archon/providers';
 import { buildAiProfile, isTierName, TIER_NAMES } from '@archon/workflows/model-validation';
+import { mergeToolGateConfig, parseToolGateConfig } from '@archon/workflows/deps';
 import type { RawAliasEntry, TierName } from '@archon/workflows/model-validation';
 import {
   rawAliasesConfigSchema,
@@ -233,6 +234,13 @@ const DEFAULT_CONFIG_CONTENT = `# Archon Global Configuration
 
 # Tier the chat agent runs on (small, medium or large). Workflows are unaffected.
 # chatTier: large
+
+# Tool Action Gate: check each state-changing tool call of workflow agents and
+# chat against fixed rules before it runs. Off unless enabled.
+# toolGate:
+#   enabled: true
+#   protectedBranches: [dev]         # added to main and master
+#   verificationCommands: ["make check"]
 
 # Streaming mode per platform (stream or batch)
 # streaming:
@@ -668,6 +676,13 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.chatTier = chatTier;
   }
 
+  if (global.toolGate !== undefined && global.toolGate !== null) {
+    result.toolGate = mergeToolGateConfig(
+      undefined,
+      parseToolGateConfig(global.toolGate, 'global config (~/.archon/config.yaml)')
+    );
+  }
+
   // Streaming preferences
   if (global.streaming) {
     if (global.streaming.telegram) result.streaming.telegram = global.streaming.telegram;
@@ -726,6 +741,15 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
 
   if (repo.workflows) {
     result.workflows = { ...result.workflows, ...repo.workflows };
+  }
+
+  if (repo.toolGate !== undefined && repo.toolGate !== null) {
+    const layer = parseToolGateConfig(repo.toolGate, 'repo config (.archon/config.yaml)');
+    if (layer.enabled === false && result.toolGate?.enabled === true) {
+      // The merge keeps the gate on; say so, or the file reads as if it worked.
+      getLog().warn({}, 'config.tool_gate_repo_disable_ignored');
+    }
+    result.toolGate = mergeToolGateConfig(result.toolGate, layer);
   }
 
   // Commands config
