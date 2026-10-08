@@ -4,25 +4,43 @@
  * means a risk signal fired and the call belongs to the classifier, or to the
  * no-classifier fallback.
  *
- * Order matters and is fixed: deny rules, then risk signals, then the allow
- * rule, then the default. A script is judged command by command and the worst
- * verdict wins, so `git status && <something destructive>` is denied.
+ * A script is judged command by command and the worst verdict wins, so
+ * `git status && <something destructive>` is denied. With no classifier
+ * configured an escalation is an allow, so everything that must never run has
+ * to be a deny here: a rule that only escalates is not a boundary.
  *
  * Paths are judged where they really land (see `path-resolution.ts`) against
  * the repository root the caller supplied. The tool's own `cwd` only says where
  * a relative path starts; it never widens what counts as inside.
  */
-import { isAbsolute, relative, resolve } from 'node:path';
+import { readFile, stat } from 'node:fs/promises';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ToolActionRequest } from '@archon/providers/types';
+import {
+  GIT_OPTION_SPECS,
+  hasAbbreviated,
+  hasOption,
+  OPTION_SPECS,
+  parseOptions,
+  valuesOf,
+  type OptionSpec,
+  type ParsedOptions,
+} from './command-options';
 import { isInside, resolveRealPath } from './path-resolution';
 import { isSecretPath } from './secret-paths';
 import {
+  parseArgv,
   parseShell,
   resolveWord,
   SHELL_INTERPRETERS,
+  shellInvocation,
+  WRAPPERS,
+  type NestedScript,
   type ParsedShell,
+  type PipelineStage,
   type ResolvedWord,
   type ShellCommand,
+  type ShellWord,
 } from './shell-tokens';
 
 // ---------------------------------------------------------------------------
@@ -47,14 +65,15 @@ export const DENY_RULES = {
     ],
   },
   'deny.secret_exfiltration': {
-    reason: 'It sends the process environment, which holds credentials, to a network client.',
+    reason:
+      'It sends the process environment or a credential file, which hold secrets, off this machine or into a program that can.',
     alternatives: [
       'Send only the specific non-secret values the request needs.',
       BLOCKED_ALTERNATIVE,
     ],
   },
   'deny.git_force_push': {
-    reason: 'It overwrites remote history with a forced push or a +refspec.',
+    reason: 'It overwrites remote history with a forced push, a mirror push or a +refspec.',
     alternatives: [
       'Push without forcing; if the remote moved, fetch and rebase or merge first.',
       'For your own rebased feature branch, name it: git push --force-with-lease origin <branch>.',
@@ -62,7 +81,7 @@ export const DENY_RULES = {
   },
   'deny.git_force_push_protected': {
     reason:
-      'A lease-protected forced push is only allowed onto a named branch that is not protected, and this one targets a protected branch or does not name its branch literally.',
+      'It rewrites or deletes a protected branch, or it is a lease-protected forced push whose branch cannot be read from the command or the checkout.',
     alternatives: [
       'Name a non-protected branch literally: git push --force-with-lease origin <branch>.',
       'Open a pull request into the protected branch instead of rewriting it.',
@@ -76,14 +95,14 @@ export const DENY_RULES = {
     ],
   },
   'deny.git_clean_force': {
-    reason: 'It deletes every untracked file and directory, which git cannot bring back.',
+    reason: 'It deletes untracked files or directories, which git cannot bring back.',
     alternatives: [
       'Run git clean -n to list what would go, then remove the specific paths you mean.',
     ],
   },
   'deny.rm_recursive_root': {
     reason:
-      'It recursively removes the filesystem root, the home directory, the repository itself, its parent, or everything a bare glob matches.',
+      'It recursively removes the filesystem root, the home directory, the repository itself or its git data, its parent, or everything a bare glob matches there.',
     alternatives: [
       'Remove the specific file or sub-directory you mean, by its path inside the repository.',
     ],
@@ -95,7 +114,7 @@ export const DENY_RULES = {
   },
   'deny.path_unresolvable': {
     reason:
-      'A target path could not be resolved (a symlink loop, a path through a file, or an unreadable directory), so the gate cannot tell where the write would land.',
+      'A target path could not be resolved (a symlink loop, a path through a file, an unreadable directory, or a path relative to a running process), so the gate cannot tell where the write would land.',
     alternatives: ['Use a plain path inside the repository.'],
   },
   'deny.secret_write': {
@@ -106,15 +125,15 @@ export const DENY_RULES = {
     ],
   },
   'deny.secret_read': {
-    reason: 'It prints the contents of an env file, key or credential store.',
+    reason: 'It reads, copies, loads or prints an env file, key, credential store or login token.',
     alternatives: [
       'Read the code or the documented template that names the variables, not their values.',
-      'Check that the file or a variable exists (test -f, ls) without printing it.',
+      'Check that the file or a variable exists (test -f, ls) without opening it.',
     ],
   },
   'deny.unreadable_request': {
     reason:
-      'The tool call reached the gate without the command text, write target or absolute working directory needed to judge it.',
+      'The tool call reached the gate without the command text, write target, known kind or absolute working directory needed to judge it.',
     alternatives: [BLOCKED_ALTERNATIVE],
   },
 } as const satisfies Record<string, DenyRule>;
@@ -127,6 +146,7 @@ export const RISK_RULE_IDS = [
   'risk.network_request',
   'risk.kind_network',
   'risk.kind_mcp',
+  'risk.environment_dump',
   'risk.secret_path_argument',
   'risk.cwd_outside_root',
   'risk.opaque_shell',
@@ -198,6 +218,11 @@ export const DEFAULT_VERIFICATION_COMMANDS: readonly string[] = [
 // Command vocabulary
 // ---------------------------------------------------------------------------
 
+/**
+ * Commands that only read. While the default for a call with no signal is
+ * allow, this list changes no decision: it only decides whether the record says
+ * `allow.read_only` or `default.no_signal`.
+ */
 const READ_ONLY_HEADS: ReadonlySet<string> = new Set([
   ...['ls', 'cat', 'rg', 'grep', 'egrep', 'fgrep', 'head', 'tail', 'wc', 'nl', 'cut', 'tr'],
   ...['pwd', 'echo', 'printf', 'which', 'file', 'stat', 'du', 'df', 'diff', 'jq', 'find'],
@@ -207,46 +232,90 @@ const READ_ONLY_GIT: ReadonlySet<string> = new Set([
   ...['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'blame', 'describe', 'grep'],
   ...['branch', 'remote'],
 ]);
-const GIT_BRANCH_LIST_FLAGS = /^(-a|-r|-v|-vv|--all|--remotes|--verbose|--list|--show-current)$/;
-/** Flags that make a read-only command run another program. */
-const GIT_EXEC_FLAGS = /^(--ext-diff|--textconv|-O.*|--open-files-in-pager.*)$/;
-const RG_EXEC_FLAGS = /^--(pre|pre-glob|hostname-bin)(=|$)/;
-const FIND_WRITE_FLAGS = /^-(delete|fprint|fprint0|fprintf|fls)$/;
-/** Wrappers that change nothing about what the command may do. */
-const BENIGN_WRAPPERS: ReadonlySet<string> = new Set(['timeout', 'nice', 'env', 'command', 'time']);
+const GIT_BRANCH_LIST_FLAGS = /^(-a|-r|-v|--all|--remotes|--verbose|--list|--show-current)$/;
+const RG_EXEC_FLAGS: readonly string[] = ['--pre', '--pre-glob', '--hostname-bin'];
+const FIND_FILE_ACTIONS: ReadonlySet<string> = new Set(['-fprint', '-fprint0', '-fprintf', '-fls']);
+/** find predicates that do not narrow what `-delete` removes. */
+const FIND_UNFILTERED = /^-(delete|depth|d|print|print0|mindepth|maxdepth|xdev|mount|noleaf|true)$/;
 
-/** Commands whose file arguments are printed or copied out. */
+/** Commands whose file arguments are printed. A variable in their place may name a secret. */
 const CONTENT_READERS: ReadonlySet<string> = new Set([
   ...['cat', 'tac', 'head', 'tail', 'less', 'more', 'bat', 'nl', 'od', 'xxd', 'hexdump', 'strings'],
   ...['base64', 'base32', 'grep', 'egrep', 'fgrep', 'rg', 'ag', 'awk', 'gawk', 'sed', 'cut'],
   ...['sort', 'uniq', 'diff', 'cmp', 'jq', 'yq'],
 ]);
-/** Git subcommands that print file contents. */
-const GIT_CONTENT_SUBCOMMANDS: ReadonlySet<string> = new Set([
-  ...['show', 'diff', 'log', 'cat-file', 'blame', 'grep', 'archive'],
+/** Git subcommands whose operands are files: given a secret one they read, stage or print it. */
+const GIT_PATH_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  ...['add', 'rm', 'mv', 'restore', 'commit', 'archive', 'apply', 'am', 'update-index'],
+  ...['hash-object', 'stash', 'grep', 'blame', 'cat-file'],
 ]);
+/**
+ * Git subcommands whose operands are revisions unless they follow `--`, name a
+ * file that exists, or have the `rev:path` form. `git log fix/credentials` is
+ * a branch.
+ */
+const GIT_REVISION_SUBCOMMANDS: ReadonlySet<string> = new Set(['diff', 'show', 'log', 'checkout']);
 /** Commands whose first operand is a pattern, script or filter, not a file. */
-const SCRIPT_FIRST: ReadonlySet<string> = new Set([
+const PATTERN_FIRST: ReadonlySet<string> = new Set([
   ...['grep', 'egrep', 'fgrep', 'rg', 'ag', 'sed', 'awk', 'gawk', 'jq', 'yq'],
 ]);
-const SCRIPT_FLAGS: ReadonlySet<string> = new Set([
-  '-e',
-  '-f',
-  '--regexp',
-  '--file',
-  '--expression',
+/** Options that supply that pattern or script, which leaves every operand a file. */
+const PATTERN_FLAGS: readonly string[] = ['-e', '-f', '--regexp', '--file', '--expression'];
+/** Commands whose arguments are text, never paths, and which read nothing from stdin. */
+const TEXT_ONLY: ReadonlySet<string> = new Set(['echo', 'printf', 'true', 'false', ':']);
+/** Shell builtins whose operands are names and values, not files. */
+const NAME_BUILTINS: ReadonlySet<string> = new Set([
+  ...['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'set', 'alias', 'unalias'],
+  ...['let', 'shopt', 'trap', 'eval', 'exit', 'return', 'shift', 'wait', 'kill', 'sleep'],
 ]);
-/** Commands whose arguments are text, never paths. */
-const TEXT_ONLY: ReadonlySet<string> = new Set(['echo', 'printf']);
 /** Commands that look at a path without showing what is in it. */
 const METADATA_ONLY: ReadonlySet<string> = new Set([
-  ...['ls', 'stat', 'test', '[', 'file', 'du', 'find', 'cd', 'pushd', 'which', 'realpath'],
-  ...['basename', 'dirname'],
+  ...['ls', 'stat', 'test', '[', '[[', 'file', 'du', 'find', 'cd', 'pushd', 'which', 'realpath'],
+  ...['basename', 'dirname', 'wc', 'tree', 'mkdir'],
 ]);
 
-const FETCHERS: ReadonlySet<string> = new Set(['curl', 'wget']);
-const STDIN_INTERPRETERS: ReadonlySet<string> = new Set([
-  ...['python', 'python2', 'python3', 'perl', 'ruby', 'node', 'nodejs', 'php'],
+/** Options whose value is text for the command, never a file it opens. */
+const TEXT_VALUE_FLAGS: ReadonlySet<string> = new Set([
+  ...['--message', '--body', '--title', '--grep', '--author', '--committer', '--format'],
+  ...['--pretty', '--regexp', '--pattern', '--query', '--jq', '--template', '--description'],
+  ...['--subject', '--name', '--exclude', '--exclude-dir', '--include', '--glob', '--iglob'],
+  ...['--type', '--search', '--label', '--filter', '--sort', '--date', '--notes', '--comment'],
+  ...['--reason', '--prefix', '--tag', '--branch', '--base', '--head', '--ref', '--since'],
+  ...['--until', '--user', '--repo', '--owner', '--field', '--raw-field', '--header', '--arg'],
+  ...['--expression', '--set', '--define', '--env', '--method', '--request', '--url'],
+]);
+/** Options whose value is a credential the command uses, which is not the same as reading it out. */
+const CREDENTIAL_USE_FLAGS: ReadonlySet<string> = new Set([
+  ...['--identity-file', '--cert', '--key', '--cacert', '--capath', '--kubeconfig', '-i'],
+  ...['--private-key', '--ssh-key', '--key-file', '--cert-file', '--ca-file', '--netrc-file'],
+  ...['--client-key', '--client-certificate', '--certificate-authority', '--tls-cert'],
+  ...['--tls-key', '--ssl-cert', '--ssl-key', '--ssl-ca', '--sslrootcert', '--keyfile'],
+  ...['--certfile', '-E', '-K', '--config'],
+]);
+/** Long options that take a value for many tools, added when a command has no table entry. */
+const COMMON_VALUE_FLAGS: readonly string[] = [
+  ...TEXT_VALUE_FLAGS,
+  ...[...CREDENTIAL_USE_FLAGS].filter(flag => flag.startsWith('--')),
+  ...['--output', '--out', '--outfile', '--output-file', '--out-dir', '--outdir', '--log-file'],
+  ...['--env-file', '--file', '--input'],
+];
+/** Options that name where an unlisted command writes. */
+const COMMON_OUTPUT_FLAGS: readonly string[] = [
+  ...['-o', '--output', '--out', '--outfile', '--output-file', '--out-dir', '--outdir'],
+  '--log-file',
+];
+
+/** Programs that run code given on their command line or stdin. */
+const INTERPRETERS: ReadonlySet<string> = new Set([
+  ...['python', 'python2', 'python3', 'perl', 'ruby', 'node', 'nodejs', 'php', 'deno', 'bun'],
+  ...['pwsh', 'powershell', 'tclsh', 'wish', 'lua', 'luajit', 'Rscript', 'osascript'],
+]);
+/** Options that carry the program, so it is not read from stdin. */
+const CODE_FLAGS: readonly string[] = [
+  ...['-c', '-e', '-E', '-p', '-r', '-m', '--eval', '--print', '--command', '-Command', '-File'],
+];
+const STDIN_PATHS: ReadonlySet<string> = new Set([
+  ...['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'],
 ]);
 const RUNS_ITS_ARGUMENT: ReadonlySet<string> = new Set([
   ...SHELL_INTERPRETERS,
@@ -254,21 +323,34 @@ const RUNS_ITS_ARGUMENT: ReadonlySet<string> = new Set([
   'source',
   '.',
 ]);
+
+const HTTP_CLIENTS: ReadonlySet<string> = new Set(['curl', 'wget', 'http', 'https', 'xh']);
 const REMOTE_CLIENTS: ReadonlySet<string> = new Set([
   ...['ssh', 'scp', 'sftp', 'nc', 'ncat', 'netcat', 'socat', 'telnet', 'ftp'],
 ]);
-const HTTP_CLIENTS: ReadonlySet<string> = new Set(['curl', 'wget', 'http', 'https', 'xh']);
+/** Everything that can bring bytes in from somewhere else. */
+const FETCHERS: ReadonlySet<string> = new Set([
+  ...HTTP_CLIENTS,
+  ...REMOTE_CLIENTS,
+  ...['fetch', 'aria2c', 'lynx', 'w3m', 'links'],
+]);
+/** Everything that can carry bytes off this machine, the HTTP and remote clients aside. */
+const SENDERS: ReadonlySet<string> = new Set([
+  ...['gh', 'aws', 'gcloud', 'az', 'kubectl', 'mail', 'mailx', 'sendmail', 'mutt', 'msmtp'],
+]);
 const SAFE_HTTP_METHODS: ReadonlySet<string> = new Set(['GET', 'HEAD', 'OPTIONS']);
-const CURL_BODY_FLAGS: ReadonlySet<string> = new Set([
-  ...['--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii', '--json'],
-  ...['--form', '--form-string', '--upload-file'],
-]);
-const WGET_BODY_FLAGS: ReadonlySet<string> = new Set([
+/** curl options whose value is a request body. A leading or embedded `@path` uploads that file. */
+const CURL_BODY_FLAGS: readonly string[] = [
+  ...['-d', '--data', '--data-raw', '--data-binary', '--data-urlencode', '--data-ascii'],
+  ...['--json', '-F', '--form', '--form-string', '-T', '--upload-file'],
+];
+const WGET_BODY_FLAGS: readonly string[] = [
   ...['--post-data', '--post-file', '--method', '--body-data', '--body-file'],
-]);
+];
 
 const MUTATION_HEADS: Readonly<Record<string, ReversibleHint>> = {
   rm: 'unknown',
+  rimraf: 'unknown',
   mv: 'likely',
   dd: 'unlikely',
   shred: 'unlikely',
@@ -278,24 +360,124 @@ const MUTATION_HEADS: Readonly<Record<string, ReversibleHint>> = {
   psql: 'unlikely',
   mysql: 'unlikely',
   mongosh: 'unlikely',
+  su: 'unlikely',
 };
-const PRIVILEGE_WRAPPERS: ReadonlySet<string> = new Set(['sudo', 'doas']);
 const PUBLISHERS: ReadonlySet<string> = new Set(['npm', 'pnpm', 'yarn', 'bun', 'cargo']);
-const GH_MUTATION_VERBS: ReadonlySet<string> = new Set([
-  ...['create', 'merge', 'close', 'delete', 'comment', 'edit', 'review', 'reopen', 'set', 'upload'],
+
+/** `gh <group> <verb>` groups, each of which has verbs that change remote state. */
+const GH_GROUPS: ReadonlySet<string> = new Set([
+  ...['pr', 'issue', 'repo', 'release', 'run', 'workflow', 'secret', 'variable', 'gist'],
+  ...['label', 'project', 'codespace', 'cache', 'ruleset', 'org', 'ssh-key', 'gpg-key'],
+  ...['auth', 'extension', 'alias', 'config', 'attestation'],
 ]);
-const GH_API_BODY_FLAGS: ReadonlySet<string> = new Set([
-  '-f',
-  '-F',
-  '--field',
-  '--raw-field',
-  '--input',
+/**
+ * The verbs of those groups that only read, or only change this checkout. Every
+ * other verb escalates, so a verb GitHub adds later is treated as a change.
+ */
+const GH_READ_VERBS: ReadonlySet<string> = new Set([
+  ...['view', 'list', 'status', 'checks', 'diff', 'watch', 'logs', 'download', 'checkout'],
+  ...['clone', 'get', 'ls', 'verify', 'search', 'browse'],
 ]);
+const GH_API_BODY_FLAGS: readonly string[] = ['-f', '-F', '--field', '--raw-field', '--input'];
+
+/** Commands that print a live credential when run. */
+const TOKEN_PRINTERS: readonly {
+  head: string;
+  words: readonly string[];
+  flag?: readonly string[];
+}[] = [
+  { head: 'gh', words: ['auth', 'token'] },
+  { head: 'gh', words: ['auth', 'status'], flag: ['--show-token', '-t'] },
+  { head: 'gcloud', words: ['auth', 'print-access-token'] },
+  { head: 'gcloud', words: ['auth', 'print-identity-token'] },
+  { head: 'gcloud', words: ['auth', 'application-default', 'print-access-token'] },
+  { head: 'az', words: ['account', 'get-access-token'] },
+  { head: 'aws', words: ['configure', 'get'] },
+  { head: 'aws', words: ['configure', 'export-credentials'] },
+  { head: 'aws', words: ['ecr', 'get-login-password'] },
+  { head: 'git', words: ['credential', 'fill'] },
+  { head: 'vault', words: ['print', 'token'] },
+  { head: 'kubectl', words: ['config', 'view'], flag: ['--raw'] },
+  { head: 'npm', words: ['token', 'list'] },
+  { head: 'pass', words: ['show'] },
+];
+
+/** Variables that make an otherwise read-only command run another program. */
+const EXEC_VARIABLES: ReadonlySet<string> = new Set([
+  ...['GIT_EXTERNAL_DIFF', 'GIT_PAGER', 'PAGER', 'GIT_SSH_COMMAND', 'GIT_SSH', 'GIT_EDITOR'],
+  ...['GIT_SEQUENCE_EDITOR', 'GIT_ASKPASS', 'SSH_ASKPASS', 'EDITOR', 'VISUAL', 'LD_PRELOAD'],
+  ...['LD_LIBRARY_PATH', 'DYLD_INSERT_LIBRARIES', 'BASH_ENV', 'ENV', 'PROMPT_COMMAND'],
+  ...['PYTHONSTARTUP', 'NODE_OPTIONS', 'PERL5OPT', 'RUBYOPT', 'LESSOPEN', 'MANPAGER'],
+]);
+
+/**
+ * Commands that run another command passed in their arguments, by word or as a
+ * quoted script. Their arguments are read as commands, like those of any
+ * command this table does not know.
+ */
+const ARGUMENT_RUNNERS: ReadonlySet<string> = new Set([
+  ...['script', 'su', 'watch', 'tmux', 'screen', 'nix', 'nix-shell', 'uv', 'uvx', 'pipx'],
+  ...['poetry', 'pipenv', 'bundle', 'dotenv', 'doppler', 'op', 'direnv', 'cross-env'],
+  ...['concurrently', 'npm-run-all', 'run-s', 'run-p', 'entr', 'fakeroot', 'proot'],
+  ...['firejail', 'bwrap', 'numactl', 'xvfb-run', 'dbus-run-session', 'sg', 'expect'],
+]);
+/** Package-manager subcommands that run a command given as the remaining words. */
+const PACKAGE_EXEC: ReadonlySet<string> = new Set(['exec', 'x', 'dlx']);
+/** Commands worth looking for among another command's arguments. */
+const EMBEDDED_HEADS: ReadonlySet<string> = new Set([
+  ...['git', 'rm', 'rimraf', 'eval', 'find', 'dd', 'mv', 'cp', 'tee', 'truncate', 'shred'],
+  ...['curl', 'wget', 'sudo', 'doas', 'env', 'xargs', 'printenv', ...SHELL_INTERPRETERS],
+]);
+
+/** Tools with their own argument grammar, in which a word like `rm` is a subcommand or a name. */
+const COMMON_TOOLS: readonly string[] = [
+  ...['npm', 'pnpm', 'yarn', 'bun', 'pip', 'pip3', 'cargo', 'go', 'make', 'cmake', 'ninja'],
+  ...['tsc', 'eslint', 'prettier', 'jest', 'vitest', 'pytest', 'ruff', 'mypy', 'biome'],
+  ...['brew', 'apt', 'apt-get', 'dnf', 'yum', 'pacman', 'apk', 'snap', 'systemctl'],
+  ...['journalctl', 'man', 'type', 'help', 'whatis', 'apropos', 'tldr', 'whereis', 'ps'],
+  ...['top', 'htop', 'date', 'read', 'mapfile', 'readarray', 'source', '.', 'tar', 'zip'],
+  ...['gzip', 'gunzip', 'bzip2', 'xz', 'zstd', 'vim', 'vi', 'nano', 'emacs', 'code', 'open'],
+  ...['xdg-open', 'archon', 'claude', 'codex', 'git', 'gh', 'terraform', 'helm', 'aws'],
+  ...['gcloud', 'az', 'vault', 'pass', 'sqlite3', 'redis-cli', 'java', 'javac', 'mvn'],
+  ...['gradle', 'gem', 'rake', 'composer', 'dotnet', 'rustup', 'ar', 'nm', 'objdump'],
+  ...['strip', 'comm', 'join', 'paste', 'rev', 'fmt', 'pr', 'column', 'expand', 'seq'],
+  ...['yes', 'env', 'printenv', 'id', 'hostname', 'pushd', 'popd', 'dirs', 'history'],
+  ...['fg', 'bg', 'jobs', 'umask', 'ulimit', 'hash', 'getopts', 'command', 'builtin'],
+  ...[
+    'time',
+    'exec',
+    'at',
+    'batch',
+    'ansible',
+    'ansible-playbook',
+    'vagrant',
+    'pulumi',
+    'flyctl',
+    'vercel',
+  ],
+];
 
 /** Redirection and download targets that are not files. */
 const DEVICE_SINKS: ReadonlySet<string> = new Set([
   ...['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty', '-'],
 ]);
+/** Bash network pseudo-files: a redirect to one sends its input to a host. */
+const NETWORK_DEVICE = /^\/dev\/(tcp|udp)\//;
+
+/** Commands the rules know by more than one name. */
+const SPEC_ALIASES: Readonly<Record<string, string>> = {
+  egrep: 'grep',
+  fgrep: 'grep',
+  gawk: 'awk',
+  python2: 'python',
+  python3: 'python',
+  nodejs: 'node',
+  bash: 'sh',
+  zsh: 'sh',
+  dash: 'sh',
+  ksh: 'sh',
+  ash: 'sh',
+};
 
 // ---------------------------------------------------------------------------
 // Judgement state
@@ -306,12 +488,21 @@ interface Judgement {
   signals: Set<RiskRuleId>;
   hints: ReversibleHint[];
   targets: Set<string>;
+  /** Files a download wrote earlier in the same call, as they appear in `targets`. */
+  fetched: Set<string>;
   /** A target or working directory this gate could not place. */
   unplaced: boolean;
 }
 
 function newJudgement(): Judgement {
-  return { deny: undefined, signals: new Set(), hints: [], targets: new Set(), unplaced: false };
+  return {
+    deny: undefined,
+    signals: new Set(),
+    hints: [],
+    targets: new Set(),
+    fetched: new Set(),
+    unplaced: false,
+  };
 }
 
 function deny(judgement: Judgement, ruleId: DenyRuleId): void {
@@ -332,71 +523,33 @@ function combineHints(hints: readonly ReversibleHint[]): ReversibleHint {
 // Arguments
 // ---------------------------------------------------------------------------
 
-interface SplitArgs {
-  /** Words starting with `-`, before any `--`. */
-  options: ResolvedWord[];
-  positionals: ResolvedWord[];
-  /** Values of the options named in `valueFlags`, by option. */
-  values: Map<string, ResolvedWord[]>;
+/** One argument: its resolved text, and the shell text hidden inside it. */
+interface Arg extends ResolvedWord {
+  nested: readonly NestedScript[];
 }
 
-/** Splits arguments the way most commands do. `valueFlags` take the next word as their value. */
-function splitArgs(
-  args: readonly ResolvedWord[],
-  valueFlags: ReadonlySet<string> = new Set()
-): SplitArgs {
-  const split: SplitArgs = { options: [], positionals: [], values: new Map() };
-  const addValue = (flag: string, value: ResolvedWord): void => {
-    split.values.set(flag, [...(split.values.get(flag) ?? []), value]);
-  };
-  let onlyPositionals = false;
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    if (arg === undefined) continue;
-    if (onlyPositionals || arg.dynamic || !arg.text.startsWith('-') || arg.text === '-') {
-      split.positionals.push(arg);
-      continue;
-    }
-    if (arg.text === '--') {
-      onlyPositionals = true;
-      continue;
-    }
-    split.options.push(arg);
-    const equals = arg.text.indexOf('=');
-    if (arg.text.startsWith('--') && equals !== -1) {
-      addValue(arg.text.slice(0, equals), { ...arg, text: arg.text.slice(equals + 1) });
-    } else if (valueFlags.has(arg.text)) {
-      const value = args[i + 1];
-      if (value !== undefined) addValue(arg.text, value);
-      i++;
-    }
-  }
-  return split;
+type Options = ParsedOptions<Arg>;
+
+function toArg(word: ShellWord, context: RuleContext): Arg {
+  return { ...resolveWord(word, context.homeDir), nested: word.nested };
 }
 
-/** Whether a short flag is present, alone or in a cluster such as `-rf`. */
-function hasShort(options: readonly ResolvedWord[], flag: string): boolean {
-  return options.some(option => /^-[A-Za-z0-9]+$/.test(option.text) && option.text.includes(flag));
-}
-
-function hasLong(options: readonly ResolvedWord[], flag: string): boolean {
-  return options.some(option => option.text === flag || option.text.startsWith(`${flag}=`));
+function plainPath(text: string): Arg {
+  return { text, dynamic: false, glob: false, nested: [] };
 }
 
 /**
- * Whether a long flag is present, spelled out or cut short. Git and GNU tools
- * accept any unambiguous prefix (`git reset --har`), so an exact match would be
- * a way round a rule. `shortest` is the shortest prefix the tool accepts.
+ * The option grammar of a command. One with no entry gets the options many
+ * tools share, so `--output file` and `--message text` are read as a value.
  */
-function hasLongAbbreviated(
-  options: readonly ResolvedWord[],
-  flag: string,
-  shortest: string
-): boolean {
-  return options.some(option => {
-    const name = option.text.split('=')[0] ?? '';
-    return name.startsWith(shortest) && flag.startsWith(name);
-  });
+function specFor(head: string): OptionSpec {
+  return (
+    OPTION_SPECS[SPEC_ALIASES[head] ?? head] ?? { valueShort: 'o', valueLong: COMMON_VALUE_FLAGS }
+  );
+}
+
+function hasSpec(head: string): boolean {
+  return (SPEC_ALIASES[head] ?? head) in OPTION_SPECS;
 }
 
 // ---------------------------------------------------------------------------
@@ -430,7 +583,8 @@ function literalView(text: string, context: RuleContext): string {
 }
 
 function isDeviceSink(word: ResolvedWord): boolean {
-  return !word.dynamic && (DEVICE_SINKS.has(word.text) || word.text.startsWith('/dev/fd/'));
+  // `/dev/fd/3` is an open file. `/dev/fd/../..` is a path like any other.
+  return !word.dynamic && (DEVICE_SINKS.has(word.text) || /^\/dev\/fd\/\d+$/.test(word.text));
 }
 
 interface ShellScope {
@@ -485,18 +639,25 @@ async function judgeWriteTarget(target: ResolvedWord, scope: ShellScope): Promis
   judgement.targets.add(rootView(where.real, context) || '.');
 }
 
-/** Whether an argument names an env file, key or credential store. */
-async function isSecretArgument(arg: ResolvedWord, scope: ShellScope): Promise<boolean> {
+/** Whether text names an env file, key or credential store, as written or where it points. */
+async function isSecretText(text: string, known: boolean, scope: ShellScope): Promise<boolean> {
   const { context } = scope;
-  const text = arg.text.startsWith('@') ? arg.text.slice(1) : arg.text;
   // A URL is not a local file, whatever its path looks like.
   if (text === '' || text.includes('://')) return false;
   const pathLike = /[/.~]/.test(text);
   if (pathLike && isSecretPath(literalView(text, context))) return true;
-  if (arg.dynamic || arg.glob) return false;
+  if (!known) return false;
   // A bare word is only a path if it exists; a symlink is judged by where it points.
   const where = await locate(text, scope.cwd, context);
   return where.kind === 'resolved' && where.exists && isSecretPath(rootView(where.real, context));
+}
+
+/** Whether an argument names a secret: the whole word, or the value of `name=value`. */
+async function isSecretArgument(arg: ResolvedWord, scope: ShellScope): Promise<boolean> {
+  const known = !arg.dynamic && !arg.glob;
+  if (await isSecretText(arg.text, known, scope)) return true;
+  const equals = arg.text.indexOf('=');
+  return equals > 0 && (await isSecretText(arg.text.slice(equals + 1), known, scope));
 }
 
 // ---------------------------------------------------------------------------
@@ -505,22 +666,72 @@ async function isSecretArgument(arg: ResolvedWord, scope: ShellScope): Promise<b
 
 interface CommandView {
   command: ShellCommand;
-  args: ResolvedWord[];
+  args: Arg[];
 }
+
+/** How a command is being judged. */
+interface Mode {
+  /** How many scripts deep: a script found inside an argument, inside a script, and so on. */
+  nesting: number;
+  /**
+   * The text was only guessed to be a command (a quoted argument of an unknown
+   * tool). Destructive commands in it still deny; a secret-shaped word given to
+   * a command nobody knows only raises a signal, because it may be prose.
+   */
+  speculative: boolean;
+}
+
+/** How many scripts inside scripts are read before the rest is left as opaque. */
+const MAX_SCRIPT_NESTING = 3;
+
+function toView(command: ShellCommand, context: RuleContext): CommandView {
+  return { command, args: command.args.map(word => toArg(word, context)) };
+}
+
+// --- git -------------------------------------------------------------------
 
 interface GitInvocation {
   subcommand: string | undefined;
-  args: ResolvedWord[];
-  directories: ResolvedWord[];
-  configOverride: boolean;
+  args: Arg[];
 }
 
-function parseGit(args: readonly ResolvedWord[]): GitInvocation {
-  const git: GitInvocation = {
-    subcommand: undefined,
-    args: [],
+interface GitCommandLine {
+  /** The subcommand as git would most likely read it. */
+  primary: GitInvocation;
+  /**
+   * Other readings, when a global option this table does not know may or may
+   * not have taken the next word as its value.
+   */
+  alternatives: GitInvocation[];
+  directories: Arg[];
+  configOverride: boolean;
+  unknownGlobal: boolean;
+}
+
+/** Global options that take the next word as their value. */
+const GIT_GLOBAL_VALUE: ReadonlySet<string> = new Set([
+  ...['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--super-prefix', '--config-env'],
+  '--attr-source',
+]);
+const GIT_GLOBAL_FLAG =
+  /^(-p|-P|--paginate|--no-pager|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-lazy-fetch|--no-advice|--version|--help|-h|-v|--html-path|--man-path|--info-path|--exec-path)$/;
+const GIT_GLOBAL_ATTACHED =
+  /^(--git-dir|--work-tree|--namespace|--super-prefix|--attr-source|--list-cmds)=/;
+/** Subcommands with a deny rule or a risk signal of their own. */
+const GIT_JUDGED: ReadonlySet<string> = new Set([
+  ...['push', 'reset', 'clean', 'rebase', 'branch', 'tag', 'checkout', 'restore', 'switch'],
+  ...['stash', 'read-tree', 'checkout-index', 'update-ref', 'reflog', 'gc', 'prune', 'rm'],
+  ...['filter-branch', 'filter-repo', 'clone', 'worktree', 'init', 'config', 'apply', 'am'],
+  ...['archive', 'bundle', 'format-patch', 'credential'],
+]);
+
+function parseGit(args: readonly Arg[]): GitCommandLine {
+  const line: GitCommandLine = {
+    primary: { subcommand: undefined, args: [] },
+    alternatives: [],
     directories: [],
     configOverride: false,
+    unknownGlobal: false,
   };
   let i = 0;
   while (i < args.length) {
@@ -528,143 +739,364 @@ function parseGit(args: readonly ResolvedWord[]): GitInvocation {
     if (arg === undefined || arg.dynamic) break;
     const text = arg.text;
     if (!text.startsWith('-')) {
-      git.subcommand = text;
-      git.args = args.slice(i + 1);
+      line.primary = { subcommand: text, args: args.slice(i + 1) };
       break;
     }
     if (text === '-C') {
       const directory = args[i + 1];
-      if (directory !== undefined) git.directories.push(directory);
-      i += 2;
-    } else if (text === '-c' || text === '--config-env') {
-      git.configOverride = true;
-      i += 2;
-    } else if (text.startsWith('--config-env=') || text.startsWith('--exec-path=')) {
-      git.configOverride = true;
-      i++;
-    } else if (['--git-dir', '--work-tree', '--namespace', '--super-prefix'].includes(text)) {
+      if (directory !== undefined) line.directories.push(directory);
+    }
+    if (text === '-c' || text.startsWith('--config-env') || text.startsWith('--exec-path=')) {
+      line.configOverride = true;
+    }
+    if (GIT_GLOBAL_VALUE.has(text)) {
       i += 2;
     } else {
+      // An option this table does not know may take a value, which would make
+      // the next word that value and the one after it the subcommand.
+      const known =
+        GIT_GLOBAL_FLAG.test(text) || GIT_GLOBAL_ATTACHED.test(text) || text.includes('=');
+      if (!known) line.unknownGlobal = true;
       i++;
     }
   }
-  return git;
+  if (line.unknownGlobal) {
+    args.forEach((arg, index) => {
+      if (index <= i || arg.dynamic || !GIT_JUDGED.has(arg.text)) return;
+      line.alternatives.push({ subcommand: arg.text, args: args.slice(index + 1) });
+    });
+  }
+  return line;
+}
+
+/**
+ * The branch a checkout has out, read from its `HEAD` file. `undefined` for a
+ * detached head, or when no checkout is found at or above `directory`.
+ */
+async function currentBranch(directory: string | undefined): Promise<string | undefined> {
+  let at = directory;
+  while (at !== undefined) {
+    const dotGit = join(at, '.git');
+    let gitDir: string | undefined;
+    try {
+      if ((await stat(dotGit)).isDirectory()) {
+        gitDir = dotGit;
+      } else {
+        // A linked worktree: `.git` is a file naming the real git directory.
+        const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(dotGit, 'utf8'))?.[1];
+        gitDir = pointer === undefined ? undefined : resolve(at, pointer.trim());
+      }
+    } catch {
+      // No `.git` here: look one directory up.
+    }
+    if (gitDir !== undefined) {
+      try {
+        const head = await readFile(join(gitDir, 'HEAD'), 'utf8');
+        return /^ref:\s*refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim();
+      } catch {
+        return undefined;
+      }
+    }
+    const parent = dirname(at);
+    at = parent === at ? undefined : parent;
+  }
+  return undefined;
+}
+
+/** Commands whose whole output is the name of the branch that is checked out. */
+const CURRENT_BRANCH_COMMANDS: ReadonlySet<string> = new Set([
+  'git branch --show-current',
+  'git rev-parse --abbrev-ref HEAD',
+  'git symbolic-ref --short HEAD',
+]);
+
+function namesCurrentBranch(refspec: Arg): boolean {
+  if (!refspec.dynamic) return refspec.text === 'HEAD' || refspec.text === '@';
+  const [only] = refspec.nested;
+  return (
+    refspec.nested.length === 1 &&
+    only !== undefined &&
+    /^\$\([^)]*\)$/.test(refspec.text) &&
+    CURRENT_BRANCH_COMMANDS.has(only.text.trim().replace(/\s+/g, ' '))
+  );
 }
 
 /** The branch a push refspec writes to. `undefined` when the refspec does not name one. */
 function pushDestination(refspec: string): string | undefined {
-  const destination = refspec.slice(refspec.lastIndexOf(':') + 1).replace(/^refs\/heads\//, '');
+  // `heads/main` and `refs/heads/main` both resolve to the branch `main` on the remote.
+  const destination = refspec
+    .slice(refspec.lastIndexOf(':') + 1)
+    .replace(/^\+/, '')
+    .replace(/^(refs\/)?heads\//, '');
   return destination === '' || destination === 'HEAD' || destination === '@'
     ? undefined
     : destination;
 }
 
-const PUSH_VALUE_FLAGS: ReadonlySet<string> = new Set([
-  ...['-o', '--push-option', '--repo', '--receive-pack', '--exec'],
-]);
-const PUSH_EVERYTHING_FLAGS: ReadonlySet<string> = new Set(['--all', '--mirror', '--branches']);
-
-function judgeGitPush(args: readonly ResolvedWord[], scope: ShellScope): void {
+async function judgeGitPush(
+  parsed: Options,
+  scope: ShellScope,
+  gitDirectory: string | undefined
+): Promise<void> {
   const { context, judgement } = scope;
-  const { options, positionals } = splitArgs(args, PUSH_VALUE_FLAGS);
-  const refspecs = positionals.slice(1);
-  const forced = hasShort(options, 'f') || options.some(option => option.text === '--force');
-  const lease = options.some(option => option.text.startsWith('--force-with-lease'));
+  const refspecs = parsed.positionals.slice(1);
+  const isProtected = (branch: string | undefined): boolean =>
+    branch === undefined || context.protectedBranches.includes(branch);
 
-  if (forced || refspecs.some(refspec => refspec.text.startsWith('+'))) {
-    deny(judgement, 'deny.git_force_push');
-  } else if (lease) {
-    const unnamed =
-      refspecs.length === 0 ||
-      options.some(option => PUSH_EVERYTHING_FLAGS.has(option.text)) ||
-      refspecs.some(refspec => refspec.dynamic || refspec.glob);
-    const destinations = refspecs.map(refspec => pushDestination(refspec.text));
-    const protectedOrUnknown = destinations.some(
-      destination => destination === undefined || context.protectedBranches.includes(destination)
-    );
-    if (unnamed || protectedOrUnknown) deny(judgement, 'deny.git_force_push_protected');
-  } else if (options.some(option => option.text === '--mirror')) {
+  const forced = hasOption(parsed, '-f', '--force');
+  // Git accepts any unambiguous prefix: `--force-w` is the lease flag.
+  const lease = hasAbbreviated(parsed, '--force-with-lease', '--force-w');
+  const mirror = hasOption(parsed, '--mirror');
+  const everything = mirror || hasOption(parsed, '--all', '--branches');
+
+  if (forced || refspecs.some(refspec => refspec.text.startsWith('+')) || (mirror && !lease)) {
     // A mirror push force-updates every remote ref and deletes the ones missing locally.
     deny(judgement, 'deny.git_force_push');
+  } else if (lease) {
+    // With no refspec git pushes the branch that is checked out.
+    const named = refspecs.length === 0 ? [plainPath('HEAD')] : refspecs;
+    const current = named.some(namesCurrentBranch) ? await currentBranch(gitDirectory) : undefined;
+    const destinations = named.map(refspec => {
+      if (namesCurrentBranch(refspec)) return current;
+      return refspec.dynamic || refspec.glob ? undefined : pushDestination(refspec.text);
+    });
+    if (everything || destinations.some(isProtected)) {
+      deny(judgement, 'deny.git_force_push_protected');
+    }
+  }
+
+  // Deleting a branch on the remote: `--delete main`, or the refspec `:main`.
+  const deleted = hasOption(parsed, '-d', '--delete')
+    ? refspecs
+    : refspecs.filter(refspec => refspec.text.startsWith(':'));
+  if (deleted.some(refspec => !refspec.dynamic && isProtected(pushDestination(refspec.text)))) {
+    deny(judgement, 'deny.git_force_push_protected');
   }
   signal(judgement, 'risk.mutation_verb', 'unlikely');
+}
+
+/** Paths a git subcommand writes outside what git itself tracks. */
+function gitWriteTargets(subcommand: string, parsed: Options, context: RuleContext): Arg[] {
+  const { positionals } = parsed;
+  switch (subcommand) {
+    case 'clone':
+      return positionals.slice(1, 2);
+    case 'init':
+      return positionals.slice(0, 1);
+    case 'worktree':
+      return positionals[0]?.text === 'add' ? positionals.slice(1, 2) : [];
+    case 'bundle':
+      return positionals[0]?.text === 'create' ? positionals.slice(1, 2) : [];
+    case 'apply':
+    case 'am':
+      return valuesOf(parsed, '--directory');
+    case 'archive':
+      return valuesOf(parsed, '-o', '--output');
+    case 'format-patch':
+      return valuesOf(parsed, '-o', '--output-directory');
+    case 'config': {
+      const reads =
+        hasOption(parsed, '--get', '--get-all', '--get-regexp', '--list', '-l') ||
+        (positionals.length < 2 && !hasOption(parsed, '--unset', '--unset-all', '--edit', '-e'));
+      if (reads) return [];
+      const files = valuesOf(parsed, '-f', '--file');
+      if (hasOption(parsed, '--global')) files.push(plainPath(join(context.homeDir, '.gitconfig')));
+      if (hasOption(parsed, '--system')) files.push(plainPath('/etc/gitconfig'));
+      return files;
+    }
+    default:
+      return valuesOf(parsed, '--output');
+  }
+}
+
+/** Raises the signal for git commands that throw away work or history without a deny rule. */
+async function judgeGitDiscard(
+  subcommand: string,
+  parsed: Options,
+  raw: readonly Arg[],
+  scope: ShellScope
+): Promise<void> {
+  const { judgement } = scope;
+  const { positionals } = parsed;
+  const verb = positionals[0]?.text;
+  let discards = false;
+  let hint: ReversibleHint = 'unknown';
+  switch (subcommand) {
+    case 'rebase':
+    case 'filter-branch':
+    case 'filter-repo':
+      discards = true;
+      hint = subcommand === 'rebase' ? 'likely' : 'unlikely';
+      break;
+    case 'branch':
+      discards =
+        hasOption(parsed, '-D') ||
+        (hasOption(parsed, '-d', '--delete') && hasOption(parsed, '-f', '--force'));
+      hint = 'likely';
+      break;
+    case 'tag':
+      discards = hasOption(parsed, '-d', '--delete');
+      hint = 'likely';
+      break;
+    case 'checkout': {
+      // `git checkout <branch>` is ordinary; with a path it overwrites the file.
+      const paths = await Promise.all(
+        positionals.map(async arg => {
+          if (arg.dynamic) return false;
+          if (arg.text === '.' || arg.text.endsWith('/')) return true;
+          const where = await locate(arg.text, scope.cwd, scope.context);
+          return where.kind === 'resolved' && where.exists;
+        })
+      );
+      discards =
+        hasOption(parsed, '-f', '--force', '-p', '--patch') ||
+        raw.some(arg => arg.text === '--') ||
+        paths.includes(true);
+      break;
+    }
+    case 'restore':
+      // `--staged` alone only unstages; anything touching the worktree overwrites files.
+      discards = !hasOption(parsed, '--staged', '-S') || hasOption(parsed, '--worktree', '-W');
+      break;
+    case 'switch':
+      discards = hasOption(parsed, '--discard-changes', '-f', '--force');
+      break;
+    case 'stash':
+      discards = verb === 'drop' || verb === 'clear';
+      break;
+    case 'reflog':
+      discards = verb === 'expire' || verb === 'delete';
+      hint = 'unlikely';
+      break;
+    case 'gc':
+      discards = [...parsed.flags].some(flag => flag.startsWith('--prune'));
+      hint = 'unlikely';
+      break;
+    case 'checkout-index':
+      discards = hasOption(parsed, '-f', '--force');
+      break;
+    case 'rm':
+      discards = !hasOption(parsed, '--cached');
+      hint = 'likely';
+      break;
+    case 'read-tree':
+    case 'update-ref':
+    case 'prune':
+      discards = true;
+      break;
+    default:
+      break;
+  }
+  if (discards) signal(judgement, 'risk.mutation_verb', hint);
+}
+
+async function judgeGitSubcommand(
+  invocation: GitInvocation,
+  scope: ShellScope,
+  gitDirectory: string | undefined
+): Promise<Options | undefined> {
+  const { subcommand } = invocation;
+  const { context, judgement } = scope;
+  if (subcommand === undefined) return undefined;
+  const parsed = parseOptions(invocation.args, GIT_OPTION_SPECS[subcommand]);
+  // A deny rule that turns on a flag cannot be settled when the flag sits in a variable.
+  const hidden = invocation.args.some(arg => arg.dynamic);
+
+  // Options that make git run another program.
+  if (
+    hasOption(
+      parsed,
+      '--ext-diff',
+      '--textconv',
+      '-O',
+      '--open-files-in-pager',
+      '--unsafe-paths'
+    ) ||
+    hasOption(parsed, '--exec', '--upload-pack', '--receive-pack')
+  ) {
+    signal(judgement, 'risk.opaque_shell');
+  }
+  for (const target of gitWriteTargets(subcommand, parsed, context)) {
+    await judgeWriteTarget(target, scope);
+  }
+
+  switch (subcommand) {
+    case 'push':
+      await judgeGitPush(parsed, scope, gitDirectory);
+      break;
+    case 'reset':
+      if (hasAbbreviated(parsed, '--hard', '--h')) deny(judgement, 'deny.git_reset_hard');
+      else if (hidden) signal(judgement, 'risk.opaque_shell');
+      break;
+    case 'clean':
+      if (hidden) signal(judgement, 'risk.opaque_shell');
+      // `-e` takes a pattern, so `-en` and `-e -n` are an exclude, not a dry run.
+      if (hasOption(parsed, '-n') || hasAbbreviated(parsed, '--dry-run', '--d')) break;
+      // Untracked files cannot be brought back. The force flag is not required
+      // for the deny: `clean.requireForce=false` makes git run without it.
+      if (hasOption(parsed, '-f', '-d', '-x', '-X') || hasAbbreviated(parsed, '--force', '--f')) {
+        deny(judgement, 'deny.git_clean_force');
+      } else {
+        signal(judgement, 'risk.mutation_verb');
+      }
+      break;
+    default:
+      await judgeGitDiscard(subcommand, parsed, invocation.args, scope);
+      break;
+  }
+  return parsed;
 }
 
 /** Returns whether this git call is a known read-only one. */
 async function judgeGit(view: CommandView, scope: ShellScope): Promise<boolean> {
   const { context, judgement } = scope;
-  const git = parseGit(view.args);
-  if (git.configOverride) signal(judgement, 'risk.opaque_shell');
+  const line = parseGit(view.args);
+  if (line.configOverride || line.unknownGlobal) signal(judgement, 'risk.opaque_shell');
 
-  for (const directory of git.directories) {
+  // `git -C dir` runs there: the branch that matters is that checkout's.
+  let gitDirectory = scope.cwd;
+  for (const directory of line.directories) {
+    const where = directory.dynamic
+      ? undefined
+      : await locate(directory.text, gitDirectory, context);
+    if (where?.kind === 'resolved') gitDirectory = where.real;
+    else gitDirectory = undefined;
     if (directory.dynamic) {
       signal(judgement, 'risk.opaque_shell');
-      continue;
-    }
-    const where = await locate(directory.text, scope.cwd, context);
-    if (where.kind !== 'resolved' || !where.inside) {
+    } else if (where?.kind !== 'resolved' || !where.inside) {
       signal(judgement, 'risk.cwd_outside_root');
       judgement.unplaced = true;
     }
   }
 
-  const { options, positionals, values } = splitArgs(git.args, new Set(['--output']));
-  for (const output of values.get('--output') ?? []) await judgeWriteTarget(output, scope);
-  const runsProgram = options.some(option => GIT_EXEC_FLAGS.test(option.text));
-  if (runsProgram) signal(judgement, 'risk.opaque_shell');
-
-  // A deny rule that turns on a flag cannot be settled when the flag, or the
-  // subcommand itself, sits in a variable: `git reset "$MODE"`, `git $SUB --hard`.
-  const hidden = git.args.some(arg => arg.dynamic);
-  if (git.subcommand === undefined && view.args.some(arg => arg.dynamic)) {
+  // The subcommand itself sits in a variable: `git $SUB --hard`.
+  if (line.primary.subcommand === undefined && view.args.some(arg => arg.dynamic)) {
     signal(judgement, 'risk.opaque_shell');
   }
 
-  switch (git.subcommand) {
-    case 'push':
-      judgeGitPush(git.args, scope);
-      return false;
-    case 'reset':
-      if (hasLongAbbreviated(options, '--hard', '--ha')) deny(judgement, 'deny.git_reset_hard');
-      else if (hidden) signal(judgement, 'risk.opaque_shell');
-      return false;
-    case 'clean':
-      if (hidden) signal(judgement, 'risk.opaque_shell');
-      if (hasShort(options, 'n') || hasLongAbbreviated(options, '--dry-run', '--d')) return false;
-      // With -d, untracked directories go too. The force flag is not required
-      // here: `clean.requireForce=false` makes git run without it.
-      if (hasShort(options, 'd')) deny(judgement, 'deny.git_clean_force');
-      else signal(judgement, 'risk.mutation_verb');
-      return false;
-    case 'rebase':
-      signal(judgement, 'risk.mutation_verb', 'likely');
-      return false;
-    case 'branch':
-      if (hasShort(options, 'D') || (hasLong(options, '--delete') && hasLong(options, '--force'))) {
-        signal(judgement, 'risk.mutation_verb', 'likely');
-        return false;
-      }
-      break;
-    case 'tag':
-      if (hasShort(options, 'd') || hasLong(options, '--delete')) {
-        signal(judgement, 'risk.mutation_verb', 'likely');
-      }
-      return false;
-    default:
-      break;
+  for (const alternative of line.alternatives) {
+    await judgeGitSubcommand(alternative, scope, gitDirectory);
   }
+  const parsed = await judgeGitSubcommand(line.primary, scope, gitDirectory);
+  const { subcommand } = line.primary;
 
-  if (git.subcommand === undefined || !READ_ONLY_GIT.has(git.subcommand)) return false;
-  if (git.configOverride || runsProgram || values.has('--output')) return false;
-  if (git.subcommand === 'branch') {
-    return positionals.length === 0 && options.every(o => GIT_BRANCH_LIST_FLAGS.test(o.text));
+  if (parsed === undefined || subcommand === undefined || !READ_ONLY_GIT.has(subcommand)) {
+    return false;
   }
-  if (git.subcommand === 'remote') {
-    const [verb] = positionals;
+  if (line.configOverride || line.unknownGlobal || parsed.values.has('--output')) return false;
+  if (hasOption(parsed, '--ext-diff', '--textconv', '-O', '--open-files-in-pager')) return false;
+  if (subcommand === 'branch') {
+    const lists = [...parsed.flags].every(flag => GIT_BRANCH_LIST_FLAGS.test(flag));
+    return parsed.positionals.length === 0 && lists;
+  }
+  if (subcommand === 'remote') {
+    const [verb] = parsed.positionals;
     return verb === undefined || verb.text === 'show' || verb.text === 'get-url';
   }
   return true;
 }
+
+// --- removal ---------------------------------------------------------------
 
 function stripTrailingSlashes(text: string): string {
   const stripped = text.replace(/\/+$/, '');
@@ -675,32 +1107,25 @@ function stripTrailingSlashes(text: string): string {
 async function isRootLikeDirectory(text: string, scope: ShellScope): Promise<boolean> {
   const { context } = scope;
   const trimmed = stripTrailingSlashes(text);
-  if (trimmed === '.' || trimmed === '..') return true;
   const where = await locate(trimmed, scope.cwd, context);
-  if (where.kind !== 'resolved') return false;
+  // Where the shell stands is unknown (a `cd` into a variable): `.` and `..` may be the root.
+  if (where.kind !== 'resolved') return trimmed === '.' || trimmed === '..';
   // The root itself, the home directory, or anything that contains the root ("/" included).
-  return where.real === context.homeDir || isInside(where.real, context.repoRoot);
+  if (where.real === context.homeDir || isInside(where.real, context.repoRoot)) return true;
+  // The repository's git data: removing it takes history, stashes and settings with it.
+  return isInside(join(context.repoRoot, '.git'), where.real);
 }
 
 async function isRootLikeRemoval(target: ResolvedWord, scope: ShellScope): Promise<boolean> {
   if (target.dynamic) return false;
   if (!target.glob) return isRootLikeDirectory(target.text, scope);
   // A bare glob: nothing but wildcards, dots and bracket syntax in the last
-  // segment (`*`, `.*`, `.[!.]*`), so it names no particular file.
+  // segment (`*`, `.*`, `.[!.]*`), so it names no particular file. It empties
+  // the directory it is anchored in, which is judged like that directory.
   const lastSlash = target.text.lastIndexOf('/');
   const name = target.text.slice(lastSlash + 1);
   if (!/^[*?.[\]!^]+$/.test(name)) return false;
-  const directory = target.text.slice(0, lastSlash + 1);
-  return directory === '' || isRootLikeDirectory(directory, scope);
-}
-
-async function judgeRm(view: CommandView, scope: ShellScope): Promise<void> {
-  const { options, positionals } = splitArgs(view.args);
-  const recursive =
-    hasShort(options, 'r') ||
-    hasShort(options, 'R') ||
-    hasLongAbbreviated(options, '--recursive', '--r');
-  await judgeRemoval(positionals, recursive, scope);
+  return isRootLikeDirectory(target.text.slice(0, lastSlash + 1) || '.', scope);
 }
 
 /** Judges paths a command removes; `recursive` adds the never-acceptable directories. */
@@ -717,46 +1142,84 @@ async function judgeRemoval(
   }
 }
 
-/** `find <paths> ... -delete` removes everything under its start paths. */
-async function judgeFindDelete(view: CommandView, scope: ShellScope): Promise<void> {
-  if (!view.args.some(arg => arg.text === '-delete')) return;
-  const expression = view.args.findIndex(arg => /^(-|\(|!)/.test(arg.text) && !arg.dynamic);
-  const starts = view.args.slice(0, expression === -1 ? view.args.length : expression);
-  await judgeRemoval(starts.length > 0 ? starts : [plainPath('.')], true, scope);
+async function judgeRm(view: CommandView, scope: ShellScope): Promise<void> {
+  const parsed = parseOptions(view.args);
+  // rimraf is `rm -rf` whatever its flags say.
+  const recursive =
+    view.command.head === 'rimraf' ||
+    hasOption(parsed, '-r', '-R') ||
+    hasAbbreviated(parsed, '--recursive', '--r');
+  await judgeRemoval(parsed.positionals, recursive, scope);
 }
 
-type TargetChoice = 'all' | 'last' | 'after_first' | 'none';
+/** find: the files its actions write, and what `-delete` removes. */
+async function judgeFind(view: CommandView, scope: ShellScope): Promise<void> {
+  const { args } = view;
+  for (const [index, arg] of args.entries()) {
+    const file = args[index + 1];
+    if (!arg.dynamic && FIND_FILE_ACTIONS.has(arg.text) && file !== undefined) {
+      await judgeWriteTarget(file, scope);
+    }
+  }
+  if (!args.some(arg => arg.text === '-delete')) return;
+  const expression = args.findIndex(arg => !arg.dynamic && /^(-|\(|!)/.test(arg.text));
+  const starts = args.slice(0, expression === -1 ? args.length : expression);
+  // `find . -delete` empties the tree. A test before it (`-name '*.pyc'`)
+  // narrows what goes to something this gate cannot enumerate: that escalates.
+  const filtered = args
+    .slice(expression === -1 ? args.length : expression)
+    .some(arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text)));
+  await judgeRemoval(starts.length > 0 ? starts : [plainPath('.')], !filtered, scope);
+  signal(scope.judgement, 'risk.mutation_verb');
+}
+
+// --- write targets ---------------------------------------------------------
+
+type TargetChoice = 'all' | 'first' | 'last' | 'after_first' | 'none';
 
 interface Writer {
+  /** Which operands the command writes, moves or removes. */
   targets: TargetChoice;
-  valueFlags?: readonly string[];
-  /** Flags whose value is a directory written into. */
-  directoryFlags?: readonly string[];
+  /** Options whose value is a file or directory written. */
+  writes?: readonly string[];
+  /** Options naming the directory operands go into; with one given, `last` no longer applies. */
+  into?: readonly string[];
 }
 
-const TARGET_DIRECTORY_FLAGS = ['-t', '--target-directory'] as const;
+const TARGET_DIRECTORY: readonly string[] = ['-t', '--target-directory'];
+const COMPILER: Writer = { targets: 'none', writes: ['-o', '--out-dir'] };
 
 /** Commands that write, move or remove the files they are given, and which operands those are. */
 const WRITERS: Readonly<Record<string, Writer>> = {
   tee: { targets: 'all' },
-  touch: { targets: 'all', valueFlags: ['-d', '-r', '-t', '--date', '--reference'] },
-  mkdir: { targets: 'all', valueFlags: ['-m', '--mode'] },
+  touch: { targets: 'all' },
+  mkdir: { targets: 'all' },
   rmdir: { targets: 'all' },
-  truncate: { targets: 'all', valueFlags: ['-s', '--size', '-r', '--reference'] },
-  shred: { targets: 'all', valueFlags: ['-n', '--iterations', '-s', '--size'] },
-  mv: { targets: 'all', valueFlags: ['-S', '--suffix'], directoryFlags: TARGET_DIRECTORY_FLAGS },
-  cp: { targets: 'last', valueFlags: ['-S', '--suffix'], directoryFlags: TARGET_DIRECTORY_FLAGS },
-  install: {
-    targets: 'last',
-    valueFlags: ['-m', '--mode', '-o', '--owner', '-g', '--group', '-S', '--suffix'],
-    directoryFlags: TARGET_DIRECTORY_FLAGS,
+  truncate: { targets: 'all' },
+  shred: { targets: 'all' },
+  unlink: { targets: 'all' },
+  script: { targets: 'all' },
+  mv: { targets: 'all', into: TARGET_DIRECTORY },
+  cp: { targets: 'last', into: TARGET_DIRECTORY },
+  install: { targets: 'last', into: TARGET_DIRECTORY },
+  ln: { targets: 'last', into: TARGET_DIRECTORY },
+  rsync: { targets: 'last' },
+  zip: { targets: 'first' },
+  patch: {
+    targets: 'first',
+    writes: ['-d', '--directory', '-o', '--output', '-r', '--reject-file'],
   },
-  ln: { targets: 'last', valueFlags: ['-S', '--suffix'], directoryFlags: TARGET_DIRECTORY_FLAGS },
-  rsync: {
-    targets: 'last',
-    valueFlags: ['-e', '--rsh', '--exclude', '--include', '--filter', '-f', '--files-from'],
-  },
-  unzip: { targets: 'none', directoryFlags: ['-d'] },
+  unzip: { targets: 'none', writes: ['-d'] },
+  sort: { targets: 'none', writes: ['-o', '--output'] },
+  gpg: { targets: 'none', writes: ['-o', '--output'] },
+  openssl: { targets: 'none', writes: ['-out', '-keyout'] },
+  gcc: COMPILER,
+  'g++': COMPILER,
+  cc: COMPILER,
+  clang: COMPILER,
+  'clang++': COMPILER,
+  rustc: COMPILER,
+  ld: COMPILER,
   chmod: { targets: 'after_first' },
   chown: { targets: 'after_first' },
   chgrp: { targets: 'after_first' },
@@ -765,121 +1228,174 @@ const WRITERS: Readonly<Record<string, Writer>> = {
 /** `host:path` and `user@host:path`: the far end of an rsync or scp, not a local file. */
 const REMOTE_PATH = /^[^/]+:/;
 
-function chooseTargets(positionals: ResolvedWord[], choice: TargetChoice): ResolvedWord[] {
+function chooseTargets(positionals: Arg[], choice: TargetChoice): Arg[] {
   if (choice === 'none') return [];
   if (choice === 'all') return positionals;
+  if (choice === 'first') return positionals.slice(0, 1);
   if (choice === 'after_first') return positionals.slice(1);
   const last = positionals.length >= 2 ? positionals.slice(-1) : [];
   return last.filter(target => !REMOTE_PATH.test(target.text));
 }
 
+const HERE: Arg = plainPath('.');
+
+/** tar: where it writes depends on whether it creates an archive or extracts one. */
+function tarTargets(args: readonly Arg[], judgement: Judgement): Arg[] {
+  const spec: OptionSpec = {
+    valueShort: 'fCbTXKNVgIH',
+    valueLong: [
+      ...['--file', '--directory', '--exclude', '--files-from', '--exclude-from', '--transform'],
+      ...['--strip-components', '--to-command', '--use-compress-program', '--checkpoint-action'],
+    ],
+  };
+  // Old style: the first word is a bundle of letters with no dash, and each
+  // letter that takes a value takes the next unused word (`tar xfC a.tar dir`).
+  const [bundle, ...rest] = args;
+  const oldStyle = bundle !== undefined && !bundle.dynamic && /^[A-Za-z]+$/.test(bundle.text);
+  const parsed = parseOptions(oldStyle ? [{ ...bundle, text: `-${bundle.text}` }] : [], spec);
+  let operands = oldStyle ? rest : [...args];
+  if (oldStyle) {
+    for (const letter of bundle.text) {
+      if (!(spec.valueShort ?? '').includes(letter)) continue;
+      const value = operands[0];
+      if (value !== undefined) parsed.values.set(`-${letter}`, [value]);
+      operands = operands.slice(1);
+    }
+  }
+  const later = parseOptions(operands, spec);
+  for (const flag of later.flags) parsed.flags.add(flag);
+  for (const [name, values] of later.values) {
+    parsed.values.set(name, [...(parsed.values.get(name) ?? []), ...values]);
+  }
+  if (hasOption(parsed, '--to-command', '--use-compress-program', '-I', '--checkpoint-action')) {
+    signal(judgement, 'risk.opaque_shell');
+  }
+  if (hasOption(parsed, '-x', '--extract', '--get')) {
+    const into = valuesOf(parsed, '-C', '--directory');
+    return into.length > 0 ? into : [HERE];
+  }
+  if (hasOption(parsed, '-c', '--create', '-r', '--append', '-u', '--update', '-A')) {
+    return valuesOf(parsed, '-f', '--file');
+  }
+  return [];
+}
+
+/** Output options spelled with one dash, as Go-style tools take them: `-output file`, `-out=file`. */
+const SINGLE_DASH_OUTPUT = /^-(out|output|outfile|output-file|out-dir|outdir|log-file)(?:=(.*))?$/;
+
+function singleDashOutputs(args: readonly Arg[]): Arg[] {
+  return args.flatMap((arg, index) => {
+    const match = arg.dynamic ? null : SINGLE_DASH_OUTPUT.exec(arg.text);
+    if (match === null) return [];
+    if (match[2] !== undefined) return [{ ...arg, text: match[2] }];
+    const next = args[index + 1];
+    return next === undefined ? [] : [next];
+  });
+}
+
 /** Collects the files a command writes through its own arguments. */
-function writeTargets(view: CommandView): ResolvedWord[] {
+function writeTargets(view: CommandView, judgement: Judgement): Arg[] {
   const { command, args } = view;
-  const writer = WRITERS[command.head];
+  const { head } = command;
+  const parsed = parseOptions(args, specFor(head));
+  const writer = WRITERS[head];
   if (writer !== undefined) {
-    const directoryFlags = writer.directoryFlags ?? [];
-    const split = splitArgs(args, new Set([...(writer.valueFlags ?? []), ...directoryFlags]));
-    const directories = directoryFlags.flatMap(flag => split.values.get(flag) ?? []);
+    const written = valuesOf(parsed, ...(writer.writes ?? []));
+    const into = valuesOf(parsed, ...(writer.into ?? []));
     // With a target directory given, every operand is a source except for mv, which removes them.
-    if (directories.length > 0 && writer.targets === 'last') return directories;
-    return [...directories, ...chooseTargets(split.positionals, writer.targets)];
+    if (into.length > 0 && writer.targets === 'last') return [...written, ...into];
+    return [...written, ...into, ...chooseTargets(parsed.positionals, writer.targets)];
   }
 
-  switch (command.head) {
+  switch (head) {
+    case 'tar':
+      return tarTargets(args, judgement);
     case 'dd':
       return args
         .filter(arg => arg.text.startsWith('of='))
         .map(arg => ({ ...arg, text: arg.text.slice('of='.length) }));
     case 'sed': {
-      const split = splitArgs(args, SCRIPT_FLAGS);
-      const inPlace = split.options.some(o => /^-[A-Za-z]*i|^--in-place/.test(o.text));
-      if (!inPlace) return [];
-      const scripted = split.options.some(option => SCRIPT_FLAGS.has(option.text));
-      return scripted ? split.positionals : split.positionals.slice(1);
+      if (!hasOption(parsed, '-i') && !hasAbbreviated(parsed, '--in-place', '--in-')) return [];
+      const scripted = valuesOf(parsed, ...PATTERN_FLAGS).length > 0;
+      return scripted ? parsed.positionals : parsed.positionals.slice(1);
     }
-    case 'perl': {
-      // `-pi -e 's/a/b/' file`: a cluster ending in e takes the program as its value.
-      const programFlags = args.filter(a => /^-[A-Za-z0-9.]*[eE]$/.test(a.text)).map(a => a.text);
-      const split = splitArgs(args, new Set(programFlags));
-      const inPlace = split.options.some(o => /^-[A-Za-z0-9]*i/.test(o.text));
-      return inPlace ? split.positionals : [];
-    }
+    case 'perl':
+      return hasOption(parsed, '-i') ? parsed.positionals : [];
+    case 'xxd':
+      return hasOption(parsed, '-r') ? parsed.positionals.slice(1, 2) : [];
+    case 'gzip':
+    case 'gunzip':
+    case 'bzip2':
+    case 'xz':
+    case 'zstd':
+      // Compressors replace the file in place unless told to write to stdout.
+      return hasOption(parsed, '-c', '--stdout', '-t', '--test', '-l', '--list')
+        ? []
+        : parsed.positionals;
     case 'curl': {
-      const split = splitArgs(args, new Set(['-o', '--output']));
-      const named = [...(split.values.get('-o') ?? []), ...(split.values.get('--output') ?? [])];
-      const remoteName = hasShort(split.options, 'O') || hasLong(split.options, '--remote-name');
-      return remoteName ? [...named, { text: '.', dynamic: false, glob: false }] : named;
+      const directory = valuesOf(parsed, '--output-dir');
+      const named = valuesOf(
+        parsed,
+        ...['-o', '--output', '-D', '--dump-header', '-c', '--cookie-jar', '--trace'],
+        ...['--trace-ascii', '--stderr', '--etag-save', '--hsts', '--alt-svc']
+      );
+      const remoteName = hasOption(parsed, '-O', '--remote-name', '--remote-name-all');
+      return [...named, ...directory, ...(remoteName && directory.length === 0 ? [HERE] : [])];
     }
     case 'wget': {
-      const split = splitArgs(
-        args,
-        new Set(['-O', '--output-document', '-P', '--directory-prefix'])
+      const logs = valuesOf(
+        parsed,
+        ...['-o', '--output-file', '-a', '--append-output', '--save-cookies', '--warc-file']
       );
-      const attached = split.options.flatMap(option => {
-        const match = /^-[A-Za-z]*O(.+)$/.exec(option.text);
-        return match?.[1] === undefined ? [] : [{ ...option, text: match[1] }];
-      });
-      const documents = [
-        ...(split.values.get('-O') ?? []),
-        ...(split.values.get('--output-document') ?? []),
-        ...attached,
-      ];
-      if (documents.length > 0) return documents;
-      const prefixes = [
-        ...(split.values.get('-P') ?? []),
-        ...(split.values.get('--directory-prefix') ?? []),
-      ];
-      return prefixes.length > 0 ? prefixes : [{ text: '.', dynamic: false, glob: false }];
+      const documents = valuesOf(parsed, '-O', '--output-document');
+      if (documents.length > 0) return [...logs, ...documents];
+      const prefixes = valuesOf(parsed, '-P', '--directory-prefix');
+      return [...logs, ...(prefixes.length > 0 ? prefixes : [HERE])];
     }
     default:
-      return [];
+      // A tool with no entry: the output options most tools share.
+      if (hasSpec(head) || isKnownHead(head)) return [];
+      return [...valuesOf(parsed, ...COMMON_OUTPUT_FLAGS), ...singleDashOutputs(args)];
   }
+}
+
+// --- signals ---------------------------------------------------------------
+
+function isNetworkClient(head: string): boolean {
+  return HTTP_CLIENTS.has(head) || REMOTE_CLIENTS.has(head);
+}
+
+/** Whether a command can carry what it is given off this machine. */
+function sendsOut(view: CommandView): boolean {
+  const { head } = view.command;
+  if (isNetworkClient(head) || SENDERS.has(head) || FETCHERS.has(head)) return true;
+  return head === 'rsync' && view.args.some(arg => REMOTE_PATH.test(arg.text));
 }
 
 /** Raises the signal for a call that reaches out over the network with a method or a body. */
 function judgeNetworkClient(view: CommandView, judgement: Judgement): void {
   const { command, args } = view;
-  const remoteRsync = command.head === 'rsync' && args.some(arg => REMOTE_PATH.test(arg.text));
-  if (REMOTE_CLIENTS.has(command.head) || remoteRsync) {
+  const { head } = command;
+  const remoteRsync = head === 'rsync' && args.some(arg => REMOTE_PATH.test(arg.text));
+  if (REMOTE_CLIENTS.has(head) || remoteRsync) {
     signal(judgement, 'risk.network_request', 'unlikely');
     return;
   }
-  if (command.head === 'gh') {
-    const split = splitArgs(args, new Set(['-X', '--method']));
-    if (split.positionals[0]?.text !== 'api') return;
-    const methods = [...(split.values.get('-X') ?? []), ...(split.values.get('--method') ?? [])];
-    const unsafeMethod = methods.some(m => !SAFE_HTTP_METHODS.has(m.text.toUpperCase()));
-    const body = split.options.some(o => GH_API_BODY_FLAGS.has(o.text.split('=')[0] ?? ''));
-    if (unsafeMethod || body) signal(judgement, 'risk.network_request', 'unlikely');
-    return;
-  }
-  if (!HTTP_CLIENTS.has(command.head)) return;
+  const parsed = parseOptions(args, specFor(head));
+  const unsafeMethod = (...flags: string[]): boolean =>
+    valuesOf(parsed, ...flags).some(method => !SAFE_HTTP_METHODS.has(method.text.toUpperCase()));
 
   let risky = false;
-  if (command.head === 'curl') {
-    args.forEach((arg, index) => {
-      if (arg.dynamic || !arg.text.startsWith('-')) return;
-      const name = arg.text.split('=')[0] ?? '';
-      if (CURL_BODY_FLAGS.has(name)) risky = true;
-      let method: string | undefined;
-      if (name === '--request') {
-        method = arg.text.includes('=') ? arg.text.slice(name.length + 1) : args[index + 1]?.text;
-      } else if (!arg.text.startsWith('--')) {
-        // `-sXDELETE`: what follows X is the method, not more flags.
-        const cluster = arg.text.slice(1);
-        const at = cluster.indexOf('X');
-        if (/[dFT]/.test(at === -1 ? cluster : cluster.slice(0, at))) risky = true;
-        if (at !== -1) method = cluster.slice(at + 1) || args[index + 1]?.text;
-      }
-      if (method !== undefined && !SAFE_HTTP_METHODS.has(method.toUpperCase())) risky = true;
-    });
-  } else if (command.head === 'wget') {
-    risky = args.some(arg => WGET_BODY_FLAGS.has(arg.text.split('=')[0] ?? ''));
-  } else {
+  if (head === 'gh') {
+    if (parsed.positionals[0]?.text !== 'api') return;
+    risky = unsafeMethod('-X', '--method') || hasOption(parsed, ...GH_API_BODY_FLAGS);
+  } else if (head === 'curl') {
+    risky = unsafeMethod('-X', '--request') || hasOption(parsed, ...CURL_BODY_FLAGS);
+  } else if (head === 'wget') {
+    risky = hasOption(parsed, ...WGET_BODY_FLAGS);
+  } else if (HTTP_CLIENTS.has(head)) {
     // httpie-style: an explicit method, or request items after the URL.
-    const { positionals } = splitArgs(args);
-    risky = positionals.some(
+    risky = parsed.positionals.some(
       (arg, index) =>
         (index === 0 && /^(POST|PUT|PATCH|DELETE)$/i.test(arg.text)) ||
         (!arg.text.includes('://') && /[=@]/.test(arg.text))
@@ -891,78 +1407,272 @@ function judgeNetworkClient(view: CommandView, judgement: Judgement): void {
 /** Raises the mutation signal for the verbs that change state outside what git can undo. */
 function judgeMutation(view: CommandView, judgement: Judgement): void {
   const { command, args } = view;
-  const { options, positionals } = splitArgs(args);
-  if (command.wrappers.some(wrapper => PRIVILEGE_WRAPPERS.has(wrapper))) {
+  const { head } = command;
+  const parsed = parseOptions(args, specFor(head));
+  const { positionals } = parsed;
+  const privileged = (name: string): boolean => WRAPPERS[name]?.kind === 'privileged';
+  if (command.wrappers.some(privileged) || privileged(head)) {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
-  const hint = MUTATION_HEADS[command.head];
+  const hint = MUTATION_HEADS[head];
   if (hint !== undefined) signal(judgement, 'risk.mutation_verb', hint);
-  if (command.head.startsWith('mkfs')) signal(judgement, 'risk.mutation_verb', 'unlikely');
-  if (PRIVILEGE_WRAPPERS.has(command.head)) signal(judgement, 'risk.mutation_verb', 'unlikely');
+  if (head.startsWith('mkfs')) signal(judgement, 'risk.mutation_verb', 'unlikely');
 
-  const recursive = hasShort(options, 'R') || hasLong(options, '--recursive');
-  if (['chmod', 'chown', 'chgrp'].includes(command.head) && recursive) {
+  const recursive = hasOption(parsed, '-R') || hasAbbreviated(parsed, '--recursive', '--rec');
+  if (['chmod', 'chown', 'chgrp'].includes(head) && recursive) {
     signal(judgement, 'risk.mutation_verb');
   }
-  if (PUBLISHERS.has(command.head) && positionals[0]?.text === 'publish') {
+  if (PUBLISHERS.has(head) && positionals[0]?.text === 'publish') {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
-  // `gh <noun> <verb>`; a global flag's value can push the verb one place right.
-  const ghVerbs = positionals.slice(1, 3);
-  if (command.head === 'gh' && positionals[0]?.text !== 'api') {
-    if (ghVerbs.some(arg => GH_MUTATION_VERBS.has(arg.text))) {
-      signal(judgement, 'risk.mutation_verb', 'unlikely');
-    }
-  }
-  if (command.head === 'find' && args.some(arg => arg.text === '-delete')) {
+  if (head === 'rsync' && [...parsed.flags].some(flag => /^--(delete|remove-source)/.test(flag))) {
     signal(judgement, 'risk.mutation_verb');
+  }
+  if (head === 'gh') {
+    const [group, verb] = positionals.map(arg => arg.text);
+    if (group !== undefined && GH_GROUPS.has(group) && verb !== undefined) {
+      if (!GH_READ_VERBS.has(verb)) signal(judgement, 'risk.mutation_verb', 'unlikely');
+    }
   }
 }
 
-/** Judges the paths a command reads: secrets it would print, and files it cannot be seen to name. */
-async function judgeReads(view: CommandView, scope: ShellScope): Promise<void> {
+/** Whether a command prints a live credential by itself (`gh auth token`). */
+function printsToken(view: CommandView): boolean {
+  const parsed = parseOptions(view.args, specFor(view.command.head));
+  const words = parsed.positionals.map(arg => arg.text);
+  return TOKEN_PRINTERS.some(
+    printer =>
+      printer.head === view.command.head &&
+      printer.words.every((word, index) => words[index] === word) &&
+      (printer.flag === undefined || hasOption(parsed, ...printer.flag))
+  );
+}
+
+/** Whether a command prints the whole environment, where credentials live. */
+function dumpsEnvironment(view: CommandView): boolean {
+  const { command, args } = view;
+  const parsed = parseOptions(args);
+  const bare = parsed.positionals.length === 0;
+  switch (command.head) {
+    case 'printenv':
+    case 'env':
+      return bare;
+    case 'set':
+      return args.length === 0;
+    case 'export':
+    case 'declare':
+    case 'typeset':
+      return bare && (args.length === 0 || hasOption(parsed, '-p', '-x'));
+    case 'compgen':
+      return hasOption(parsed, '-e', '-v');
+    default:
+      return false;
+  }
+}
+
+// --- reads -----------------------------------------------------------------
+
+/** Quoted strings inside program text: `'...'` and `"..."`. */
+const CODE_STRING = /'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g;
+/** A list of quoted strings, as an argv: `["git", "reset", "--hard"]`. */
+const CODE_STRING_LIST = /\[\s*(?:(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*,?\s*){2,}\]/g;
+
+function codeStrings(code: string): string[] {
+  return [...code.matchAll(CODE_STRING)].map(match => match[1] ?? match[2] ?? '');
+}
+
+/**
+ * Looks inside interpreter code for what the gate can recognise there: a
+ * quoted shell command (`os.system('rm -rf /')`), an argv list
+ * (`subprocess.run(["git", "reset", "--hard"])`) and a quoted secret path
+ * (`open('.env')`). Everything else in the program is invisible.
+ */
+async function judgeCode(code: string, scope: ShellScope, mode: Mode): Promise<void> {
+  if (mode.nesting >= MAX_SCRIPT_NESTING) return;
+  const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
+  const scripts = [
+    ...codeStrings(code).filter(text => /\s/.test(text)),
+    ...[...code.matchAll(CODE_STRING_LIST)].map(match => codeStrings(match[0]).join(' ')),
+  ];
+  for (const script of scripts) {
+    await judgeScript(parseShell(script), scope.cwd, scope.context, scope.judgement, inner);
+  }
+  for (const text of codeStrings(code)) {
+    if (/\s/.test(text)) continue;
+    if (await isSecretText(text, true, scope)) deny(scope.judgement, 'deny.secret_read');
+  }
+}
+
+/** The program an interpreter was handed on its command line or stdin. */
+function interpreterCode(view: CommandView): string[] {
+  const { command, args } = view;
+  if (!INTERPRETERS.has(command.head)) return [];
+  const parsed = parseOptions(args, specFor(command.head));
+  const flagged = valuesOf(parsed, ...CODE_FLAGS).map(value => value.text);
+  // `deno eval '<code>'`, `bun -e` aside: the subcommand form.
+  const [verb, code] = parsed.positionals;
+  const evaluated = verb?.text === 'eval' && code !== undefined ? [code.text] : [];
+  return [...flagged, ...evaluated, ...command.stdin];
+}
+
+/** curl: the files a request body names with `@path`, alone or inside `name=@path`. */
+function curlUploads(parsed: Options): Arg[] {
+  const always = valuesOf(parsed, '-T', '--upload-file');
+  const marked = valuesOf(parsed, ...CURL_BODY_FLAGS)
+    .filter(value => !always.includes(value))
+    .flatMap(value => {
+      const at = /(?:^|=|;)[@<]([^;,]+)/.exec(value.text)?.[1];
+      return at === undefined ? [] : [{ ...value, text: at }];
+    });
+  return [...always, ...marked];
+}
+
+/** The arguments of a git command that name files, as opposed to revisions and patterns. */
+async function gitFileArguments(git: GitCommandLine, scope: ShellScope): Promise<Arg[]> {
+  const { subcommand, args } = git.primary;
+  if (subcommand === undefined) return [];
+  // Everything after `--` is a path, for every subcommand.
+  const dashDash = args.findIndex(arg => !arg.dynamic && arg.text === '--');
+  const after = dashDash === -1 ? [] : args.slice(dashDash + 1);
+  const parsed = parseOptions(
+    dashDash === -1 ? args : args.slice(0, dashDash),
+    GIT_OPTION_SPECS[subcommand]
+  );
+  if (GIT_PATH_SUBCOMMANDS.has(subcommand)) {
+    // `git grep <pattern> [paths]`: the pattern is not a path unless -e or -f gave it.
+    const patterned = subcommand === 'grep' && valuesOf(parsed, '-e', '-f').length === 0;
+    return [...(patterned ? parsed.positionals.slice(1) : parsed.positionals), ...after];
+  }
+  if (!GIT_REVISION_SUBCOMMANDS.has(subcommand)) return after;
+  const named: Arg[] = [];
+  for (const arg of parsed.positionals) {
+    const colon = arg.text.lastIndexOf(':');
+    if (colon !== -1) {
+      named.push({ ...arg, text: arg.text.slice(colon + 1) });
+    } else if (!arg.dynamic) {
+      const where = await locate(arg.text, scope.cwd, scope.context);
+      if (where.kind === 'resolved' && where.exists) named.push(arg);
+    }
+  }
+  return [...named, ...after];
+}
+
+/** The arguments of a command that name files it opens. */
+function fileArguments(view: CommandView): Arg[] {
+  const { command, args } = view;
+  const { head } = command;
+  const spec = specFor(head);
+  const parsed = parseOptions(args, spec);
+  if (head === 'curl') return curlUploads(parsed);
+
+  const patterned =
+    PATTERN_FIRST.has(head) && valuesOf(parsed, '-e', '--regexp', '--expression').length === 0;
+  const scriptFile = PATTERN_FIRST.has(head) && valuesOf(parsed, '-f', '--file').length > 0;
+  const operands = patterned && !scriptFile ? parsed.positionals.slice(1) : parsed.positionals;
+
+  // Option values: for a command with a table entry only those known to be
+  // files it reads; for any other, every value that is not text or a credential in use.
+  const values = [...parsed.values.entries()].flatMap(([name, list]) => {
+    if (TEXT_VALUE_FLAGS.has(name) || CREDENTIAL_USE_FLAGS.has(name)) return [];
+    if (hasSpec(head))
+      return (FILE_VALUE_FLAGS[SPEC_ALIASES[head] ?? head] ?? []).includes(name) ? list : [];
+    return COMMON_OUTPUT_FLAGS.includes(name) ? [] : list;
+  });
+  return [...operands, ...values];
+}
+
+/** For commands with an option table: the options whose value is a file the command reads. */
+const FILE_VALUE_FLAGS: Readonly<Record<string, readonly string[]>> = {
+  grep: ['-f', '--file', '--exclude-from'],
+  rg: ['-f', '--file', '--ignore-file'],
+  sed: ['-f', '--file'],
+  awk: ['-f', '--file'],
+  jq: ['-f', '--from-file'],
+  wget: ['--post-file', '--body-file', '-i', '--input-file', '--load-cookies'],
+  patch: ['-i', '--input'],
+  node: ['--env-file', '-r', '--require', '--import'],
+  docker: ['--env-file'],
+  openssl: ['-in', '-inkey', '-key', '-kfile', '-passin'],
+  gpg: ['--passphrase-file'],
+  rsync: ['--files-from', '--password-file'],
+  touch: ['-r', '--reference'],
+  truncate: ['-r', '--reference'],
+};
+
+type ReadKind = 'metadata' | 'sends' | 'reads';
+
+/** What a command does with a file it is given, as far as secrets are concerned. */
+function readKind(view: CommandView, git: GitCommandLine | undefined): ReadKind {
+  const { head } = view.command;
+  if (git !== undefined) {
+    // Only the subcommands that take files can read one; `gitFileArguments` picks the files.
+    const { subcommand } = git.primary;
+    const parsed = parseOptions(git.primary.args, GIT_OPTION_SPECS[subcommand ?? '']);
+    const untracks = subcommand === 'rm' && hasOption(parsed, '--cached');
+    return untracks ? 'metadata' : 'reads';
+  }
+  if (METADATA_ONLY.has(head) || NAME_BUILTINS.has(head)) return 'metadata';
+  return sendsOut(view) ? 'sends' : 'reads';
+}
+
+/**
+ * Judges the paths a command reads. A secret path given to any command is
+ * denied unless the command only looks at metadata: a command this table does
+ * not know may print, copy or load the file as easily as `cat` would.
+ */
+async function judgeReads(view: CommandView, scope: ShellScope, mode: Mode): Promise<void> {
   const { command } = view;
-  const { judgement } = scope;
-  if (TEXT_ONLY.has(command.head)) return;
+  const { head } = command;
+  const { judgement, context } = scope;
 
-  // For git the operands follow the subcommand, and only some subcommands print files.
-  const git = command.head === 'git' ? parseGit(view.args) : undefined;
-  const args = git?.args ?? view.args;
-  const printsFiles =
-    git === undefined
-      ? CONTENT_READERS.has(command.head)
-      : GIT_CONTENT_SUBCOMMANDS.has(git.subcommand ?? '');
-  const sendsFiles = isNetworkClient(command.head) || command.head === 'rsync';
-  const split = splitArgs(args);
-  const scripted = split.options.some(option => SCRIPT_FLAGS.has(option.text));
-  const operands =
-    SCRIPT_FIRST.has(command.head) && !scripted ? split.positionals.slice(1) : split.positionals;
-  const optionValues = [...split.values.values()].flat();
-  // `done < file` and `< file` alone: whatever reads stdin there prints it.
-  const sources = command.redirections
-    .filter(redirection => redirection.operator === '<')
-    .map(redirection => ({
-      arg: resolveWord(redirection.target, scope.context.homeDir),
-      isReader: printsFiles || command.head === '',
-    }));
-  const named = [...operands, ...optionValues].map(arg => ({ arg, isReader: printsFiles }));
+  if (printsToken(view)) deny(judgement, 'deny.secret_read');
+  if (dumpsEnvironment(view)) signal(judgement, 'risk.environment_dump');
+  for (const code of interpreterCode(view)) await judgeCode(code, scope, mode);
 
-  for (const { arg, isReader } of [...named, ...sources]) {
-    // Prose passed to an unknown command is not a path: skip it unless a reader would open it.
+  const git = head === 'git' ? parseGit(view.args) : undefined;
+  const kind = readKind(view, git);
+  const refuse = (): void => {
+    if (kind === 'sends') deny(judgement, 'deny.secret_exfiltration');
+    else if (mode.speculative && !isKnownHead(head)) signal(judgement, 'risk.secret_path_argument');
+    else deny(judgement, 'deny.secret_read');
+  };
+
+  // Whatever reads stdin reads the redirected file, unless the command ignores stdin.
+  if (!TEXT_ONLY.has(head) && !(METADATA_ONLY.has(head) || NAME_BUILTINS.has(head))) {
+    for (const redirection of command.redirections) {
+      if (redirection.operator !== '<') continue;
+      const source = toArg(redirection.target, context);
+      if (await isSecretArgument(source, scope)) refuse();
+      else if (source.dynamic) signal(judgement, 'risk.opaque_shell');
+    }
+  }
+  // Files the wrappers were handed are read by the wrapper, whatever it runs: `xargs -a <file>`.
+  for (const word of command.wrapperWords) {
+    const arg = toArg(word, context);
+    if (!arg.text.startsWith('-') && (await isSecretArgument(arg, scope))) {
+      deny(judgement, 'deny.secret_read');
+    }
+  }
+  if (TEXT_ONLY.has(head) || kind === 'metadata') return;
+
+  const isReader = CONTENT_READERS.has(head);
+  const named = git === undefined ? fileArguments(view) : await gitFileArguments(git, scope);
+  for (const arg of named) {
+    // Prose is not a path: skip it unless a reader would try to open it.
     if (!isReader && /\s/.test(arg.text)) continue;
     if (await isSecretArgument(arg, scope)) {
-      if (sendsFiles) deny(judgement, 'deny.secret_exfiltration');
-      else if (isReader) deny(judgement, 'deny.secret_read');
-      else if (!METADATA_ONLY.has(command.head)) signal(judgement, 'risk.secret_path_argument');
+      refuse();
       continue;
     }
     // A reader whose file is a variable, or a glob over hidden files, may be opening a
     // secret. Git is left out: its variable arguments are refs far more often than files.
-    if (!isReader || git !== undefined) continue;
+    if (!isReader) continue;
     const name = arg.text.slice(arg.text.lastIndexOf('/') + 1);
     if (arg.dynamic || (arg.glob && name.startsWith('.'))) signal(judgement, 'risk.opaque_shell');
   }
 }
+
+// --- allow rule ------------------------------------------------------------
 
 function isVerificationCommand(view: CommandView, context: RuleContext): boolean {
   if (view.args.some(arg => arg.dynamic)) return false;
@@ -979,21 +1689,80 @@ function isReadOnly(view: CommandView, scope: ShellScope, gitReadOnly: boolean):
   if (command.head === '' || command.opaque.length > 0 || command.assignments.length > 0) {
     return false;
   }
-  if (command.wrappers.some(wrapper => !BENIGN_WRAPPERS.has(wrapper))) return false;
+  if (command.wrappers.some(wrapper => WRAPPERS[wrapper]?.kind !== 'benign')) return false;
+  if (command.wrapperTargets.length > 0 || command.chdir !== undefined) return false;
   const writesFile = command.redirections.some(
-    redirection =>
-      redirection.write && !isDeviceSink(resolveWord(redirection.target, scope.context.homeDir))
+    redirection => redirection.write && !isDeviceSink(toArg(redirection.target, scope.context))
   );
   if (writesFile) return false;
   if (isVerificationCommand(view, scope.context)) return true;
   if (command.head === 'git') return gitReadOnly;
-  if (command.head === 'find' && args.some(arg => FIND_WRITE_FLAGS.test(arg.text))) return false;
+  if (command.head === 'find') {
+    return !args.some(arg => arg.text === '-delete' || FIND_FILE_ACTIONS.has(arg.text));
+  }
   return READ_ONLY_HEADS.has(command.head);
 }
 
+// --- commands inside arguments ---------------------------------------------
+
+const KNOWN_HEADS: ReadonlySet<string> = new Set([
+  ...READ_ONLY_HEADS,
+  ...CONTENT_READERS,
+  ...METADATA_ONLY,
+  ...TEXT_ONLY,
+  ...NAME_BUILTINS,
+  ...INTERPRETERS,
+  ...SHELL_INTERPRETERS,
+  ...FETCHERS,
+  ...SENDERS,
+  ...PUBLISHERS,
+  ...COMMON_TOOLS,
+  ...Object.keys(WRITERS),
+  ...Object.keys(MUTATION_HEADS),
+  ...Object.keys(OPTION_SPECS),
+  ...Object.keys(SPEC_ALIASES),
+  ...['rsync', 'tar', 'dd', 'sed', 'perl', 'xxd'],
+]);
+
+function isKnownHead(head: string): boolean {
+  return KNOWN_HEADS.has(head) || head.startsWith('mkfs');
+}
+
+/**
+ * Whether a command's arguments may themselves be a command: a tool this table
+ * does not know, or one known to run what it is given.
+ */
+function runsItsArguments(view: CommandView): boolean {
+  const { head } = view.command;
+  if (head === '') return false;
+  if (ARGUMENT_RUNNERS.has(head) || !isKnownHead(head)) return true;
+  return PUBLISHERS.has(head) && view.args.some(arg => PACKAGE_EXEC.has(arg.text));
+}
+
+/**
+ * Reads the arguments of a wrapper nobody listed as the commands they may be:
+ * every suffix that starts at a command with rules of its own
+ * (`flock x rm -rf /`), and every quoted argument holding more than one word
+ * (`watch 'git reset --hard'`).
+ */
+function embeddedScripts(view: CommandView): ParsedShell[] {
+  if (!runsItsArguments(view)) return [];
+  const scripts: ParsedShell[] = [];
+  view.args.forEach((arg, index) => {
+    const name = arg.text.slice(arg.text.lastIndexOf('/') + 1);
+    if (!arg.dynamic && EMBEDDED_HEADS.has(name)) {
+      scripts.push(parseArgv(view.command.args.slice(index)));
+    }
+    if (/\s/.test(arg.text.trim())) scripts.push(parseShell(arg.text));
+  });
+  return scripts;
+}
+
+// --- one command -----------------------------------------------------------
+
 async function changeDirectory(view: CommandView, scope: ShellScope): Promise<string | undefined> {
   const { context, judgement } = scope;
-  const [target] = splitArgs(view.args).positionals;
+  const [target] = parseOptions(view.args).positionals;
   if (target === undefined) return context.homeDir;
   if (target.dynamic || target.glob || target.text === '-') {
     judgement.unplaced = true;
@@ -1008,31 +1777,93 @@ async function changeDirectory(view: CommandView, scope: ShellScope): Promise<st
   return where.real;
 }
 
-/** Judges one command. Returns whether it matched the read-only allow rule. */
-async function judgeCommand(view: CommandView, scope: ShellScope): Promise<boolean> {
+/**
+ * Whether a command runs a file that a download wrote earlier in the same call:
+ * `curl -o x.sh … && sh x.sh` is a download piped into a shell with a file in
+ * between. Across separate tool calls the gate cannot see the link.
+ */
+async function runsFetchedFile(view: CommandView, scope: ShellScope): Promise<boolean> {
   const { command, args } = view;
+  const { head } = command;
   const { judgement, context } = scope;
+  if (judgement.fetched.size === 0) return false;
+  let script: Arg | undefined;
+  if (SHELL_INTERPRETERS.has(head)) {
+    const invocation = shellInvocation(command.args);
+    const [operand] = invocation.operands;
+    script = invocation.dashC || operand === undefined ? undefined : toArg(operand, context);
+  } else if (head === 'source' || head === '.') {
+    [script] = args;
+  } else if (INTERPRETERS.has(head)) {
+    const parsed = parseOptions(args, specFor(head));
+    script = hasOption(parsed, ...CODE_FLAGS) ? undefined : parsed.positionals[0];
+  } else {
+    // Run directly (`./x.sh`): only the file name of the command survives parsing.
+    return [...judgement.fetched].some(path => path.slice(path.lastIndexOf('/') + 1) === head);
+  }
+  if (script === undefined || script.dynamic) return false;
+  const where = await locate(script.text, scope.cwd, context);
+  return where.kind === 'resolved' && judgement.fetched.has(rootView(where.real, context));
+}
+
+/** Judges one command. Returns whether it matched the read-only allow rule. */
+async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): Promise<boolean> {
+  const { command, args } = view;
+  const { judgement, context } = outer;
+
+  // `env -C dir cmd` and `sudo -D dir cmd` run the command somewhere else.
+  let scope = outer;
+  if (command.chdir !== undefined) {
+    const directory = toArg(command.chdir, context);
+    const where = directory.dynamic ? undefined : await locate(directory.text, outer.cwd, context);
+    scope = { ...outer, cwd: where?.kind === 'resolved' ? where.real : undefined };
+    if (where?.kind !== 'resolved') judgement.unplaced = true;
+    else if (!where.inside) signal(judgement, 'risk.cwd_outside_root');
+  }
 
   if (command.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
+  if (command.assignments.some(name => EXEC_VARIABLES.has(name))) {
+    signal(judgement, 'risk.opaque_shell');
+  }
+  const exported = NAME_BUILTINS.has(command.head)
+    ? args.map(arg => /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(arg.text)?.[1] ?? '')
+    : [];
+  if (exported.some(name => EXEC_VARIABLES.has(name))) signal(judgement, 'risk.opaque_shell');
 
   let gitReadOnly = false;
   if (command.head === 'git') gitReadOnly = await judgeGit(view, scope);
-  if (command.head === 'rm') await judgeRm(view, scope);
-  if (command.head === 'find') await judgeFindDelete(view, scope);
-  if (command.head === 'rg' && args.some(arg => RG_EXEC_FLAGS.test(arg.text))) {
+  if (command.head === 'rm' || command.head === 'rimraf') await judgeRm(view, scope);
+  if (command.head === 'find') await judgeFind(view, scope);
+  if (command.head === 'rg' && hasOption(parseOptions(args, specFor('rg')), ...RG_EXEC_FLAGS)) {
     signal(judgement, 'risk.opaque_shell');
   }
 
-  for (const target of writeTargets(view)) await judgeWriteTarget(target, scope);
-  for (const redirection of command.redirections) {
-    if (redirection.write) {
-      await judgeWriteTarget(resolveWord(redirection.target, context.homeDir), scope);
+  const targets = [
+    ...writeTargets(view, judgement),
+    ...command.wrapperTargets.map(word => toArg(word, context)),
+    ...command.redirections
+      .filter(redirection => redirection.write)
+      .map(redirection => toArg(redirection.target, context)),
+  ];
+  const alreadyWritten = new Set(judgement.targets);
+  for (const target of targets) await judgeWriteTarget(target, scope);
+  if (FETCHERS.has(command.head)) {
+    for (const written of judgement.targets) {
+      if (!alreadyWritten.has(written)) judgement.fetched.add(written);
     }
   }
+  if (await runsFetchedFile(view, scope)) deny(judgement, 'deny.pipe_to_shell');
 
-  await judgeReads(view, scope);
+  await judgeReads(view, scope, mode);
   judgeMutation(view, judgement);
   judgeNetworkClient(view, judgement);
+
+  if (mode.nesting < MAX_SCRIPT_NESTING) {
+    const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
+    for (const script of embeddedScripts(view)) {
+      await judgeScript(script, scope.cwd, context, judgement, inner);
+    }
+  }
 
   return isReadOnly(view, scope, gitReadOnly);
 }
@@ -1041,74 +1872,158 @@ async function judgeCommand(view: CommandView, scope: ShellScope): Promise<boole
 // Rules that span commands
 // ---------------------------------------------------------------------------
 
+/** Whether a command runs what arrives on its stdin as a program. */
 function readsProgramFromStdin(view: CommandView): boolean {
   const { command, args } = view;
-  if (SHELL_INTERPRETERS.has(command.head)) {
-    const { options, positionals } = splitArgs(
-      args,
-      new Set(['-o', '-O', '--rcfile', '--init-file'])
+  const { head } = command;
+  if (SHELL_INTERPRETERS.has(head)) {
+    const invocation = shellInvocation(command.args);
+    // `xargs sh -c` with no script word: the script is whatever the pipe carries.
+    if (invocation.dashC) return invocation.script === undefined;
+    const options = args.slice(0, args.length - invocation.operands.length);
+    const first = invocation.operands[0];
+    const operand = first === undefined ? undefined : resolveWord(first, '~').text;
+    return (
+      operand === undefined ||
+      STDIN_PATHS.has(operand) ||
+      options.some(option => /^-[A-Za-z]*s[A-Za-z]*$/.test(option.text))
     );
-    if (options.some(option => /^-[A-Za-z]*c[A-Za-z]*$/.test(option.text))) return false;
-    return positionals.length === 0 || positionals[0]?.text === '-' || hasShort(options, 's');
   }
-  if (command.head === 'source' || command.head === '.') {
-    return args.some(arg => arg.text === '/dev/stdin' || arg.text === '/proc/self/fd/0');
-  }
-  if (STDIN_INTERPRETERS.has(command.head)) {
-    const { positionals } = splitArgs(args);
-    return positionals.length === 0 || positionals[0]?.text === '-';
+  if (head === 'source' || head === '.') return args.some(arg => STDIN_PATHS.has(arg.text));
+  // `at` and `batch` queue whatever shell text they are fed, unless given a file.
+  if (head === 'at' || head === 'batch') return !args.some(arg => arg.text === '-f');
+  if (INTERPRETERS.has(head)) {
+    const parsed = parseOptions(args, specFor(head));
+    if (hasOption(parsed, ...CODE_FLAGS)) return false;
+    // `python3`, `python3 -`, `deno run -`, `bun run -`.
+    const leading = parsed.positionals.slice(0, 2);
+    return leading.length === 0 || leading.some(arg => STDIN_PATHS.has(arg.text));
   }
   return false;
 }
 
-function dumpsEnvironment(view: CommandView): boolean {
-  const { command, args } = view;
-  const { options, positionals } = splitArgs(args);
-  switch (command.head) {
-    case 'printenv':
-      return true;
-    case 'env':
-    case 'set':
-      return positionals.length === 0;
-    case 'export':
-    case 'declare':
-    case 'typeset':
-      return positionals.length === 0 || hasShort(options, 'p');
-    default:
-      return args.some(arg => /^\/proc\/[^/]+\/environ$/.test(arg.text));
+/** What a command contributes to a pipeline, the commands found in its arguments included. */
+interface Roles {
+  fetches: boolean;
+  dumps: boolean;
+  runsStdin: boolean;
+  leaves: boolean;
+}
+
+function rolesOf(view: CommandView, context: RuleContext): Roles {
+  const embedded = embeddedScripts(view).flatMap(script =>
+    script.commands.filter(command => command.parent === undefined).map(c => toView(c, context))
+  );
+  const all = [view, ...embedded];
+  const readsEnviron = (candidate: CommandView): boolean =>
+    [
+      ...candidate.args,
+      ...candidate.command.redirections
+        .filter(redirection => redirection.operator === '<')
+        .map(redirection => toArg(redirection.target, context)),
+    ].some(arg => /^\/proc\/[^/]+\/environ$/.test(arg.text));
+  return {
+    fetches: all.some(candidate => FETCHERS.has(candidate.command.head)),
+    dumps: all.some(candidate => dumpsEnvironment(candidate) || readsEnviron(candidate)),
+    runsStdin: all.some(readsProgramFromStdin),
+    leaves: all.some(
+      candidate =>
+        sendsOut(candidate) ||
+        INTERPRETERS.has(candidate.command.head) ||
+        SHELL_INTERPRETERS.has(candidate.command.head)
+    ),
+  };
+}
+
+/** Whether `earlier` writes into a pipe that `later` reads, at any level of grouping. */
+function feeds(earlier: readonly PipelineStage[], later: readonly PipelineStage[]): boolean {
+  for (let level = earlier.length - 1; level >= 0; level--) {
+    const mine = earlier[level];
+    const theirs = later.find(stage => stage.id === mine?.id);
+    if (mine !== undefined && theirs !== undefined) return mine.stage < theirs.stage;
   }
+  return false;
 }
 
-function isNetworkClient(head: string): boolean {
-  return HTTP_CLIENTS.has(head) || REMOTE_CLIENTS.has(head);
-}
-
-function judgeAcrossCommands(views: readonly CommandView[], judgement: Judgement): void {
+function judgeAcrossCommands(
+  views: readonly CommandView[],
+  context: RuleContext,
+  judgement: Judgement
+): void {
+  const roles = views.map(view => rolesOf(view, context));
   views.forEach((later, index) => {
-    for (const earlier of views.slice(0, index)) {
-      if (earlier.command.pipeline !== later.command.pipeline) continue;
-      if (FETCHERS.has(earlier.command.head) && readsProgramFromStdin(later)) {
-        deny(judgement, 'deny.pipe_to_shell');
-      }
-      if (dumpsEnvironment(earlier) && isNetworkClient(later.command.head)) {
-        deny(judgement, 'deny.secret_exfiltration');
-      }
-    }
-    // The same two attacks written as a substitution: `bash <(curl …)`, `curl -d "$(printenv)"`.
-    const { parent, via } = later.command;
-    const holder = parent === undefined ? undefined : views[parent];
-    if (holder === undefined || via !== 'substitution') return;
-    if (FETCHERS.has(later.command.head) && RUNS_ITS_ARGUMENT.has(holder.command.head)) {
+    const mine = roles[index];
+    if (mine === undefined) return;
+    const upstream = views
+      .map((earlier, at) => ({ earlier, at }))
+      .filter(
+        ({ earlier, at }) =>
+          at < index && feeds(earlier.command.pipelinePath, later.command.pipelinePath)
+      )
+      .map(({ at }) => roles[at]);
+
+    if (mine.runsStdin && upstream.some(role => role?.fetches)) {
       deny(judgement, 'deny.pipe_to_shell');
     }
-    if (dumpsEnvironment(later) && isNetworkClient(holder.command.head)) {
+    if (mine.leaves && upstream.some(role => role?.dumps)) {
       deny(judgement, 'deny.secret_exfiltration');
+    }
+    // A dump sent straight to a host: `env > /dev/tcp/host/port`.
+    const toNetwork = later.command.redirections.some(
+      redirection =>
+        redirection.write && NETWORK_DEVICE.test(toArg(redirection.target, context).text)
+    );
+    if (mine.dumps && toNetwork) deny(judgement, 'deny.secret_exfiltration');
+
+    // The same attacks written as a substitution: `bash <(curl …)`,
+    // `curl -d "$(printenv)"`, `curl … > >(sh)`, `curl … | tee >(sh)`.
+    const { via } = later.command;
+    const parent = later.command.parent ?? -1;
+    const holder = views[parent];
+    const holderRoles = roles[parent];
+    if (holder === undefined || holderRoles === undefined) return;
+    if (via === 'substitution') {
+      if (mine.fetches && RUNS_ITS_ARGUMENT.has(holder.command.head)) {
+        deny(judgement, 'deny.pipe_to_shell');
+      }
+      if (mine.dumps && holderRoles.leaves) deny(judgement, 'deny.secret_exfiltration');
+    }
+    if (via === 'sink') {
+      const feedsHolder = views
+        .map((earlier, at) => ({ earlier, at }))
+        .filter(
+          ({ earlier, at }) =>
+            at < parent && feeds(earlier.command.pipelinePath, holder.command.pipelinePath)
+        )
+        .map(({ at }) => roles[at]);
+      const sources = [holderRoles, ...feedsHolder];
+      if (mine.runsStdin && sources.some(role => role?.fetches)) {
+        deny(judgement, 'deny.pipe_to_shell');
+      }
+      if (mine.leaves && sources.some(role => role?.dumps)) {
+        deny(judgement, 'deny.secret_exfiltration');
+      }
     }
   });
 }
 
-/** How many `echo ... | sh` layers are read before the rest is left as opaque. */
-const MAX_PIPED_SCRIPT_NESTING = 3;
+/** The literal text a command writes to its stdout, when that can be read off the command. */
+function printedText(view: CommandView): string | undefined {
+  const { command, args } = view;
+  if (args.some(arg => arg.dynamic)) return undefined;
+  if (command.head === 'echo') return args.map(arg => arg.text).join(' ');
+  // printf's first argument is the format; alone, it is all that is printed.
+  if (command.head === 'printf')
+    return args
+      .slice(args.length > 1 ? 1 : 0)
+      .map(a => a.text)
+      .join(' ');
+  // `cat <<EOF | sh`: the heredoc is what cat prints.
+  if (command.head === 'cat' && args.length === 0 && command.stdin.length > 0) {
+    return command.stdin.join('\n');
+  }
+  return undefined;
+}
 
 /** Judges one script. Returns whether every command in it matched the read-only allow rule. */
 async function judgeScript(
@@ -1116,15 +2031,12 @@ async function judgeScript(
   startCwd: string | undefined,
   context: RuleContext,
   judgement: Judgement,
-  nesting = 0
+  mode: Mode = { nesting: 0, speculative: false }
 ): Promise<boolean> {
   if (parsed.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
 
-  const views: CommandView[] = parsed.commands.map(command => ({
-    command,
-    args: command.args.map(word => resolveWord(word, context.homeDir)),
-  }));
-  judgeAcrossCommands(views, judgement);
+  const views: CommandView[] = parsed.commands.map(command => toView(command, context));
+  judgeAcrossCommands(views, context, judgement);
 
   // One working directory per subshell: a `cd` inside `( ... )` or `$(...)` ends
   // with it. A subshell starts where its enclosing one stands when it is first used.
@@ -1140,22 +2052,21 @@ async function judgeScript(
   let allReadOnly = views.length > 0 && parsed.opaque.length === 0;
   for (const [index, view] of views.entries()) {
     const scope: ShellScope = { context, judgement, cwd: cwdOf(view.command.scope) };
-    if (!(await judgeCommand(view, scope))) allReadOnly = false;
+    if (!(await judgeCommand(view, scope, mode))) allReadOnly = false;
 
-    // `... | sh`: the shell runs whatever the pipe carries. That text is unknown
-    // unless the stage before it is an echo of literals, which is read as a script.
-    const feeder = views
-      .slice(0, index)
-      .filter(earlier => earlier.command.pipeline === view.command.pipeline)
-      .at(-1);
-    if (feeder !== undefined && readsProgramFromStdin(view)) {
-      signal(judgement, 'risk.opaque_shell');
-      const literal = TEXT_ONLY.has(feeder.command.head) && feeder.args.every(arg => !arg.dynamic);
-      if (literal && nesting < MAX_PIPED_SCRIPT_NESTING) {
-        // printf's first argument is the format, not part of what it prints.
-        const printed = feeder.command.head === 'printf' ? feeder.args.slice(1) : feeder.args;
-        const piped = parseShell(printed.map(arg => arg.text).join(' '));
-        await judgeScript(piped, scope.cwd, context, judgement, nesting + 1);
+    // A shell or `source` reading its program from stdin runs whatever arrives
+    // there: a here-string of its own, or what the stage before it prints.
+    if (readsProgramFromStdin(view) && mode.nesting < MAX_SCRIPT_NESTING) {
+      const inner: Mode = { nesting: mode.nesting + 1, speculative: mode.speculative };
+      const feeder = views
+        .slice(0, index)
+        .filter(earlier => feeds(earlier.command.pipelinePath, view.command.pipelinePath))
+        .at(-1);
+      const piped = feeder === undefined ? undefined : printedText(feeder);
+      const own = SHELL_INTERPRETERS.has(view.command.head) ? [] : view.command.stdin;
+      if (feeder !== undefined || own.length > 0) signal(judgement, 'risk.opaque_shell');
+      for (const script of [...own, ...(piped === undefined ? [] : [piped])]) {
+        await judgeScript(parseShell(script), scope.cwd, context, judgement, inner);
       }
     }
     if (view.command.head === 'cd' || view.command.head === 'pushd') {
@@ -1188,10 +2099,6 @@ function conclude(judgement: Judgement, allowRule: AllowRuleId, cwdInside: boole
       cwdInside && !judgement.unplaced && !judgement.signals.has('risk.cwd_outside_root'),
     reversibleHint: combineHints(judgement.hints),
   };
-}
-
-function plainPath(text: string): ResolvedWord {
-  return { text, dynamic: false, glob: false };
 }
 
 /** Judges one tool call by the fixed rules. No shell is run and nothing is written. */
@@ -1248,5 +2155,9 @@ export async function evaluateRules(
       }
       return conclude(judgement, allReadOnly ? 'allow.read_only' : 'default.no_signal', cwdInside);
     }
+    default:
+      // A kind this version does not know (a newer provider, a typo): refusing it
+      // is recorded and explained, where returning nothing would be neither.
+      return denied('deny.unreadable_request');
   }
 }

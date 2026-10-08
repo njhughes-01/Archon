@@ -21,8 +21,34 @@ export type ResolvedPath =
 /** The kernel's own limit on symlinks followed in one lookup. */
 const MAX_SYMLINK_HOPS = 40;
 
+/**
+ * A backslash separates segments only where the platform says so. On POSIX it
+ * is an ordinary character: a directory can be named `a\b\c`, and treating it
+ * as three levels would let `a\b\c/../../..` climb out of the root unnoticed.
+ */
+const SEPARATORS = sep === '\\' ? /[\\/]/ : /\//;
+
 function segmentsOf(path: string): string[] {
-  return path.split(/[\\/]/).filter(segment => segment !== '' && segment !== '.');
+  return path.split(SEPARATORS).filter(segment => segment !== '' && segment !== '.');
+}
+
+/**
+ * Paths under `/proc` that mean "this process": its working directory, root and
+ * open files. They resolve against the engine, not against the shell the tool
+ * will run, so where a write through them lands cannot be known here.
+ */
+const PROCESS_RELATIVE = /^\/proc\/[^/]+\/(cwd|root|fd|task)(\/|$)/;
+
+/**
+ * `/dev/fd/3` and `/dev/stdout` name an open file. Anything written past them
+ * (`/dev/fd/../..`) is a walk through the same per-process directory.
+ */
+function isProcessRelative(path: string): boolean {
+  if (PROCESS_RELATIVE.test(path)) return true;
+  const [first, second, ...rest] = segmentsOf(path);
+  if (first !== 'dev') return false;
+  if (second === 'fd') return rest.length !== 1 || !/^\d+$/.test(rest[0] ?? '');
+  return ['stdin', 'stdout', 'stderr'].includes(second ?? '') && rest.length > 0;
 }
 
 function errorCode(error: unknown): string {
@@ -39,6 +65,7 @@ function errorCode(error: unknown): string {
 export async function resolveRealPath(target: string, baseDir: string): Promise<ResolvedPath> {
   if (!isAbsolute(baseDir)) return { ok: false, code: 'ERELATIVE' };
   const start = isAbsolute(target) ? target : `${baseDir}${sep}${target}`;
+  if (isProcessRelative(start)) return { ok: false, code: 'EPROCESS' };
   const { root } = parse(start);
   let current = root;
   let pending = segmentsOf(start.slice(root.length));
@@ -52,6 +79,7 @@ export async function resolveRealPath(target: string, baseDir: string): Promise<
       continue;
     }
     const candidate = join(current, segment);
+    if (PROCESS_RELATIVE.test(candidate)) return { ok: false, code: 'EPROCESS' };
     let isLink: boolean;
     try {
       isLink = (await lstat(candidate)).isSymbolicLink();

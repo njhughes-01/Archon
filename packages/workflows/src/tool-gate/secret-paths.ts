@@ -1,16 +1,20 @@
 /**
  * Which paths are shaped like a secret: an env file, a key, a credential store,
- * or anything inside a directory that holds them. Decided from the path alone,
- * so the file is never opened.
+ * a login file one of the agent CLIs keeps, or anything inside a directory that
+ * holds them. Decided from the path alone, so the file is never opened.
  *
- * Import-free on purpose. The context scout's pack script carries the same
- * vocabulary (`isSecretPath` in `.shared/context-scout.ts`), and a pack script
- * cannot import engine code. Until one of them owns the list and the other
- * derives from it, this file must cover at least everything that predicate
- * covers.
+ * Import-free on purpose. The context scout's pack script carries the base
+ * vocabulary (`isSecretPath` in `.shared/context-scout.ts`) and a pack script
+ * cannot import engine code, so the two lists cannot share a module yet.
+ * `secret-paths.test.ts` holds them together instead: every path the scout
+ * calls secret must be secret here too, unless `secretPathExemption` names why
+ * the gate lets it through. The gate has those exemptions because it guards
+ * work, not prompts: an agent has to edit `.env.example` and read
+ * `src/secrets/manager.ts`, while the scout only chooses what to quote.
  */
 
-const SECRET_DIRECTORIES = new Set([
+/** Directories that hold credentials and nothing an agent needs to open. */
+const CREDENTIAL_DIRECTORIES = new Set([
   '.ssh',
   '.aws',
   '.gnupg',
@@ -18,9 +22,24 @@ const SECRET_DIRECTORIES = new Set([
   '.azure',
   '.kube',
   '.docker',
-  'secrets',
-  '.secrets',
 ]);
+
+/** Directories named for secrets. Source code inside them is exempt. */
+const SECRET_DIRECTORIES = new Set(['secrets', '.secrets']);
+
+/** Credential directories that are only recognisable with their parent. */
+const CREDENTIAL_DIRECTORY_PAIRS = new Set(['.config/gcloud', '.config/github-copilot']);
+
+/** Credential files that are only recognisable with their directory. */
+const CREDENTIAL_FILE_SUFFIXES = [
+  ...['gh/hosts.yml', 'github-copilot/hosts.json', 'github-copilot/apps.json'],
+  ...['etc/shadow', 'etc/gshadow', 'etc/sudoers'],
+];
+
+/** `hosts.yml` is a login store when it sits in a tool's config directory. */
+const HOSTS_FILE = /^hosts\.(yml|yaml|json)$/;
+/** A tool's config or home directory, as the user keeps it or as the engine delivers a copy. */
+const TOOL_HOME = /^(\.config|.+-home|\.[a-z0-9-]+)$/;
 
 const SECRET_NAMES = new Set([
   '.netrc',
@@ -31,6 +50,16 @@ const SECRET_NAMES = new Set([
   '.git-credentials',
   'authorized_keys',
   'known_hosts',
+  // Login stores of the agent CLIs (Codex, OpenCode, Pi) and of package tools.
+  'auth.json',
+  '.claude.json',
+  'application_default_credentials.json',
+  '.vault-token',
+  '.my.cnf',
+  '.s3cfg',
+  '.boto',
+  '.dockercfg',
+  'kubeconfig',
 ]);
 
 /** A file whose name starts with one of these, whatever follows the next dot, stores secrets. */
@@ -50,8 +79,6 @@ const SECRET_EXTENSIONS = new Set([
   'ppk',
   'gpg',
   'asc',
-  'crt',
-  'cer',
   'der',
   'tfvars',
   'tfstate',
@@ -81,30 +108,123 @@ const ENV_CODE_EXTENSIONS = new Set([
   'sh',
 ]);
 
-/**
- * A secret store keeps its name when something is appended to it
- * (`secrets.enc.yaml`, `id_rsa.bak`, `.netrc.old`), so every dotted prefix of
- * the file name is checked, and every extension after the first dot. A secret
- * directory counts in the last position too: the path may name the directory.
- */
-export function isSecretPath(path: string): boolean {
-  const segments = path
-    .toLowerCase()
-    .split(/[\\/]/)
-    .filter(segment => segment !== '' && segment !== '.');
-  if (segments.some(segment => SECRET_DIRECTORIES.has(segment))) return true;
+/** Source and prose files: `src/secrets/manager.ts` and `docs/secrets.md` are not secrets. */
+const SOURCE_EXTENSIONS = new Set(['ts', 'tsx', 'js', 'py', 'go', 'rs', 'rb', 'java', 'md']);
 
+/** Public halves of a key pair, and certificates. */
+const PUBLIC_EXTENSIONS = new Set(['pub', 'crt', 'cer']);
+
+/** An env file checked in as a template: `.env.example`, `.env.production.sample`, `env.example`. */
+const ENV_TEMPLATE = /^\.?env(\.[^.]+)*\.(example|sample|template|dist|defaults)$/;
+
+/** The environment of a running process, as the kernel serves it. */
+const PROCESS_ENVIRONMENT = /(^|\/)proc\/[^/]+\/environ$/;
+
+export type SecretPathExemption = 'env_template' | 'source_file' | 'public_material';
+
+interface PathShape {
+  path: string;
+  /** Every segment but the last. */
+  directories: string[];
+  name: string;
+  extension: string;
+}
+
+function shapeOf(path: string): PathShape | undefined {
+  const lowered = path.toLowerCase().replaceAll('\\', '/');
+  const segments = lowered.split('/').filter(segment => segment !== '' && segment !== '.');
   const name = segments.pop();
-  if (name === undefined) return false;
-  if (segments.some(segment => segment.startsWith('.env'))) return true;
-  if (name.startsWith('.env') || name.endsWith('.env')) return true;
-  if (KEY_NAME_PREFIXES.some(prefix => name.startsWith(prefix))) return true;
+  if (name === undefined) return undefined;
+  const dot = name.lastIndexOf('.');
+  return {
+    path: lowered,
+    directories: segments,
+    name,
+    extension: dot <= 0 ? '' : name.slice(dot + 1),
+  };
+}
 
+function inCredentialStore(shape: PathShape): boolean {
+  const segments = [...shape.directories, shape.name];
+  if (segments.some(segment => CREDENTIAL_DIRECTORIES.has(segment))) return true;
+  const joined = segments.join('/');
+  if (CREDENTIAL_FILE_SUFFIXES.some(suffix => joined === suffix || joined.endsWith(`/${suffix}`))) {
+    return true;
+  }
+  if (HOSTS_FILE.test(shape.name) && shape.directories.some(segment => TOOL_HOME.test(segment))) {
+    return true;
+  }
+  return segments.some(
+    (segment, index) =>
+      index > 0 && CREDENTIAL_DIRECTORY_PAIRS.has(`${segments[index - 1] ?? ''}/${segment}`)
+  );
+}
+
+function isEnvFile(shape: PathShape): boolean {
+  const { name } = shape;
+  if (name.startsWith('.env') || name.endsWith('.env')) return true;
+  return name.split('.')[0] === 'env' && !ENV_CODE_EXTENSIONS.has(shape.extension);
+}
+
+/** Named after secrets: inside `secrets/`, or called `secrets.*` / `credentials.*`. */
+function isNamedForSecrets(shape: PathShape): boolean {
+  if ([...shape.directories, shape.name].some(segment => SECRET_DIRECTORIES.has(segment))) {
+    return true;
+  }
+  const parts = shape.name.split('.');
+  return parts.some((_, index) =>
+    SECRET_STEMS.has(
+      parts
+        .slice(0, index + 1)
+        .join('.')
+        .replace(/^\./, '')
+    )
+  );
+}
+
+function isKeyOrStore(shape: PathShape): boolean {
+  const { name } = shape;
+  if (KEY_NAME_PREFIXES.some(prefix => name.startsWith(prefix))) return true;
   const parts = name.split('.');
-  if (parts[0] === 'env' && !ENV_CODE_EXTENSIONS.has(parts.at(-1) ?? '')) return true;
   for (let end = 1; end <= parts.length; end++) {
-    const prefix = parts.slice(0, end).join('.');
-    if (SECRET_NAMES.has(prefix) || SECRET_STEMS.has(prefix.replace(/^\./, ''))) return true;
+    if (SECRET_NAMES.has(parts.slice(0, end).join('.'))) return true;
   }
   return parts.slice(1).some(extension => SECRET_EXTENSIONS.has(extension));
+}
+
+/**
+ * Why the gate does not treat a secret-shaped path as a secret, or `undefined`
+ * when no exemption applies. These are the only differences from the scout's
+ * vocabulary that the conformance test accepts.
+ */
+export function secretPathExemption(path: string): SecretPathExemption | undefined {
+  const shape = shapeOf(path);
+  if (shape === undefined) return undefined;
+  if (PUBLIC_EXTENSIONS.has(shape.extension)) return 'public_material';
+  if (inCredentialStore(shape) || PROCESS_ENVIRONMENT.test(shape.path)) return undefined;
+  if (shape.directories.some(segment => segment.startsWith('.env'))) return undefined;
+  if (ENV_TEMPLATE.test(shape.name)) return 'env_template';
+  if (isEnvFile(shape) || isKeyOrStore(shape)) return undefined;
+  if (SOURCE_EXTENSIONS.has(shape.extension) && isNamedForSecrets(shape)) return 'source_file';
+  return undefined;
+}
+
+/**
+ * Whether a path names an env file, a key, a credential or login store, or a
+ * process environment. A secret store keeps its name when something is appended
+ * to it (`secrets.enc.yaml`, `id_rsa.bak`, `.netrc.old`), so every dotted prefix
+ * of the file name is checked, and every extension after the first dot.
+ */
+export function isSecretPath(path: string): boolean {
+  const shape = shapeOf(path);
+  if (shape === undefined) return false;
+  if (secretPathExemption(path) !== undefined) return false;
+  return (
+    PROCESS_ENVIRONMENT.test(shape.path) ||
+    inCredentialStore(shape) ||
+    shape.directories.some(segment => segment.startsWith('.env')) ||
+    isEnvFile(shape) ||
+    isKeyOrStore(shape) ||
+    isNamedForSecrets(shape)
+  );
 }

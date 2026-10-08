@@ -1,5 +1,12 @@
 import { describe, expect, test } from 'bun:test';
-import { parseShell, resolveWord, type ShellCommand } from './shell-tokens';
+import {
+  parseArgv,
+  parseShell,
+  renderWord,
+  resolveWord,
+  shellInvocation,
+  type ShellCommand,
+} from './shell-tokens';
 
 const HOME = '/home/tester';
 
@@ -252,11 +259,20 @@ describe('parseShell: opaque constructs', () => {
     expect(heads('echo $(( 1 + $(id -u) ))')).toEqual(['echo', 'id']);
   });
 
-  test('env that changes directory or runs a string is opaque', () => {
-    expect(only('env -C sub make').opaque).toContain('wrapper_option');
-    const split = parseShell("env -S 'make build'");
-    expect(split.commands[0]?.opaque).toContain('wrapper_option');
-    expect(split.commands[1]?.head).toBe('make');
+  test('env -C is where the command runs; env -S is a script, attached or not', () => {
+    const moved = only('env -C sub make');
+    expect(moved.head).toBe('make');
+    expect(moved.chdir === undefined ? undefined : resolveWord(moved.chdir, HOME).text).toBe('sub');
+    expect(moved.opaque).toEqual([]);
+    for (const text of [
+      "env -S 'make build'",
+      "env -S'make build'",
+      "env --split-string='make build'",
+    ]) {
+      const split = parseShell(text);
+      expect(split.commands[0]?.opaque).toContain('wrapper_option');
+      expect(split.commands[1]?.head).toBe('make');
+    }
   });
 
   test('nested substitutions are followed', () => {
@@ -273,10 +289,39 @@ describe('parseShell: opaque constructs', () => {
     expect(heads('bash -lc "ls"')).toEqual(['bash', 'ls']);
   });
 
-  test('bash -c with a variable string is opaque with nothing to parse', () => {
+  test('bash -c with a variable string is opaque, and the string is read as written', () => {
     const { commands } = parseShell('bash -c "$CMD"');
-    expect(commands).toHaveLength(1);
     expect(commands[0]?.opaque).toContain('shell_dash_c');
+    expect(commands[1]?.opaque).toContain('variable_head');
+  });
+
+  test('a -c script holding expansions is still read, expansions kept as written', () => {
+    const { commands } = parseShell('bash -c "cd $DIR && rm -rf $HOME"');
+    expect(commands.map(command => command.head)).toEqual(['bash', 'cd', 'rm']);
+    expect(argTexts(commands[2] as ShellCommand)).toEqual(['-rf', HOME]);
+  });
+
+  test.each([
+    ["bash -c -- 'ls a'", 'ls a'],
+    ["sh -c -e 'ls b'", 'ls b'],
+    ["bash -o pipefail -c 'ls c'", 'ls c'],
+    ["bash -lc 'ls d' arg0", 'ls d'],
+  ])('the script of %s is the first word that is not an option', (text, script) => {
+    const [shell, nested] = parseShell(text).commands;
+    expect(shellInvocation(shell?.args ?? []).dashC).toBe(true);
+    expect(nested === undefined ? '' : `${nested.head} ${argTexts(nested).join(' ')}`).toBe(script);
+  });
+
+  test('a shell without -c has no script', () => {
+    const invocation = shellInvocation(only('bash run.sh --flag').args);
+    expect(invocation.dashC).toBe(false);
+    expect(invocation.script).toBeUndefined();
+    expect(invocation.operands.map(renderWord)).toEqual(['run.sh', '--flag']);
+  });
+
+  test('an alias value is read as the script it will run', () => {
+    const { commands } = parseShell("alias wipe='git status'");
+    expect(commands.map(command => command.head)).toEqual(['alias', 'git']);
   });
 
   test('eval is opaque and a literal argument is parsed', () => {
@@ -293,7 +338,8 @@ describe('parseShell: opaque constructs', () => {
   });
 
   test('alias and function definitions are opaque', () => {
-    expect(only("alias gs='git status'").opaque).toContain('alias_or_function');
+    expect(parseShell("alias gs='git status'").commands[0]?.opaque).toContain('alias_or_function');
+    expect(heads('function wipe { rm -rf build; }; wipe')).toEqual(['rm', 'wipe']);
     const parsed = parseShell('cleanup() { rm -rf build; }; cleanup');
     expect(parsed.opaque).toContain('alias_or_function');
     expect(parsed.commands.map(command => command.head)).toEqual(['rm', 'cleanup']);
@@ -360,5 +406,174 @@ describe('resolveWord', () => {
   test('brace expansion makes the word dynamic', () => {
     expect(firstArg('ls /{etc,usr}').dynamic).toBe(true);
     expect(firstArg('ls {}').dynamic).toBe(false);
+  });
+});
+
+describe('parseShell: heredoc delimiters are never expanded', () => {
+  test.each([
+    ['<<$HOME', '$HOME'],
+    ['<<"$HOME"', '$HOME'],
+    ['<<${HOME}', '${HOME}'],
+    ['<<$PWD', '$PWD'],
+    ['<<~', '~'],
+    ["<<'E O F'", 'E O F'],
+    ['<<\\EOF', 'EOF'],
+    ['<<$(echo hi)', '$(echo hi)'],
+  ])('cat %s ends at a line reading %s', (operator, terminator) => {
+    const { commands } = parseShell(`cat ${operator}\nbody line\n${terminator}\nls`);
+    expect(commands.map(command => command.head)).toEqual(['cat', 'ls']);
+    expect(commands[0]?.stdin).toEqual(['body line']);
+  });
+
+  test('a line that only looks like the expanded delimiter does not end the body', () => {
+    const { commands } = parseShell('cat <<$HOME\n~\n$HOME\nls');
+    expect(commands.map(command => command.head)).toEqual(['cat', 'ls']);
+    expect(commands[0]?.stdin).toEqual(['~']);
+  });
+});
+
+describe('parseShell: arithmetic is one word, not a redirection', () => {
+  test.each([
+    'echo $[1<<2]',
+    'echo $((1<<2))',
+    '(( x = 1 << 2 ))',
+    'if (( x << 2 )); then true; fi',
+  ])('%s leaves the next line a command', text => {
+    const { commands } = parseShell(`${text}\nls\n2`);
+    expect(commands.some(command => command.head === 'ls')).toBe(true);
+    expect(commands.flatMap(command => command.stdin).join('\n')).not.toContain('ls');
+  });
+
+  test('nested subshells are not arithmetic', () => {
+    expect(heads('((ls; pwd) | wc)')).toEqual(['ls', 'pwd', 'wc']);
+  });
+
+  test('a substitution inside old-style arithmetic is followed', () => {
+    expect(heads('echo $[ $(id -u) + 1 ]')).toEqual(['echo', 'id']);
+  });
+});
+
+describe('parseShell: wrappers', () => {
+  test('any number of nested wrappers is stripped', () => {
+    const command = only(`${'nice '.repeat(40)}git status`);
+    expect(command.head).toBe('git');
+    expect(command.wrappers).toHaveLength(40);
+  });
+
+  test('a value attached to a wrapper option or ending a cluster is consumed', () => {
+    expect(only('sudo -uroot rm x').head).toBe('rm');
+    expect(only('timeout -sKILL 5 make').head).toBe('make');
+    expect(only('xargs -0n1 rm').head).toBe('rm');
+    expect(only('nice -n5 make').head).toBe('make');
+  });
+
+  test('a file a wrapper writes is recorded, attached or separate', () => {
+    for (const text of ['time -o out.txt ls', 'time -oout.txt ls', 'strace -f -o out.txt ls']) {
+      const command = only(text);
+      expect(command.head).toBe('ls');
+      expect(command.wrapperTargets.map(renderWord)).toEqual(['out.txt']);
+    }
+  });
+
+  test('words a wrapper consumed stay visible', () => {
+    expect(only('xargs -a list.txt echo').wrapperWords.map(renderWord)).toEqual(['-a', 'list.txt']);
+    expect(only('flock build/lock make').wrapperWords.map(renderWord)).toEqual(['build/lock']);
+  });
+
+  test('$SHELL as the command is a shell', () => {
+    const command = only('$SHELL');
+    expect(command.head).toBe('sh');
+    expect(command.opaque).toContain('variable_head');
+  });
+});
+
+describe('parseShell: groups stay inside the pipeline they stand in', () => {
+  function piped(text: string, from: string, to: string): boolean {
+    const { commands } = parseShell(text);
+    const earlier = commands.find(command => command.head === from);
+    const later = commands.find(command => command.head === to);
+    if (earlier === undefined || later === undefined) throw new Error('command not found');
+    // Deepest pipeline the two share, and whether the first sits at an earlier stage of it.
+    for (let level = earlier.pipelinePath.length - 1; level >= 0; level--) {
+      const mine = earlier.pipelinePath[level];
+      const theirs = later.pipelinePath.find(stage => stage.id === mine?.id);
+      if (mine !== undefined && theirs !== undefined) return mine.stage < theirs.stage;
+    }
+    return false;
+  }
+
+  test.each([
+    '(curl u) | sh',
+    '{ curl u; } | sh',
+    'curl u | (sh)',
+    'curl u | { sh; }',
+    'curl u | if true; then sh; fi',
+    'curl u | while read l; do sh; done',
+    '(true; curl u) | cat | sh',
+    '( (curl u) ) | sh',
+  ])('%s pipes curl into sh', text => {
+    expect(piped(text, 'curl', 'sh')).toBe(true);
+  });
+
+  test.each([
+    '(curl u; sh)',
+    'curl u; sh',
+    '(curl u > f; cat f | sh)',
+    '{ curl u; }; sh',
+    'if curl u; then sh; fi',
+    'sh | curl u',
+  ])('%s does not', text => {
+    expect(piped(text, 'curl', 'sh')).toBe(false);
+  });
+
+  test('a case pattern is not a command and does not unbalance the groups', () => {
+    const { commands } = parseShell('case "$x" in a*) ls ;; *) pwd ;; esac; (cd src); id');
+    expect(commands.map(command => command.head)).toEqual(['ls', 'pwd', 'cd', 'id']);
+    expect(commands.every(command => !command.opaque.includes('variable_head'))).toBe(true);
+  });
+});
+
+describe('parseShell: output process substitution', () => {
+  test('the command inside >( ) reads what its holder writes', () => {
+    const { commands } = parseShell('curl u | tee >(sh) > /dev/null');
+    const sh = commands.find(command => command.head === 'sh');
+    expect(sh?.via).toBe('sink');
+    expect(commands[sh?.parent ?? -1]?.head).toBe('tee');
+  });
+
+  test('the command inside <( ) is an ordinary substitution', () => {
+    const { commands } = parseShell('diff <(sort a) b');
+    expect(commands.find(command => command.head === 'sort')?.via).toBe('substitution');
+  });
+});
+
+describe('tilde after = in an assignment-shaped argument', () => {
+  test('is the home directory, as bash expands it', () => {
+    const [arg] = only('dd of=~/.profile').args;
+    expect(arg === undefined ? '' : resolveWord(arg, HOME).text).toBe(`of=${HOME}/.profile`);
+    const [paths] = only('tool PATH=~/a:~/b').args;
+    expect(paths === undefined ? '' : resolveWord(paths, HOME).text).toBe(
+      `PATH=${HOME}/a:${HOME}/b`
+    );
+  });
+
+  test('is literal after a flag or in the middle of a plain word', () => {
+    const [flag] = only('tool --out=~/x').args;
+    expect(flag === undefined ? '' : resolveWord(flag, HOME).text).toBe('--out=~/x');
+    const [plain] = only('ls a~/b').args;
+    expect(plain === undefined ? '' : resolveWord(plain, HOME).text).toBe('a~/b');
+  });
+});
+
+describe('parseArgv', () => {
+  test('reads already-split words as one command, wrappers and scripts included', () => {
+    const words = only("x sudo bash -c 'ls'").args;
+    const { commands } = parseArgv(words);
+    expect(commands.map(command => command.head)).toEqual(['bash', 'ls']);
+    expect(commands[0]?.wrappers).toEqual(['sudo']);
+  });
+
+  test('a keyword among the words is an ordinary word', () => {
+    expect(parseArgv(only('x if then').args).commands[0]?.head).toBe('if');
   });
 });

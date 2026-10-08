@@ -118,6 +118,27 @@ describe.skipIf(process.platform === 'win32')('resolveRealPath', () => {
     });
   });
 
+  test('a directory literally named with backslashes is one segment', async () => {
+    const { base, root } = makeTree();
+    mkdirSync(join(root, 'a\\b\\c'));
+    // One level down, three levels up: two above the root.
+    expect(await resolveRealPath('a\\b\\c/../../../x.txt', root)).toMatchObject({
+      path: join(base, '..', 'x.txt'),
+    });
+  });
+
+  test.each([
+    '/proc/self/cwd/x.txt',
+    '/proc/self/root/etc/hosts',
+    '/proc/999999999/cwd/x.txt',
+    '/dev/fd/../../etc/hosts',
+    '/dev/fd/3/x',
+    '/dev/stdout/../x',
+  ])('%s is relative to a process, so it is refused', async path => {
+    const { root } = makeTree();
+    expect(await resolveRealPath(path, root)).toEqual({ ok: false, code: 'EPROCESS' });
+  });
+
   test('a relative base directory is refused', async () => {
     expect(await resolveRealPath('x', 'not/absolute')).toEqual({ ok: false, code: 'ERELATIVE' });
   });

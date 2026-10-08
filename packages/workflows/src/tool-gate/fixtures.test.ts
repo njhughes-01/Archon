@@ -34,7 +34,7 @@ type Expectation = 'allow' | 'deny' | 'escalate';
 interface FixtureRow {
   id: string;
   tool: string;
-  kind: ToolActionKind;
+  kind: ToolActionKind | 'browser';
   cwd: string;
   expect: Expectation;
   command?: string;
@@ -70,8 +70,19 @@ function makeTree(): Tree {
   const root = join(base, 'repo');
   const outside = join(base, 'outside');
   const home = join(base, 'home');
-  for (const dir of ['src', 'docs', 'build', 'sub'])
-    mkdirSync(join(root, dir), { recursive: true });
+  const dirs = ['src', 'docs', 'build/empty', 'sub', 'dist', 'a\\b\\c'];
+  for (const dir of dirs) mkdirSync(join(root, dir), { recursive: true });
+  // Three checkouts with different current branches, read from their HEAD files.
+  const heads = [
+    ['.', 'ref: refs/heads/feature/login\n'],
+    ['on-main', 'ref: refs/heads/main\n'],
+    ['detached', '4b825dc642cb6eb9a060e54bf8d69288fbee4904\n'],
+  ] as const;
+  for (const [dir, head] of heads) {
+    mkdirSync(join(root, dir, '.git'), { recursive: true });
+    writeFileSync(join(root, dir, '.git', 'HEAD'), head);
+  }
+  writeFileSync(join(root, '.env.example'), 'FIXTURE=\n');
   mkdirSync(outside);
   mkdirSync(join(home, '.ssh'), { recursive: true });
   writeFileSync(join(root, 'README.md'), '# fixture\n');
@@ -97,7 +108,8 @@ function fill(text: string, tree: Tree): string {
 function toRequest(row: FixtureRow, tree: Tree): ToolActionRequest {
   return {
     toolName: row.tool,
-    kind: row.kind,
+    // One row carries a kind no provider should send, to pin the refusal.
+    kind: row.kind as ToolActionKind,
     cwd: fill(row.cwd, tree),
     input: row.input ?? {},
     ...(row.command !== undefined && { command: fill(row.command, tree) }),
