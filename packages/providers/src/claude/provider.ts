@@ -740,13 +740,14 @@ async function applyNodeConfig(
   // every ~30s with just `description` + `last_tool_name`; with it, the SDK
   // forks the subagent's session every ~30s to produce a short present-tense
   // `summary` (e.g. "Analyzing auth module"). The fork reuses the subagent's
-  // model + prompt cache, so cost stays minimal. Only workflow nodes opt in —
-  // direct chat calls (no nodeConfig) skip this to keep the chat surface
-  // unchanged. Authors can still override per-node by setting
-  // `agentProgressSummaries: false` in nodeConfig (see below).
+  // model + prompt cache, so cost stays minimal. Only workflow nodes default
+  // to it. A call that carries nodeConfig without a nodeId — direct chat with
+  // its tool denial or effort, title generation — keeps the SDK default, so
+  // the chat surface does not start forking sessions because it gained a
+  // nodeConfig. An explicit `agentProgressSummaries` wins on either path.
   if (nodeConfig.agentProgressSummaries !== undefined) {
     options.agentProgressSummaries = nodeConfig.agentProgressSummaries;
-  } else {
+  } else if (isWorkflowNode) {
     options.agentProgressSummaries = true;
   }
 

@@ -1200,6 +1200,52 @@ describe('parseOrchestratorCommands', () => {
         expect(result.workflowInvocationFailure).toBeNull();
       }
     });
+
+    test('a failing line with text after it is an example, not an attempted launch', () => {
+      // The format puts the command last. A line the reply goes on from — the
+      // agent showing the syntax, inside a code fence or not — launched nothing
+      // and was not meant to.
+      for (const response of [
+        'To run one, write:\n/invoke-workflow {workflow-name} --project {project-name}\nReplace the placeholders.',
+        'The syntax is:\n```\n/invoke-workflow {workflow-name} --project {project-name}\n```\nThen send it.',
+        '/invoke-workflow assist\nbut you need a project too.',
+      ]) {
+        const result = parseOrchestratorCommands(response, codebases, workflows);
+        expect(result.workflowInvocation).toBeNull();
+        expect(result.workflowInvocationFailure).toBeNull();
+      }
+    });
+
+    test('trailing blank lines do not make a failing last line an example', () => {
+      const result = parseOrchestratorCommands(
+        'On it.\n/invoke-workflow nonexistent-workflow --project my-project\n\n  \n',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure?.reason).toBe('unknown_workflow');
+    });
+
+    test('a failing command whose --prompt spans lines is still an attempted launch', () => {
+      // The prompt's later lines belong to the command; they are not text after it.
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow nonexistent-workflow --project my-project --prompt "Fix the login bug:\n- redirect loop\n- stale cookie"',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure?.reason).toBe('unknown_workflow');
+    });
+
+    test('text after a multi-line --prompt closes still makes the command an example', () => {
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow nonexistent-workflow --project my-project --prompt "line one\nline two"\nThat is the shape.',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure).toBeNull();
+    });
   });
 
   // ─── Complex real-world responses ────────────────────────────────────────────
@@ -5501,6 +5547,186 @@ describe('handleMessage — /invoke-workflow that starts nothing', () => {
 
     expect(mockCaptureChatTurn).toHaveBeenCalledTimes(1);
     expect(mockCaptureChatTurn.mock.calls[0]?.[0]).toMatchObject({ outcome: 'completed' });
+  });
+
+  // ─── A command-looking line the reply goes on from is not a launch ──────────
+
+  const examples: { name: string; reply: string }[] = [
+    {
+      name: 'placeholder example with text after it',
+      reply:
+        'To start one yourself, write:\n/invoke-workflow {workflow-name} --project {project-name}\nReplace both placeholders.',
+    },
+    {
+      name: 'fenced example with text after it',
+      reply:
+        'The syntax is:\n```\n/invoke-workflow {workflow-name} --project {project-name}\n```\nReplace both placeholders.',
+    },
+  ];
+
+  for (const { name, reply } of examples) {
+    test(`batch mode — ${name}: the whole reply is delivered, no notice`, async () => {
+      const { sent } = await runTurn('batch', [reply]);
+
+      expect(sent).toEqual([reply]);
+      expect(failureLog()).toBeUndefined();
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    });
+
+    test(`stream mode — ${name}: the withheld text is delivered, no notice`, async () => {
+      const { sent } = await runTurn('stream', [reply]);
+
+      // The chunk is withheld while it might be a command, then sent whole.
+      expect(sent).toEqual([reply]);
+      expect(failureLog()).toBeUndefined();
+      expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+    });
+  }
+
+  test('stream mode — text arriving after a complete failing line is delivered, not lost', async () => {
+    const { sent } = await runTurn(
+      'stream',
+      [
+        'The syntax is:\n',
+        '/invoke-workflow {workflow-name} --project {project-name}\n',
+        'Replace both placeholders.',
+      ],
+      'telegram'
+    );
+
+    expect(sent).toEqual([
+      'The syntax is:\n',
+      '/invoke-workflow {workflow-name} --project {project-name}\nReplace both placeholders.',
+    ]);
+    expect(failureLog()).toBeUndefined();
+    const assistantRow = mockAddMessage.mock.calls.find(c => c[1] === 'assistant');
+    expect(assistantRow?.[2]).toBe(
+      'The syntax is:\n/invoke-workflow {workflow-name} --project {project-name}\nReplace both placeholders.'
+    );
+  });
+
+  test('batch mode — text arriving after a complete failing line means no notice', async () => {
+    const { sent } = await runTurn('batch', [
+      'The syntax is:\n',
+      '/invoke-workflow {workflow-name} --project {project-name}\n',
+      'Replace both placeholders.',
+    ]);
+
+    expect(sent.some(text => text.includes('Workflow not started'))).toBe(false);
+    expect(sent.join('')).toContain('/invoke-workflow {workflow-name} --project {project-name}');
+    expect(failureLog()).toBeUndefined();
+  });
+
+  // ─── Stream mode: nothing the agent said before the command is lost ─────────
+
+  test('stream mode — explanation in the same chunk as a failing command is sent with the notice', async () => {
+    const notice =
+      'Workflow not started: there is no workflow named "fix-everything". Use `/workflow list` to see the available workflows.';
+    const { sent } = await runTurn(
+      'stream',
+      ["I'll get that fixed.\n\n/invoke-workflow fix-everything --project my-project"],
+      'telegram'
+    );
+
+    expect(sent).toEqual([`I'll get that fixed.\n\n${notice}`]);
+    const assistantRow = mockAddMessage.mock.calls.find(c => c[1] === 'assistant');
+    expect(assistantRow?.[2]).toBe(`I'll get that fixed.\n\n${notice}`);
+  });
+
+  test('stream mode — only the not-yet-streamed part of the explanation is sent again', async () => {
+    const notice =
+      'Workflow not started: there is no workflow named "fix-everything". Use `/workflow list` to see the available workflows.';
+    const { sent } = await runTurn(
+      'stream',
+      ['First part. ', 'Second part.\n\n/invoke-workflow fix-everything --project my-project'],
+      'telegram'
+    );
+
+    expect(sent).toEqual(['First part. ', `Second part.\n\n${notice}`]);
+    const assistantRow = mockAddMessage.mock.calls.find(c => c[1] === 'assistant');
+    expect(assistantRow?.[2]).toBe(`First part. Second part.\n\n${notice}`);
+  });
+
+  const malformedNotice =
+    'Workflow not started: the launch command was malformed (it needs a workflow name, then --project <name>). Nothing ran — please ask again.';
+
+  test('stream mode — a bare /invoke-workflow final line is not streamed raw (single chunk)', async () => {
+    const { sent } = await runTurn('stream', ['On it.\n\n/invoke-workflow']);
+
+    expect(sent).toEqual([`On it.\n\n${malformedNotice}`]);
+  });
+
+  test('stream mode — a bare /invoke-workflow final line is not streamed raw (own chunk)', async () => {
+    const { sent } = await runTurn('stream', ['On it.\n\n', '/invoke-workflow']);
+
+    expect(sent).toEqual(['On it.\n\n', malformedNotice]);
+    expect(failureLog()).toMatchObject({ reason: 'malformed' });
+  });
+
+  test('stream mode — a withheld chunk that turns out to be prose is delivered', async () => {
+    // "/invoke-workflow" at the end of a chunk is withheld in case it is a
+    // command; the next chunk shows it was a different word.
+    const { sent } = await runTurn('stream', ['See also:\n', '/invoke-workflow', 's.md for more.']);
+
+    expect(sent).toEqual(['See also:\n', '/invoke-workflows.md for more.']);
+    expect(failureLog()).toBeUndefined();
+  });
+
+  // ─── A reply that registers a project and then invokes on it ────────────────
+
+  describe('with a /register-project in the same reply', () => {
+    beforeEach(() => {
+      // The project list as the database would hold it: one project to begin
+      // with, plus whatever this turn has registered so far.
+      mockCreateCodebase.mockClear();
+      mockListCodebases.mockImplementation(() =>
+        Promise.resolve([
+          makeNamedCodebase('my-project'),
+          ...mockCreateCodebase.mock.calls.map(([input]) => makeNamedCodebase(input.name)),
+        ])
+      );
+    });
+
+    test('an invoke on the project the reply just registered is dispatched', async () => {
+      mockParseCommand.mockReturnValue({
+        command: 'register-project',
+        args: ['new-project', '/repos/new-project'],
+      });
+
+      const { sent } = await runTurn('batch', [
+        'Registering it, then starting the work.\n/register-project new-project /repos/new-project\n/invoke-workflow assist --project new-project --prompt "Fix the login bug"',
+      ]);
+
+      expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+        expect.objectContaining({ originalMessage: 'Fix the login bug' }),
+        expect.anything()
+      );
+      expect(sent.some(text => text.includes('Workflow not started'))).toBe(false);
+      // The explanation goes out once, with the registration — not again with the dispatch.
+      expect(sent.filter(text => text.includes('Registering it')).length).toBe(1);
+      expect(failureLog()).toBeUndefined();
+    });
+
+    for (const mode of ['batch', 'stream'] as const) {
+      test(`${mode} mode — a still-unknown project is reported against the list after registration`, async () => {
+        mockParseCommand.mockReturnValue({
+          command: 'register-project',
+          args: ['new-project', '/repos/new-project'],
+        });
+
+        const { sent } = await runTurn(mode, [
+          '/register-project new-project /repos/new-project\n/invoke-workflow assist --project ghost-project',
+        ]);
+
+        expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
+        expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+        expect(sent).toContain(
+          'Workflow not started: no registered project matches "ghost-project". Registered projects: my-project, new-project.'
+        );
+        expect(failureLog()).toMatchObject({ reason: 'unknown_project' });
+      });
+    }
   });
 
   test('a valid command is unaffected — it dispatches and logs no failure', async () => {

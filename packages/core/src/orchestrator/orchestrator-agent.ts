@@ -379,11 +379,11 @@ export interface OrchestratorCommands {
 
 // ─── Command Parsing ────────────────────────────────────────────────────────
 
-// Prefix patterns: fire as soon as the command keyword is seen.
-const INVOKE_WORKFLOW_PREFIX_RE = /^\/invoke-workflow\s/m;
-// A whole reply's view of the same thing: the keyword alone on the last line
-// has no trailing whitespace to match, and is still an attempt to invoke.
-const INVOKE_WORKFLOW_LINE_RE = /^\/invoke-workflow(?:\s|$)/m;
+// Prefix patterns: fire as soon as the command keyword is seen. The invoke
+// keyword also counts at the very end of the text: a reply can end on the bare
+// keyword, and a stream chunk that ends on it must be held back until the next
+// chunk shows whether it was a command.
+const INVOKE_WORKFLOW_PREFIX_RE = /^\/invoke-workflow(?:\s|$)/m;
 const REGISTER_PROJECT_PREFIX_RE = /^\/register-project\s/m;
 
 // Full-command patterns: fire once all required tokens are present.
@@ -591,9 +591,44 @@ function resolveCodebaseName(name: string, codebases: readonly Codebase[]): Code
   );
 }
 
+function endOfLine(text: string, from: number): number {
+  const newline = text.indexOf('\n', from);
+  return newline === -1 ? text.length : newline;
+}
+
+/**
+ * What a reply says after the `/invoke-workflow` command whose line starts at
+ * `lineStart`. The command ends with its line, or — when that line opens a
+ * quoted `--prompt` — with the line that closes the quote, because a prompt
+ * may span lines. An unclosed prompt runs to the end of the reply.
+ */
+function textAfterInvokeCommand(text: string, lineStart: number): string {
+  const lineEnd = endOfLine(text, lineStart);
+  const quote = /--prompt\s+(["'])/.exec(text.slice(lineStart, lineEnd));
+  if (!quote) return text.slice(lineEnd);
+  const close = text.indexOf(quote[1], lineStart + quote.index + quote[0].length);
+  return close === -1 ? '' : text.slice(endOfLine(text, close));
+}
+
+/**
+ * The part of `text` that comes before its first `/invoke-workflow` line, or
+ * empty when no such line starts inside `text`.
+ */
+function textBeforeInvokeLine(text: string): string {
+  const normalized = normalizeCommandText(text);
+  const line = INVOKE_WORKFLOW_PREFIX_RE.exec(normalized);
+  return line ? normalized.slice(0, line.index) : '';
+}
+
 /**
  * Parse orchestrator commands from AI response text.
  * Scans for /invoke-workflow and /register-project patterns.
+ *
+ * An `/invoke-workflow` line that cannot start a workflow is reported as
+ * `workflowInvocationFailure` only when it is the last thing in the reply, which
+ * is where the format puts a real command. A failing line the reply goes on
+ * from is the agent showing the syntax: it is left in the text and reported as
+ * nothing.
  */
 export function parseOrchestratorCommands(
   response: string,
@@ -617,34 +652,33 @@ export function parseOrchestratorCommands(
   // template. Commands with --prompt before --project will not match.
   const invokePattern = /^\/invoke-workflow\s+(\S+)\s+--project[\s=]+(\S+)/m;
   const invokeMatch = invokePattern.exec(normalizedResponse);
-  const invokeLine = INVOKE_WORKFLOW_LINE_RE.exec(normalizedResponse);
+  const invokeLine = INVOKE_WORKFLOW_PREFIX_RE.exec(normalizedResponse);
+  const failInvoke = (cause: InvokeFailureCause, lineStart: number): void => {
+    if (textAfterInvokeCommand(normalizedResponse, lineStart).trim() !== '') return;
+    result.workflowInvocationFailure = {
+      ...cause,
+      precedingText: normalizedResponse.slice(0, lineStart).trim(),
+    };
+  };
   if (invokeMatch) {
     const workflowName = invokeMatch[1].trim();
     const projectName = invokeMatch[2].trim();
-    // Message before the command
-    const commandIndex = normalizedResponse.indexOf(invokeMatch[0]);
-    const remainingMessage = normalizedResponse.slice(0, commandIndex).trim();
 
     // Validate workflow exists
     const workflow = findWorkflow(workflowName, [...workflows]);
     if (!workflow) {
-      result.workflowInvocationFailure = {
-        reason: 'unknown_workflow',
-        workflowName,
-        precedingText: remainingMessage,
-      };
+      failInvoke({ reason: 'unknown_workflow', workflowName }, invokeMatch.index);
     } else {
       // Validate project exists (case-insensitive, supports partial name matching)
       // e.g., "Archon" matches "coleam00/Archon"
       const matchedCodebase = findCodebaseByName(codebases, projectName);
       if (!matchedCodebase) {
-        result.workflowInvocationFailure = {
-          reason: 'unknown_project',
-          workflowName,
-          projectName,
-          precedingText: remainingMessage,
-        };
+        failInvoke({ reason: 'unknown_project', workflowName, projectName }, invokeMatch.index);
       } else {
+        // Extract message before the command
+        const commandIndex = normalizedResponse.indexOf(invokeMatch[0]);
+        const remainingMessage = normalizedResponse.slice(0, commandIndex).trim();
+
         // Extract optional --prompt "..." parameter (double or single quotes)
         const commandText = normalizedResponse.slice(commandIndex);
         const promptPattern = /--prompt\s+(?:"([^"]+)"|'([^']+)')/;
@@ -667,10 +701,7 @@ export function parseOrchestratorCommands(
   } else if (invokeLine) {
     // The line is there but the workflow name or `--project` is not where the
     // format puts them.
-    result.workflowInvocationFailure = {
-      reason: 'malformed',
-      precedingText: normalizedResponse.slice(0, invokeLine.index).trim(),
-    };
+    failInvoke({ reason: 'malformed' }, invokeLine.index);
   }
 
   // Parse /register-project {name} {path}
@@ -2792,6 +2823,9 @@ async function handleStreamMode(
   // What the user has actually been sent: chunks from the command prefix on are
   // withheld, so this can be shorter than the joined reply.
   let streamedText = '';
+  // Assistant text that arrived after the command was complete. It stays out of
+  // `allMessages` (see below) but is still part of the reply.
+  let textAfterCommand = '';
   let newSessionId: string | undefined;
   let commandDetected = false;
   let commandFullyParsed = false;
@@ -2809,6 +2843,8 @@ async function handleStreamMode(
       // whitespace boundary, causing the parse regex to overshoot.
       if (!commandFullyParsed) {
         allMessages.push(msg.content);
+      } else {
+        textAfterCommand += msg.content;
       }
       if (!commandDetected) {
         // Check for orchestrator commands BEFORE streaming to frontend.
@@ -2969,24 +3005,41 @@ async function handleStreamMode(
       fullResponse,
       commands.projectRegistration
     );
-    await sendInvokeFailureAfterRegistration(platform, conversationId, commands, codebases);
+    if (commands.workflowInvocationFailure) {
+      await resolveInvokeAfterRegistration(
+        platform,
+        conversationId,
+        conversation,
+        workflows,
+        fullResponse,
+        originalMessage,
+        isolationHints,
+        issueContext,
+        userId
+      );
+    }
     return;
   }
 
-  // Text was already streamed — nothing more to send, unless the reply tried to
-  // invoke a workflow and started nothing. That command chunk was withheld
-  // above and no run exists, so the notice is one extra message. Nothing is
-  // retracted: what was streamed before the command is still the agent's reply.
-  let delivered = fullResponse;
-  if (commands.workflowInvocationFailure) {
-    const notice = reportInvokeFailure(
-      platform,
-      conversationId,
-      commands.workflowInvocationFailure,
-      codebases
-    );
-    await platform.sendMessage(conversationId, notice);
-    delivered = [streamedText.trim(), notice].filter(Boolean).join('\n\n');
+  // Nothing was dispatched, so whatever was withheld from the command prefix on
+  // still has to reach the user: nothing the agent said may be dropped. Text
+  // that arrived after a complete command makes it an example rather than a
+  // launch, the same as text after it in the parsed reply.
+  const withheld = fullResponse.slice(streamedText.length) + textAfterCommand;
+  const invokeFailure = textAfterCommand.trim() === '' ? commands.workflowInvocationFailure : null;
+  let unsent = withheld;
+  let delivered = streamedText + withheld;
+  if (invokeFailure) {
+    // A real attempt that started nothing: the command itself is replaced by the
+    // reason. Only the explanation that was withheld along with it goes out —
+    // the part streamed earlier is already on screen.
+    const notice = reportInvokeFailure(platform, conversationId, invokeFailure, codebases);
+    const beforeCommand = textBeforeInvokeLine(withheld);
+    unsent = [beforeCommand.trim(), notice].filter(Boolean).join('\n\n');
+    delivered = [(streamedText + beforeCommand).trim(), notice].filter(Boolean).join('\n\n');
+  }
+  if (unsent.trim() !== '') {
+    await platform.sendMessage(conversationId, unsent);
   }
   // Persist the assistant reply for non-web platforms so it appears in the
   // Web UI conversation history. The web adapter persists through its
@@ -3049,6 +3102,8 @@ async function handleBatchMode(
   let newSessionId: string | undefined;
   let commandDetected = false;
   let commandFullyParsed = false;
+  // Whether assistant text arrived after the command was complete.
+  let textAfterCommand = false;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
   for await (const msg of aiClient.sendQuery(
@@ -3063,6 +3118,8 @@ async function handleBatchMode(
       allChunks.push({ type: 'assistant', content: msg.content });
       if (!commandFullyParsed) {
         assistantMessages.push(msg.content);
+      } else if (msg.content.trim() !== '') {
+        textAfterCommand = true;
       }
 
       // Cap assistant-only chunks while no command has been detected.  Once
@@ -3250,14 +3307,28 @@ async function handleBatchMode(
       finalMessage,
       commands.projectRegistration
     );
-    await sendInvokeFailureAfterRegistration(platform, conversationId, commands, codebases);
+    if (commands.workflowInvocationFailure) {
+      await resolveInvokeAfterRegistration(
+        platform,
+        conversationId,
+        conversation,
+        workflows,
+        assistantMessages.join(''),
+        originalMessage,
+        isolationHints,
+        issueContext,
+        userId
+      );
+    }
     return;
   }
 
   // No orchestrator commands — send the clean response. A reply that tried to
   // invoke a workflow and started nothing goes out without the command line and
   // with the reason in its place, so the user is not left waiting for a run.
-  const invokeFailure = commands.workflowInvocationFailure;
+  // Text that arrived after a complete command makes it an example rather than
+  // a launch, the same as text after it in the parsed reply.
+  const invokeFailure = textAfterCommand ? null : commands.workflowInvocationFailure;
   const reply = invokeFailure
     ? [
         invokeFailure.precedingText,
@@ -3395,20 +3466,48 @@ async function handleWorkflowInvocationResult(
 }
 
 /**
- * A reply that registered a project may also have tried to invoke a workflow
- * and started nothing. The registration still stands; say the run does not.
+ * A reply that registered a project and then tried to invoke a workflow was
+ * judged against the project list from before the registration. Judge the
+ * invocation again against the list as it now stands: start the workflow when
+ * its project exists now, otherwise say why it did not start.
  */
-async function sendInvokeFailureAfterRegistration(
+async function resolveInvokeAfterRegistration(
   platform: IPlatformAdapter,
   conversationId: string,
-  commands: OrchestratorCommands,
-  codebases: readonly Codebase[]
+  conversation: Conversation,
+  workflows: readonly WorkflowWithSource[],
+  reply: string,
+  originalMessage: string,
+  isolationHints: HandleMessageContext['isolationHints'],
+  issueContext?: string,
+  userId?: string
 ): Promise<void> {
-  if (!commands.workflowInvocationFailure) return;
-  await platform.sendMessage(
-    conversationId,
-    reportInvokeFailure(platform, conversationId, commands.workflowInvocationFailure, codebases)
+  const codebases = await codebaseDb.listCodebases();
+  const { workflowInvocation, workflowInvocationFailure } = parseOrchestratorCommands(
+    reply,
+    codebases,
+    workflows.map(ws => ws.workflow)
   );
+  if (workflowInvocation) {
+    await handleWorkflowInvocationResult(
+      platform,
+      conversationId,
+      conversation,
+      codebases,
+      workflows,
+      // The text before the commands already went out with the registration.
+      { ...workflowInvocation, remainingMessage: '' },
+      originalMessage,
+      isolationHints,
+      issueContext,
+      userId
+    );
+  } else if (workflowInvocationFailure) {
+    await platform.sendMessage(
+      conversationId,
+      reportInvokeFailure(platform, conversationId, workflowInvocationFailure, codebases)
+    );
+  }
 }
 
 /**

@@ -149,7 +149,10 @@ export interface GlobalConfig {
    * workflows keep the tiers their nodes name and title generation stays on
    * `small`. Install-level — a repo config cannot set it. A user's own default
    * chat model still wins.
-   * @default 'large'
+   *
+   * Unset, chat asks for `large` and `assistants.<provider>.model` stands in
+   * when that tier is not configured. An explicit `chatTier: large` asks for
+   * the same tier but never substitutes `assistants.<provider>.model`.
    */
   chatTier?: TierName;
 

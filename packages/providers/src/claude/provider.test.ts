@@ -1197,6 +1197,21 @@ describe('ClaudeProvider', () => {
       expect(callArgs.options).toMatchObject({ agentProgressSummaries: false });
     });
 
+    test('an explicit agentProgressSummaries wins on a call that is not a workflow node', async () => {
+      mockQuery.mockImplementation(async function* () {
+        // Empty
+      });
+
+      for await (const _ of client.sendQuery('test', '/workspace', undefined, {
+        nodeConfig: { agentProgressSummaries: true },
+      })) {
+        // consume
+      }
+
+      const callArgs = mockQuery.mock.calls[0][0] as { options: Record<string, unknown> };
+      expect(callArgs.options).toMatchObject({ agentProgressSummaries: true });
+    });
+
     test('does not set agentProgressSummaries for direct chat (no nodeConfig)', async () => {
       mockQuery.mockImplementation(async function* () {
         // Empty
@@ -3115,6 +3130,9 @@ describe('sendQuery decomposition behaviors', () => {
       expect(options.tools).toBeUndefined();
       expect(options.skills).toBeUndefined();
       expect(options.strictMcpConfig).toBeUndefined();
+      // Carrying nodeConfig must not opt the chat into the workflow-node
+      // default of forking subagent sessions for progress summaries.
+      expect(options).not.toHaveProperty('agentProgressSummaries');
     });
 
     test('does not grant Skill to a non-workflow call that carries skills', async () => {
