@@ -71,10 +71,18 @@ async function startEmbeddedOpencode(
   });
 }
 
+/** The fields of an OpenCode session this provider reads back. */
+export interface OpencodeSessionInfo {
+  id?: string;
+  /** The session's permission ruleset, when the server reports one. */
+  permission?: unknown;
+}
+
 export interface OpencodeClientLike {
   session: {
-    create(options?: Record<string, unknown>): Promise<{ data?: { id?: string } }>;
-    get(options: Record<string, unknown>): Promise<{ data?: { id?: string } }>;
+    create(options?: Record<string, unknown>): Promise<{ data?: OpencodeSessionInfo }>;
+    get(options: Record<string, unknown>): Promise<{ data?: OpencodeSessionInfo }>;
+    update(options: Record<string, unknown>): Promise<{ data?: OpencodeSessionInfo }>;
     promptAsync(options: Record<string, unknown>): Promise<unknown>;
     abort(options: Record<string, unknown>): Promise<unknown>;
     message(

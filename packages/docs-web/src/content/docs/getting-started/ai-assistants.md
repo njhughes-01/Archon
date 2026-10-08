@@ -842,16 +842,7 @@ archon ai default pi openrouter/minimax/minimax-m2 --scope user
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 
-**What chat can change.** The chat agent answers questions and does read-only research; work that changes files runs in a workflow. Archon tells the agent this in its instructions and also asks the provider to run every chat turn without its built-in file-editing tools. How that request is honoured depends on the provider:
-
-| Provider | Chat turn runs with |
-| --- | --- |
-| `claude` | `Write`, `Edit` and `NotebookEdit` removed |
-| `pi` | `read` and `bash` only (no `edit` or `write`) |
-| `copilot` | file-write permission requests refused |
-| `codex`, `opencode` | no restriction available — the instructions are the only control, and Archon logs `orchestrator.chat_file_write_restriction_unsupported` on each chat turn |
-
-The shell stays available on every provider (project setup clones with it, and research reads with it), so this is a guard against the agent quietly editing a project, not a sandbox. Workflow nodes are never restricted this way. The [capability matrix](/reference/provider-capabilities/) row "Direct chat without file-editing tools" is generated from the same flags.
+**What chat can change.** The chat agent answers questions and does read-only research; work that changes files runs in a workflow. Archon tells the agent this in its instructions and also asks the provider to run every chat turn without its built-in file-editing tools. Which providers honour that request is the "Direct chat without file-editing tools" row of the [capability matrix](/reference/provider-capabilities/), generated from the providers themselves. Where the row shows ❌ the restriction is not wired for that provider: the instructions are the only control, and Archon logs `orchestrator.chat_file_write_restriction_unsupported` on each chat turn. The shell stays available on every provider (project setup clones with it, and research reads with it), so this is a guard against the agent quietly editing a project, not a sandbox. Workflow nodes are never restricted this way.
 
 ### Per-run model bindings
 

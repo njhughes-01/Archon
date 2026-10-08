@@ -29,11 +29,9 @@ export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
   skills: false, // top-level nodeConfig.skills has no OpenCode request translation yet
   agents: true,
   toolRestrictions: true,
-  // Not wired. The per-prompt `tools` map takes tool ids the SDK types only as
-  // strings (the list is a runtime endpoint), and the typed `permission.edit`
-  // exists only in server or agent config, which the embedded runtime leaves to
-  // the user's own OpenCode config (see runtime.ts).
-  fileWriteRestriction: false,
+  // restrictFileWrites → session permission ruleset with `edit` denied
+  // (session.ts). Wired from the SDK typings only; not run against OpenCode.
+  fileWriteRestriction: true,
   structuredOutput: 'enforced', // sends format:{json_schema}; reads info.structured_output
   requiresAllPropertiesRequired: false, // OpenCode does not enforce the required-coverage rule
   envInjection: true,

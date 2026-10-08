@@ -11,13 +11,14 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   skills: false,
   agents: false,
   toolRestrictions: false,
-  // No thread option expresses "no project-file writes, shell otherwise free".
-  // `sandboxMode` is the only write control: `read-only` also stops the shell
-  // writing anywhere (project setup clones, `archon workflow …` state) and has
-  // no network switch (`networkAccessEnabled` only sets
-  // `sandbox_workspace_write.network_access`); `workspace-write` makes the
-  // working directory — the project itself — writable. There is no per-tool
-  // switch and no approval callback to refuse a single edit.
+  // Not wired. The thread options this provider sets do not express "no
+  // project-file writes, shell otherwise free": `sandboxMode: 'read-only'` also
+  // stops the shell writing anywhere (project setup clones, `archon workflow …`
+  // state) and `networkAccessEnabled` only sets
+  // `sandbox_workspace_write.network_access`, while `workspace-write` is meant
+  // to keep the working directory — the project itself — writable. A permission
+  // profile passed through `CodexOptions.config` might express it; that route
+  // has not been evaluated.
   fileWriteRestriction: false,
   structuredOutput: 'enforced', // SDK outputSchema grammar-constrains decoding
   requiresAllPropertiesRequired: true, // OpenAI strict-mode: every key in properties must appear in required

@@ -102,6 +102,14 @@ const CAVEATS: readonly { provider: string; key: keyof ProviderCapabilities; not
       'Config-file-based agent selection (named agents from `opencode.json`) with per-call ' +
       'model/tools overrides — not inline sub-agent definitions.',
   },
+  {
+    provider: 'opencode',
+    key: 'fileWriteRestriction',
+    note:
+      'Sent as a per-session permission rule denying `edit`, which stays on that chat session. ' +
+      'Wired from the SDK typings and not yet verified against a running OpenCode; a server ' +
+      'that answers without the rule is logged as `opencode.file_write_restriction_unconfirmed`.',
+  },
 ];
 
 const SUPERSCRIPT_DIGITS = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'] as const;

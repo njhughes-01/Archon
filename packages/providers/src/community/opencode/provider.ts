@@ -156,7 +156,8 @@ export class OpencodeProvider implements IAgentProvider {
         const { sessionId, resumed } = await resolveSessionId(
           runtime.client,
           sessionCwd,
-          resumeSessionId
+          resumeSessionId,
+          requestOptions?.restrictFileWrites
         );
         if (resumeSessionId && !resumed) {
           yield {
