@@ -56,3 +56,6 @@ CHANGELOG.md
 CONTRIBUTING.md
 *.yml
 *.yaml
+
+# Local Codanna code-graph index (never committed)
+.codanna/
