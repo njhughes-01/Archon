@@ -1245,6 +1245,33 @@ describe('parseOrchestratorCommands', () => {
 
       expect(result.workflowInvocationFailure).toBeNull();
     });
+
+    test('an escaped quote inside a multi-line --prompt does not end the command early', () => {
+      // The prompt closes on its last line; the \" on the first line is content.
+      const result = parseOrchestratorCommands(
+        '/invoke-workflow nonexistent-workflow --project my-project --prompt "say \\"hi\\" first\nthen fix it"',
+        codebases,
+        workflows
+      );
+
+      expect(result.workflowInvocationFailure?.reason).toBe('unknown_workflow');
+    });
+
+    test('a failing line skipped as an example leaves a debug trace with names only', () => {
+      mockLogger.debug.mockClear();
+
+      parseOrchestratorCommands(
+        'Write it like this:\n/invoke-workflow {workflow-name} --project my-project --prompt "secret words"\nThen send.',
+        codebases,
+        workflows
+      );
+
+      const trace = mockLogger.debug.mock.calls.find(
+        c => c[1] === 'orchestrator.invoke_example_skipped'
+      );
+      expect(trace?.[0]).toEqual({ reason: 'unknown_workflow', workflowName: '{workflow-name}' });
+      expect(JSON.stringify(mockLogger.debug.mock.calls)).not.toContain('secret words');
+    });
   });
 
   // ─── Complex real-world responses ────────────────────────────────────────────
@@ -5612,9 +5639,31 @@ describe('handleMessage — /invoke-workflow that starts nothing', () => {
     ]);
 
     expect(sent.some(text => text.includes('Workflow not started'))).toBe(false);
-    expect(sent.join('')).toContain('/invoke-workflow {workflow-name} --project {project-name}');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('The syntax is:');
+    expect(sent[0]).toContain('/invoke-workflow {workflow-name} --project {project-name}');
+    // The sentence after the example arrived as its own chunk and must survive.
+    expect(sent[0]).toContain('Replace both placeholders.');
     expect(failureLog()).toBeUndefined();
   });
+
+  for (const mode of ['batch', 'stream'] as const) {
+    test(`${mode} mode — a successful dispatch never shows the command line, with or without later chunks`, async () => {
+      const { sent } = await runTurn(mode, [
+        'On it.\n\n/invoke-workflow assist --project my-project --prompt "Fix the login bug"\n',
+        'Anything else?',
+      ]);
+
+      expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+        expect.objectContaining({ originalMessage: 'Fix the login bug' }),
+        expect.anything()
+      );
+      expect(sent.some(text => text.includes('/invoke-workflow'))).toBe(false);
+      // Unchanged: what the agent says after a command that started a run is dropped.
+      expect(sent.some(text => text.includes('Anything else?'))).toBe(false);
+      expect(failureLog()).toBeUndefined();
+    });
+  }
 
   // ─── Stream mode: nothing the agent said before the command is lost ─────────
 
@@ -5660,6 +5709,30 @@ describe('handleMessage — /invoke-workflow that starts nothing', () => {
 
     expect(sent).toEqual(['On it.\n\n', malformedNotice]);
     expect(failureLog()).toMatchObject({ reason: 'malformed' });
+  });
+
+  test('stream mode — a command keyword split across chunks is never streamed as a fragment', async () => {
+    const { sent } = await runTurn('stream', [
+      'On it.\n/invoke-',
+      'workflow assist --project ghost-project',
+    ]);
+
+    expect(sent).toEqual([
+      'On it.\n\nWorkflow not started: no registered project matches "ghost-project". Registered projects: my-project, other-project.',
+    ]);
+    expect(sent.some(text => text.includes('/invoke-'))).toBe(false);
+  });
+
+  test('stream mode — a held line that turns out to be a path is delivered whole', async () => {
+    const { sent } = await runTurn('stream', ['The route is\n/inv', 'entory/list.\n', 'Done.']);
+
+    expect(sent).toEqual(['The route is\n/inventory/list.\n', 'Done.']);
+  });
+
+  test('stream mode — a reply that ends on a held fragment still delivers it', async () => {
+    const { sent } = await runTurn('stream', ['Type a slash:\n', '/']);
+
+    expect(sent).toEqual(['Type a slash:\n', '/']);
   });
 
   test('stream mode — a withheld chunk that turns out to be prose is delivered', async () => {
@@ -5708,6 +5781,48 @@ describe('handleMessage — /invoke-workflow that starts nothing', () => {
     });
 
     for (const mode of ['batch', 'stream'] as const) {
+      test(`${mode} mode — register and invoke arriving as two chunks still starts the workflow`, async () => {
+        // The first chunk is a complete command on its own. What follows it is
+        // still part of the reply and has to be read.
+        mockParseCommand.mockReturnValue({
+          command: 'register-project',
+          args: ['new-project', '/repos/new-project'],
+        });
+
+        const { sent } = await runTurn(mode, [
+          'Registering it, then starting the work.\n/register-project new-project /repos/new-project\n',
+          '/invoke-workflow assist --project new-project --prompt "Fix the login bug"',
+        ]);
+
+        expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
+        expect(mockDispatchBackgroundWorkflow).toHaveBeenCalledWith(
+          expect.objectContaining({ originalMessage: 'Fix the login bug' }),
+          expect.anything()
+        );
+        expect(sent.filter(text => text.includes('Registering it')).length).toBe(1);
+        expect(sent.some(text => text.includes('/invoke-workflow'))).toBe(false);
+        expect(sent.some(text => text.includes('Workflow not started'))).toBe(false);
+        expect(failureLog()).toBeUndefined();
+      });
+
+      test(`${mode} mode — two chunks, project still unknown after registration: the user is told`, async () => {
+        mockParseCommand.mockReturnValue({
+          command: 'register-project',
+          args: ['new-project', '/repos/new-project'],
+        });
+
+        const { sent } = await runTurn(mode, [
+          '/register-project new-project /repos/new-project\n',
+          '/invoke-workflow assist --project ghost-project',
+        ]);
+
+        expect(mockCreateCodebase).toHaveBeenCalledTimes(1);
+        expect(mockDispatchBackgroundWorkflow).not.toHaveBeenCalled();
+        expect(sent).toContain(
+          'Workflow not started: no registered project matches "ghost-project". Registered projects: my-project, new-project.'
+        );
+      });
+
       test(`${mode} mode — a still-unknown project is reported against the list after registration`, async () => {
         mockParseCommand.mockReturnValue({
           command: 'register-project',

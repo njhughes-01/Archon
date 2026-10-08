@@ -358,6 +358,16 @@ export interface OrchestratorCommands {
 const INVOKE_WORKFLOW_PREFIX_RE = /^\/invoke-workflow(?:\s|$)/m;
 const REGISTER_PROJECT_PREFIX_RE = /^\/register-project\s/m;
 
+// A quoted command value — a `--prompt`, a project path — as the two readers
+// that decide where a command ends take it: closed by the quote that opened
+// it, a backslash escaping the next character, newlines allowed inside. The
+// stream detector (the FULL_RE objects) and textAfterInvokeCommand share it so
+// they cannot disagree. The `--prompt` extractor in parseOrchestratorCommands
+// still stops at the first quote; unescaping there would change prompts that
+// contain backslashes.
+const CLOSED_QUOTED_VALUE_RE = /^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/s;
+const COMMAND_KEYWORDS = ['/invoke-workflow', '/register-project'] as const;
+
 // Full-command patterns: fire once all required tokens are present.
 // These determine when accumulation can stop — further chunks cannot add
 // required parse tokens and could corrupt already-captured ones.
@@ -383,11 +393,8 @@ const INVOKE_WORKFLOW_FULL_RE = {
     const promptKeywordMatch = /--prompt\s+/.exec(line);
     if (promptKeywordMatch) {
       const afterPrompt = line.slice(promptKeywordMatch.index + promptKeywordMatch[0].length);
-      if (afterPrompt.startsWith('"')) {
-        return /^"(?:[^"\\]|\\.)*"/.test(afterPrompt);
-      }
-      if (afterPrompt.startsWith("'")) {
-        return /^'(?:[^'\\]|\\.)*'/.test(afterPrompt);
+      if (afterPrompt.startsWith('"') || afterPrompt.startsWith("'")) {
+        return CLOSED_QUOTED_VALUE_RE.test(afterPrompt);
       }
       // Unquoted --prompt value: require line terminator.
       return !isEos;
@@ -419,12 +426,9 @@ const REGISTER_PROJECT_FULL_RE = {
     if (nameEnd === -1) return false; // no path token yet
     const projectPath = rest.slice(nameEnd).trimStart();
     if (!projectPath) return false;
-    if (projectPath.startsWith('"')) {
+    if (projectPath.startsWith('"') || projectPath.startsWith("'")) {
       // Quoted path: require closing quote
-      return /^"(?:[^"\\]|\\.)*"/.test(projectPath);
-    }
-    if (projectPath.startsWith("'")) {
-      return /^'(?:[^'\\]|\\.)*'/.test(projectPath);
+      return CLOSED_QUOTED_VALUE_RE.test(projectPath);
     }
     // Unquoted path: require line terminator so we don't freeze on a partial path with spaces
     return !isEos;
@@ -446,6 +450,31 @@ function normalizeCommandText(text: string): string {
 function isCommandFullyParsed(accumulated: string): boolean {
   const normalized = normalizeCommandText(accumulated);
   return INVOKE_WORKFLOW_FULL_RE.test(normalized) || REGISTER_PROJECT_FULL_RE.test(normalized);
+}
+
+/**
+ * Whether `text` ends on a line that is the start of a command keyword
+ * (`/invoke-work`). A stream holds such a chunk back: shown now, it would be a
+ * command fragment on screen that the next chunk turns into a command.
+ */
+function endsWithPartialCommandKeyword(text: string): boolean {
+  const lastLine = text.slice(text.lastIndexOf('\n') + 1);
+  return lastLine !== '' && COMMAND_KEYWORDS.some(keyword => keyword.startsWith(lastLine));
+}
+
+/**
+ * The reply as one string. The first `commandEnd` chunks run through the chunk
+ * that completed a command; whatever arrived after it is still part of the
+ * reply — it may hold another command, or show the first was only an example —
+ * and starts on its own line, so it cannot run into the command's last token
+ * and change what the parser reads.
+ */
+function joinReply(chunks: readonly string[], commandEnd: number | undefined): string {
+  if (commandEnd === undefined) return chunks.join('');
+  const throughCommand = chunks.slice(0, commandEnd).join('');
+  const afterCommand = chunks.slice(commandEnd).join('');
+  if (afterCommand === '' || throughCommand.endsWith('\n')) return throughCommand + afterCommand;
+  return `${throughCommand}\n${afterCommand}`;
 }
 
 /**
@@ -576,10 +605,11 @@ function endOfLine(text: string, from: number): number {
  */
 function textAfterInvokeCommand(text: string, lineStart: number): string {
   const lineEnd = endOfLine(text, lineStart);
-  const quote = /--prompt\s+(["'])/.exec(text.slice(lineStart, lineEnd));
-  if (!quote) return text.slice(lineEnd);
-  const close = text.indexOf(quote[1], lineStart + quote.index + quote[0].length);
-  return close === -1 ? '' : text.slice(endOfLine(text, close));
+  const prompt = /--prompt\s+(?=["'])/.exec(text.slice(lineStart, lineEnd));
+  if (!prompt) return text.slice(lineEnd);
+  const valueStart = lineStart + prompt.index + prompt[0].length;
+  const quoted = CLOSED_QUOTED_VALUE_RE.exec(text.slice(valueStart));
+  return quoted ? text.slice(endOfLine(text, valueStart + quoted[0].length)) : '';
 }
 
 /**
@@ -626,7 +656,11 @@ export function parseOrchestratorCommands(
   const invokeMatch = invokePattern.exec(normalizedResponse);
   const invokeLine = INVOKE_WORKFLOW_PREFIX_RE.exec(normalizedResponse);
   const failInvoke = (cause: InvokeFailureCause, lineStart: number): void => {
-    if (textAfterInvokeCommand(normalizedResponse, lineStart).trim() !== '') return;
+    if (textAfterInvokeCommand(normalizedResponse, lineStart).trim() !== '') {
+      // `cause` holds the reason and the names on the line, never reply text.
+      getLog().debug(cause, 'orchestrator.invoke_example_skipped');
+      return;
+    }
     result.workflowInvocationFailure = {
       ...cause,
       precedingText: normalizedResponse.slice(0, lineStart).trim(),
@@ -2794,12 +2828,10 @@ async function handleStreamMode(
   // What the user has actually been sent: chunks from the command prefix on are
   // withheld, so this can be shorter than the joined reply.
   let streamedText = '';
-  // Assistant text that arrived after the command was complete. It stays out of
-  // `allMessages` (see below) but is still part of the reply.
-  let textAfterCommand = '';
   let newSessionId: string | undefined;
   let commandDetected = false;
-  let commandFullyParsed = false;
+  // How many chunks it took to complete the command; see joinReply.
+  let commandEnd: number | undefined;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
   for await (const msg of aiClient.sendQuery(
@@ -2809,14 +2841,7 @@ async function handleStreamMode(
     requestOptions
   )) {
     if (msg.type === 'assistant' && msg.content) {
-      // Accumulate only while the command is not yet fully captured; post-command
-      // trailing chunks would corrupt the project-name token if joined without a
-      // whitespace boundary, causing the parse regex to overshoot.
-      if (!commandFullyParsed) {
-        allMessages.push(msg.content);
-      } else {
-        textAfterCommand += msg.content;
-      }
+      allMessages.push(msg.content);
       if (!commandDetected) {
         // Check for orchestrator commands BEFORE streaming to frontend.
         // If detected, suppress this chunk and all future chunks — the full
@@ -2828,21 +2853,19 @@ async function handleStreamMode(
           REGISTER_PROJECT_PREFIX_RE.test(normalizedAccumulated)
         ) {
           commandDetected = true;
-          // If the complete command pattern is already present, stop accumulating —
-          // no more chunks needed. This prevents trailing chunks from corrupting
-          // the project-name token when the command was fully emitted in one chunk.
           if (isCommandFullyParsed(accumulated)) {
-            commandFullyParsed = true;
+            commandEnd = allMessages.length;
           }
-        } else {
-          await platform.sendMessage(conversationId, msg.content);
-          streamedText += msg.content;
+        } else if (!endsWithPartialCommandKeyword(normalizedAccumulated)) {
+          // Everything not yet sent, which is this chunk plus any held back
+          // while it could still have become a command keyword.
+          await platform.sendMessage(conversationId, accumulated.slice(streamedText.length));
+          streamedText = accumulated;
         }
-      } else if (!commandFullyParsed) {
-        // Post-prefix: keep accumulating until the full command pattern is present.
-        const accumulated = allMessages.join('');
-        if (isCommandFullyParsed(accumulated)) {
-          commandFullyParsed = true;
+      } else if (commandEnd === undefined) {
+        // Post-prefix: keep reading until the full command pattern is present.
+        if (isCommandFullyParsed(allMessages.join(''))) {
+          commandEnd = allMessages.length;
         }
       }
     } else if (msg.type === 'tool' && msg.toolName) {
@@ -2937,7 +2960,7 @@ async function handleStreamMode(
     return;
   }
 
-  const fullResponse = allMessages.join('');
+  const fullResponse = joinReply(allMessages, commandEnd);
   const commands = parseOrchestratorCommands(
     fullResponse,
     codebases,
@@ -2993,11 +3016,9 @@ async function handleStreamMode(
   }
 
   // Nothing was dispatched, so whatever was withheld from the command prefix on
-  // still has to reach the user: nothing the agent said may be dropped. Text
-  // that arrived after a complete command makes it an example rather than a
-  // launch, the same as text after it in the parsed reply.
-  const withheld = fullResponse.slice(streamedText.length) + textAfterCommand;
-  const invokeFailure = textAfterCommand.trim() === '' ? commands.workflowInvocationFailure : null;
+  // still has to reach the user: nothing the agent said may be dropped.
+  const withheld = fullResponse.slice(streamedText.length);
+  const invokeFailure = commands.workflowInvocationFailure;
   let unsent = withheld;
   let delivered = streamedText + withheld;
   if (invokeFailure) {
@@ -3072,9 +3093,8 @@ async function handleBatchMode(
   let totalChunksTruncated = false;
   let newSessionId: string | undefined;
   let commandDetected = false;
-  let commandFullyParsed = false;
-  // Whether assistant text arrived after the command was complete.
-  let textAfterCommand = false;
+  // How many chunks it took to complete the command; see joinReply.
+  let commandEnd: number | undefined;
   let lastResult: { cost?: number; tokens?: TokenUsage; stopReason?: string } | undefined;
 
   for await (const msg of aiClient.sendQuery(
@@ -3084,28 +3104,17 @@ async function handleBatchMode(
     requestOptions
   )) {
     if (msg.type === 'assistant' && msg.content) {
-      // Always record in allChunks for debug logging; accumulate assistantMessages
-      // only while the command is not yet fully captured (same reason as stream mode).
+      // allChunks is the capped debug record; assistantMessages is the reply.
       allChunks.push({ type: 'assistant', content: msg.content });
-      if (!commandFullyParsed) {
-        assistantMessages.push(msg.content);
-      } else if (msg.content.trim() !== '') {
-        textAfterCommand = true;
-      }
+      assistantMessages.push(msg.content);
 
       // Cap assistant-only chunks while no command has been detected.  Once
       // commandDetected flips to true we stop shifting so that all tokens of
-      // the in-flight command are preserved — shifting the prefix away would
-      // break both the prefix and full-command regexes.  As a consequence, if
-      // the AI starts a command prefix but never completes it, assistantMessages
-      // can grow unbounded from the per-assistant perspective; the outer
-      // MAX_BATCH_TOTAL_CHUNKS guard on allChunks (below) is the true hard cap
-      // for that edge case.
-      if (
-        !commandDetected &&
-        !commandFullyParsed &&
-        assistantMessages.length > MAX_BATCH_ASSISTANT_CHUNKS
-      ) {
+      // the in-flight command, and whatever the reply says after it, are
+      // preserved — shifting the prefix away would break both the prefix and
+      // full-command regexes.  As a consequence assistantMessages is not
+      // capped from the command prefix on.
+      if (!commandDetected && assistantMessages.length > MAX_BATCH_ASSISTANT_CHUNKS) {
         assistantMessages.shift();
         assistantChunksTruncated = true;
       }
@@ -3119,13 +3128,12 @@ async function handleBatchMode(
         ) {
           commandDetected = true;
           if (isCommandFullyParsed(accumulated)) {
-            commandFullyParsed = true;
+            commandEnd = assistantMessages.length;
           }
         }
-      } else if (!commandFullyParsed) {
-        const accumulated = assistantMessages.join('');
-        if (isCommandFullyParsed(accumulated)) {
-          commandFullyParsed = true;
+      } else if (commandEnd === undefined) {
+        if (isCommandFullyParsed(assistantMessages.join(''))) {
+          commandEnd = assistantMessages.length;
         }
       }
     } else if (msg.type === 'tool' && msg.toolName) {
@@ -3241,8 +3249,9 @@ async function handleBatchMode(
   // separator lines that break multi-chunk command text (name and path appear on
   // separate lines from '/register-project'). Raw join preserves the command as a
   // contiguous string. User-visible output still comes from filterToolIndicators.
+  const rawReply = joinReply(assistantMessages, commandEnd);
   const commands = parseOrchestratorCommands(
-    assistantMessages.join(''),
+    rawReply,
     codebases,
     workflows.map(ws => ws.workflow)
   );
@@ -3284,7 +3293,7 @@ async function handleBatchMode(
         conversationId,
         conversation,
         workflows,
-        assistantMessages.join(''),
+        rawReply,
         originalMessage,
         isolationHints,
         issueContext,
@@ -3297,9 +3306,7 @@ async function handleBatchMode(
   // No orchestrator commands — send the clean response. A reply that tried to
   // invoke a workflow and started nothing goes out without the command line and
   // with the reason in its place, so the user is not left waiting for a run.
-  // Text that arrived after a complete command makes it an example rather than
-  // a launch, the same as text after it in the parsed reply.
-  const invokeFailure = textAfterCommand ? null : commands.workflowInvocationFailure;
+  const invokeFailure = commands.workflowInvocationFailure;
   const reply = invokeFailure
     ? [
         invokeFailure.precedingText,
