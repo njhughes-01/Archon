@@ -77,6 +77,10 @@
       "src/codex/binary-resolver-dev.test.ts"
     ],
     [
+      "src/codex/tool-gate-request.test.ts",
+      "src/codex/tool-gate-bridge.test.ts"
+    ],
+    [
       "src/claude/binary-resolver.test.ts"
     ],
     [
@@ -162,6 +166,9 @@
     ],
     [
       "src/shared/resumed.test.ts"
+    ],
+    [
+      "src/shared/tool-gate.test.ts"
     ],
     [
       "src/claude/container-spawn.test.ts"

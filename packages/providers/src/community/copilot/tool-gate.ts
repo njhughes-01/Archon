@@ -38,10 +38,15 @@
 import { createLogger } from '@archon/paths';
 import type { SessionConfig } from '@github/copilot-sdk';
 
-import type { ToolActionDecision, ToolActionKind, ToolActionRequest } from '../../types';
+import type { ToolActionKind, ToolActionRequest } from '../../types';
+import {
+  askToolGate,
+  formatToolGateDenial,
+  toolGateFailure,
+  type ToolGate,
+  type ToolGateDenial,
+} from '../../shared/tool-gate';
 
-type ToolGate = (request: ToolActionRequest) => Promise<ToolActionDecision>;
-type ToolGateDenial = Extract<ToolActionDecision, { action: 'deny' }>;
 // `SessionHooks` is declared by the SDK but not re-exported from its barrel.
 type PreToolUseHandler = NonNullable<NonNullable<SessionConfig['hooks']>['onPreToolUse']>;
 
@@ -168,62 +173,6 @@ export function toCopilotToolAction(
   };
 }
 
-function gateFailure(reason: string): ToolGateDenial {
-  return {
-    action: 'deny',
-    needsApproval: false,
-    reason,
-    alternatives: [
-      'Continue with work that does not need this tool call.',
-      'Report the work as blocked.',
-    ],
-  };
-}
-
-/** The denial as the model reads it: the reason, then each alternative on its own line. */
-export function formatToolGateDenial(denial: ToolGateDenial): string {
-  const lines = [`Blocked by the tool gate: ${denial.reason}`];
-  if (denial.alternatives.length > 0) {
-    lines.push('Alternatives:', ...denial.alternatives.map(alternative => `- ${alternative}`));
-  }
-  return lines.join('\n');
-}
-
-/**
- * Ask the gate. Anything other than a well-formed `allow` is a denial: a
- * rejected promise and a malformed answer are gate failures, never permission.
- */
-async function askToolGate(
-  toolGate: ToolGate,
-  request: ToolActionRequest
-): Promise<ToolActionDecision> {
-  try {
-    const decision: unknown = await toolGate(request);
-    if (isRecord(decision)) {
-      if (decision.action === 'allow') return { action: 'allow' };
-      if (
-        decision.action === 'deny' &&
-        typeof decision.reason === 'string' &&
-        Array.isArray(decision.alternatives)
-      ) {
-        return decision as ToolGateDenial;
-      }
-    }
-    getLog().error(
-      { toolName: request.toolName, kind: request.kind },
-      'copilot.tool_gate_malformed'
-    );
-    return gateFailure('The tool gate gave no usable answer, so this call was not allowed.');
-  } catch (err) {
-    // The request is not logged: its input can hold secrets.
-    getLog().error(
-      { err, toolName: request.toolName, kind: request.kind },
-      'copilot.tool_gate_failed'
-    );
-    return gateFailure('The tool gate failed, so this call was not allowed.');
-  }
-}
-
 /**
  * Build the `onPreToolUse` handler for one request. `requestCwd` is used only
  * when the runtime's hook input carries no working directory.
@@ -248,12 +197,12 @@ export function buildToolGateHook(
         mcpServerNames
       );
       if (!request) return undefined;
-      const decision = await askToolGate(toolGate, request);
+      const decision = await askToolGate(toolGate, request, getLog(), 'copilot');
       if (decision.action === 'allow') return undefined;
       denial = decision;
     } catch (err) {
       getLog().error({ err }, 'copilot.tool_gate_hook_failed');
-      denial = gateFailure('The tool gate failed, so this call was not allowed.');
+      denial = toolGateFailure('The tool gate failed, so this call was not allowed.');
     }
     return {
       permissionDecision: 'deny',

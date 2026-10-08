@@ -28,11 +28,15 @@ import type {
 import { createLogger } from '@archon/paths';
 
 import type { ToolActionDecision, ToolActionKind, ToolActionRequest } from '../types';
+import {
+  askToolGate,
+  formatToolGateDenial,
+  toolGateFailure,
+  type ToolGate,
+  type ToolGateDenial,
+} from '../shared/tool-gate';
 import type { ClaudeKnownToolName } from './capabilities';
 import { ARCHON_TOOL_SERVER } from './native-tools';
-
-type ToolGate = (request: ToolActionRequest) => Promise<ToolActionDecision>;
-type ToolGateDenial = Extract<ToolActionDecision, { action: 'deny' }>;
 
 let cachedLog: ReturnType<typeof createLogger> | undefined;
 function getLog(): ReturnType<typeof createLogger> {
@@ -124,62 +128,6 @@ export function toClaudeToolAction(
   };
 }
 
-function gateFailure(reason: string): ToolGateDenial {
-  return {
-    action: 'deny',
-    needsApproval: false,
-    reason,
-    alternatives: [
-      'Continue with work that does not need this tool call.',
-      'Report the work as blocked.',
-    ],
-  };
-}
-
-/** The denial as the model reads it: the reason, then each alternative on its own line. */
-export function formatToolGateDenial(denial: ToolGateDenial): string {
-  const lines = [`Blocked by the tool gate: ${denial.reason}`];
-  if (denial.alternatives.length > 0) {
-    lines.push('Alternatives:', ...denial.alternatives.map(alternative => `- ${alternative}`));
-  }
-  return lines.join('\n');
-}
-
-/**
- * Ask the gate. Anything other than a well-formed `allow` is a denial: a
- * rejected promise and a malformed answer are gate failures, never permission.
- */
-async function askToolGate(
-  toolGate: ToolGate,
-  request: ToolActionRequest
-): Promise<ToolActionDecision> {
-  try {
-    const decision: unknown = await toolGate(request);
-    if (isRecord(decision)) {
-      if (decision.action === 'allow') return { action: 'allow' };
-      if (
-        decision.action === 'deny' &&
-        typeof decision.reason === 'string' &&
-        Array.isArray(decision.alternatives)
-      ) {
-        return decision as ToolGateDenial;
-      }
-    }
-    getLog().error(
-      { toolName: request.toolName, kind: request.kind },
-      'claude.tool_gate_malformed'
-    );
-    return gateFailure('The tool gate gave no usable answer, so this call was not allowed.');
-  } catch (err) {
-    // The request is not logged: its input can hold secrets.
-    getLog().error(
-      { err, toolName: request.toolName, kind: request.kind },
-      'claude.tool_gate_failed'
-    );
-    return gateFailure('The tool gate failed, so this call was not allowed.');
-  }
-}
-
 function denyOutput(denial: ToolGateDenial): HookJSONOutput {
   return {
     hookSpecificOutput: {
@@ -239,11 +187,13 @@ export function withToolGateHooks(
     const request = toClaudeToolAction(input, archonNativeTools);
     if (!request) return Promise.resolve({ action: 'allow' });
     if (signal.aborted) {
-      return Promise.resolve(gateFailure('The run was cancelled before this call was checked.'));
+      return Promise.resolve(
+        toolGateFailure('The run was cancelled before this call was checked.')
+      );
     }
     const known = verdicts.get(input.tool_use_id);
     if (known) return known;
-    const asked = askToolGate(toolGate, request);
+    const asked = askToolGate(toolGate, request, getLog(), 'claude');
     verdicts.set(input.tool_use_id, asked);
     return asked;
   };
@@ -267,7 +217,7 @@ export function withToolGateHooks(
       if (rewritten) {
         const request = toClaudeToolAction({ ...input, tool_input: rewritten }, archonNativeTools);
         const rewrittenVerdict = request
-          ? await askToolGate(toolGate, request)
+          ? await askToolGate(toolGate, request, getLog(), 'claude')
           : ({ action: 'allow' } as const);
         if (rewrittenVerdict.action === 'deny') return deny(input, rewrittenVerdict);
       }

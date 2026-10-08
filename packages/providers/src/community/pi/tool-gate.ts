@@ -19,10 +19,8 @@
 import { createLogger } from '@archon/paths';
 import type { ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
-import type { ToolActionDecision, ToolActionKind, ToolActionRequest } from '../../types';
-
-type ToolGate = (request: ToolActionRequest) => Promise<ToolActionDecision>;
-type ToolGateDenial = Extract<ToolActionDecision, { action: 'deny' }>;
+import type { ToolActionKind, ToolActionRequest } from '../../types';
+import { askToolGate, formatToolGateDenial, type ToolGate } from '../../shared/tool-gate';
 
 /**
  * Pi's built-in tool names, taken from the SDK's own tool-call event union
@@ -65,56 +63,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function gateFailure(reason: string): ToolGateDenial {
-  return {
-    action: 'deny',
-    needsApproval: false,
-    reason,
-    alternatives: [
-      'Continue with work that does not need this tool call.',
-      'Report the work as blocked.',
-    ],
-  };
-}
-
-/** The denial as the model reads it: the reason, then each alternative on its own line. */
-export function formatToolGateDenial(denial: ToolGateDenial): string {
-  const lines = [`Blocked by the tool gate: ${denial.reason}`];
-  if (denial.alternatives.length > 0) {
-    lines.push('Alternatives:', ...denial.alternatives.map(alternative => `- ${alternative}`));
-  }
-  return lines.join('\n');
-}
-
-/**
- * Ask the gate. Anything other than a well-formed `allow` is a denial: a
- * rejected promise and a malformed answer are gate failures, never permission.
- */
-async function askToolGate(
-  toolGate: ToolGate,
-  request: ToolActionRequest
-): Promise<ToolActionDecision> {
-  try {
-    const decision: unknown = await toolGate(request);
-    if (isRecord(decision)) {
-      if (decision.action === 'allow') return { action: 'allow' };
-      if (
-        decision.action === 'deny' &&
-        typeof decision.reason === 'string' &&
-        Array.isArray(decision.alternatives)
-      ) {
-        return decision as ToolGateDenial;
-      }
-    }
-    getLog().error({ toolName: request.toolName, kind: request.kind }, 'pi.tool_gate_malformed');
-    return gateFailure('The tool gate gave no usable answer, so this call was not allowed.');
-  } catch (err) {
-    // The request is not logged: its input can hold secrets.
-    getLog().error({ err, toolName: request.toolName, kind: request.kind }, 'pi.tool_gate_failed');
-    return gateFailure('The tool gate failed, so this call was not allowed.');
-  }
-}
-
 function gatePiTool<T extends GateablePiTool>(
   tool: T,
   kind: ToolActionKind,
@@ -127,7 +75,7 @@ function gatePiTool<T extends GateablePiTool>(
     ...rest: unknown[]
   ): Promise<unknown> => {
     const input = isRecord(params) ? params : {};
-    const decision = await askToolGate(toolGate, {
+    const request: ToolActionRequest = {
       toolName: tool.name,
       kind,
       cwd,
@@ -135,7 +83,8 @@ function gatePiTool<T extends GateablePiTool>(
       ...(kind === 'file_write' && typeof input.path === 'string' ? { paths: [input.path] } : {}),
       input,
       toolCallId,
-    });
+    };
+    const decision = await askToolGate(toolGate, request, getLog(), 'pi');
     if (decision.action === 'deny') throw new Error(formatToolGateDenial(decision));
     // Every argument Pi passed goes through unchanged, including the ones a
     // `ToolDefinition` takes beyond an `AgentTool` (the extension context).
