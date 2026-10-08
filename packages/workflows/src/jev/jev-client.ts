@@ -1,10 +1,10 @@
 /**
  * The Jev wire format (TypeSafe System One, docs.typesafe.ai/api.md) — and the only module
- * that knows it. Callers describe `choice` or `noul` questions and get back typed results,
+ * that knows it. Callers describe `choice`, `noul` or `score` questions and get back typed results,
  * so the endpoint can be any Jev-compatible service: nothing here depends on the host, and
  * the response's `model` and `usage` are not read.
  *
- * Deliberately narrow: two question types, no retries, and no imports at all. A caller
+ * Deliberately narrow: three question types, no retries, and no imports at all. A caller
  * that cannot get an answer keeps its behaviour without one, so every failure is a value,
  * never a throw.
  */
@@ -26,7 +26,13 @@ export interface JevConnection {
   fetch?: Fetch;
 }
 
-export type JevFailureReason = 'timeout' | 'http_error' | 'malformed_response' | 'network_error';
+/** `invalid_request` is returned before anything is sent, for a question that cannot be asked. */
+export type JevFailureReason =
+  | 'timeout'
+  | 'http_error'
+  | 'malformed_response'
+  | 'network_error'
+  | 'invalid_request';
 
 export interface JevFailure {
   ok: false;
@@ -87,7 +93,78 @@ export type JevNoulResult =
     }
   | JevFailure;
 
+/** A rating question. `criteria` is ordered low to high; level `i` is `criteria[i]`. */
+export interface JevScoreQuestion {
+  instructions: string;
+  /** 2 to 10 level descriptions, lowest first. */
+  criteria: readonly string[];
+}
+
+export interface JevScoreRequest extends JevConnection, JevScoreQuestion {
+  /** Question name; the answer is read back under the same name. */
+  name: string;
+  state: Readonly<Record<string, JevStateValue>>;
+}
+
+export type JevScoreResult =
+  | {
+      ok: true;
+      /** Probability-weighted mean level, 0-based, so it may be fractional. */
+      score: number;
+      legend?: Record<string, string>;
+      probabilities: Record<string, number>;
+      confidence: number;
+    }
+  | JevFailure;
+
+/** Smallest and largest number of levels a score question may have. */
+export const JEV_SCORE_MIN_LEVELS = 2;
+export const JEV_SCORE_MAX_LEVELS = 10;
+
+/** One question of a mixed call, tagged with its wire `type`. */
+export type JevQuestion =
+  | {
+      type: 'choice';
+      instructions: string;
+      criteria: Readonly<Record<string, string | null>>;
+    }
+  | ({ type: 'noul' } & JevNoulQuestion)
+  | ({ type: 'score' } & JevScoreQuestion);
+
+/** The answer to a `JevQuestion` of the same `type`. */
+export type JevAnswer =
+  | {
+      type: 'choice';
+      choice: string;
+      probability: number;
+      confidence: number;
+      probabilities: Record<string, number>;
+    }
+  | { type: 'noul'; noul: number }
+  | {
+      type: 'score';
+      score: number;
+      legend?: Record<string, string>;
+      probabilities: Record<string, number>;
+      confidence: number;
+    };
+
+export interface JevRequest extends JevConnection {
+  /** Question name to question. Every question is answered over the same `state`. */
+  questions: Readonly<Record<string, JevQuestion>>;
+  state: Readonly<Record<string, JevStateValue>>;
+}
+
+export type JevResult =
+  | {
+      ok: true;
+      /** Question name to its answer. Exactly the names asked, each of its own type. */
+      answers: Record<string, JevAnswer>;
+    }
+  | JevFailure;
+
 const MALFORMED: JevFailure = { ok: false, reason: 'malformed_response' };
+const INVALID_REQUEST: JevFailure = { ok: false, reason: 'invalid_request' };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -95,6 +172,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isNumberRecord(value: unknown): value is Record<string, number> {
   return isRecord(value) && Object.values(value).every(entry => typeof entry === 'number');
+}
+
+function isUnit(value: unknown): value is number {
+  return typeof value === 'number' && value >= 0 && value <= 1;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return isRecord(value) && Object.values(value).every(entry => typeof entry === 'string');
 }
 
 /**
@@ -109,14 +194,46 @@ function readAnswer(body: unknown, name: string, type: string): Record<string, u
   return isRecord(answer) && answer.type === type ? answer : null;
 }
 
+type ChoiceAnswer = Extract<JevAnswer, { type: 'choice' }>;
+type ScoreAnswer = Extract<JevAnswer, { type: 'score' }>;
+
+function toChoiceAnswer(answer: Record<string, unknown>): ChoiceAnswer | null {
+  const { choice, probabilities, confidence } = answer;
+  if (typeof choice !== 'string' || !isUnit(confidence)) return null;
+  if (!isNumberRecord(probabilities) || !Object.hasOwn(probabilities, choice)) return null;
+  return {
+    type: 'choice',
+    choice,
+    probability: probabilities[choice],
+    confidence,
+    probabilities,
+  };
+}
+
+function toScoreAnswer(answer: Record<string, unknown>, levels: number): ScoreAnswer | null {
+  const { score, legend, probabilities, confidence } = answer;
+  if (typeof score !== 'number' || !Number.isFinite(score) || score < 0 || score > levels - 1) {
+    return null;
+  }
+  if (!isUnit(confidence)) return null;
+  if (!isNumberRecord(probabilities) || !Object.values(probabilities).every(isUnit)) return null;
+  if (legend === undefined) return { type: 'score', score, probabilities, confidence };
+  if (!isStringRecord(legend)) return null;
+  return { type: 'score', score, legend, probabilities, confidence };
+}
+
 /** Read the answer to the choice question called `name` out of a parsed response body. */
 export function parseJevChoiceResponse(body: unknown, name: string): JevChoiceResult {
   const answer = readAnswer(body, name, 'choice');
-  if (answer === null) return MALFORMED;
-  const { choice, probabilities, confidence } = answer;
-  if (typeof choice !== 'string' || typeof confidence !== 'number') return MALFORMED;
-  if (!isNumberRecord(probabilities) || !Object.hasOwn(probabilities, choice)) return MALFORMED;
-  return { ok: true, choice, probability: probabilities[choice], confidence, probabilities };
+  const parsed = answer === null ? null : toChoiceAnswer(answer);
+  if (parsed === null) return MALFORMED;
+  return {
+    ok: true,
+    choice: parsed.choice,
+    probability: parsed.probability,
+    confidence: parsed.confidence,
+    probabilities: parsed.probabilities,
+  };
 }
 
 /**
@@ -127,8 +244,47 @@ export function parseJevNoulResponse(body: unknown, names: readonly string[]): J
   const answers: Record<string, number> = {};
   for (const name of names) {
     const noul = readAnswer(body, name, 'noul')?.noul;
-    if (typeof noul !== 'number' || !(noul >= 0 && noul <= 1)) return MALFORMED;
+    if (!isUnit(noul)) return MALFORMED;
     answers[name] = noul;
+  }
+  return { ok: true, answers };
+}
+
+/**
+ * Read the answer to the score question called `name`, asked with `levels` levels. The
+ * score must lie within the asked range, so a response for a different question is refused.
+ */
+export function parseJevScoreResponse(body: unknown, name: string, levels: number): JevScoreResult {
+  const answer = readAnswer(body, name, 'score');
+  const parsed = answer === null ? null : toScoreAnswer(answer, levels);
+  if (parsed === null) return MALFORMED;
+  return {
+    ok: true,
+    score: parsed.score,
+    ...(parsed.legend ? { legend: parsed.legend } : {}),
+    probabilities: parsed.probabilities,
+    confidence: parsed.confidence,
+  };
+}
+
+/**
+ * Read the answer to every question in `questions`, each as its own type. One missing,
+ * mistyped or unusable answer makes the whole response malformed.
+ */
+export function parseJevResponse(
+  body: unknown,
+  questions: Readonly<Record<string, JevQuestion>>
+): JevResult {
+  const answers: Record<string, JevAnswer> = {};
+  for (const [name, question] of Object.entries(questions)) {
+    const answer = readAnswer(body, name, question.type);
+    if (answer === null) return MALFORMED;
+    let parsed: JevAnswer | null;
+    if (question.type === 'choice') parsed = toChoiceAnswer(answer);
+    else if (question.type === 'score') parsed = toScoreAnswer(answer, question.criteria.length);
+    else parsed = isUnit(answer.noul) ? { type: 'noul', noul: answer.noul } : null;
+    if (parsed === null) return MALFORMED;
+    answers[name] = parsed;
   }
   return { ok: true, answers };
 }
@@ -199,4 +355,54 @@ export async function askJevNoul(request: JevNoulRequest): Promise<JevNoulResult
   );
   const posted = await postJev(request, request.state, questions);
   return posted.ok ? parseJevNoulResponse(posted.body, names) : posted;
+}
+
+function hasValidLevels(question: JevScoreQuestion): boolean {
+  return (
+    question.criteria.length >= JEV_SCORE_MIN_LEVELS &&
+    question.criteria.length <= JEV_SCORE_MAX_LEVELS
+  );
+}
+
+/**
+ * Ask one `score` question. A level count outside 2..10 comes back as `invalid_request`
+ * without a request being sent; every other failure is as for `askJevChoice`.
+ */
+export async function askJevScore(request: JevScoreRequest): Promise<JevScoreResult> {
+  if (!hasValidLevels(request)) return INVALID_REQUEST;
+  const posted = await postJev(request, request.state, {
+    [request.name]: {
+      type: 'score',
+      instructions: request.instructions,
+      criteria: request.criteria,
+    },
+  });
+  return posted.ok
+    ? parseJevScoreResponse(posted.body, request.name, request.criteria.length)
+    : posted;
+}
+
+/**
+ * Ask questions of any mix of types over one shared state, in one request. Never throws,
+ * and never returns a partial answer set: see `parseJevResponse`. No questions, or a score
+ * question with fewer than 2 or more than 10 levels, is `invalid_request` and sends nothing.
+ */
+export async function askJev(request: JevRequest): Promise<JevResult> {
+  const names = Object.keys(request.questions);
+  if (names.length === 0) return INVALID_REQUEST;
+  for (const name of names) {
+    const question = request.questions[name];
+    if (question.type === 'score' && !hasValidLevels(question)) return INVALID_REQUEST;
+  }
+  const questions = Object.fromEntries(
+    names.map(name => {
+      const question = request.questions[name];
+      if (question.type === 'noul' && question.criteria === undefined) {
+        return [name, { type: 'noul', instructions: question.instructions }];
+      }
+      return [name, question];
+    })
+  );
+  const posted = await postJev(request, request.state, questions);
+  return posted.ok ? parseJevResponse(posted.body, request.questions) : posted;
 }
