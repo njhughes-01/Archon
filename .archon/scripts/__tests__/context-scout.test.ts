@@ -3,7 +3,7 @@
  * replaced: `fetch` is injected, and every file listing comes from a real git checkout.
  */
 import { describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
@@ -205,12 +205,19 @@ describe('readScoutSettings', () => {
     ['JEV_SCOUT_WINDOW_LINES', '0'],
     ['JEV_SCOUT_WINDOW_LINES', '12.5'],
     ['JEV_SCOUT_PARALLELISM', '-1'],
+    // More requests at once than any classifier endpoint should be handed by one run.
+    ['JEV_SCOUT_PARALLELISM', '17'],
     ['JEV_SCOUT_MAX_FILES', 'many'],
   ])('is unavailable when %s is %s', (name, value) => {
     expect(readScoutSettings({ JEV_API_KEY: 'k', [name]: value })).toEqual({
       available: false,
       reason: `invalid_setting:${name}`,
     });
+  });
+
+  it('accepts the largest parallelism it allows', () => {
+    const read = readScoutSettings({ JEV_API_KEY: 'k', JEV_SCOUT_PARALLELISM: '16' });
+    expect(read.available && read.settings.parallelism).toBe(16);
   });
 
   it('is unavailable when the overlap is not smaller than the window', () => {
@@ -264,6 +271,23 @@ describe('isSecretPath', () => {
     'infra/prod.tfvars',
     'infra/terraform.tfstate',
     'k8s/secrets/db.yaml',
+    // A secret store keeps its name whatever is appended to it.
+    'config/secrets.enc.yaml',
+    'config/credentials.yml.enc',
+    'config/secret.json.bak',
+    'home/.netrc.bak',
+    'backup/id_rsa.bak',
+    'backup/id_rsa.old.pub',
+    // Hardware-backed and renamed key files.
+    'keys/id_ed25519_sk',
+    'keys/id_ecdsa_sk.pub',
+    'keys/id_rsa_deploy',
+    // Env files written without the leading dot, and directories of them.
+    'env',
+    'env.production',
+    'deploy/env.local',
+    '.env.d/database',
+    '.envs/production/app.yaml',
   ])('excludes %s', path => {
     expect(isSecretPath(path)).toBe(true);
   });
@@ -276,6 +300,14 @@ describe('isSecretPath', () => {
     'src/keyboard.ts',
     'src/env.ts',
     'README.md',
+    // Code that reads the environment is code.
+    'types/env.d.ts',
+    'app/env.py',
+    'web/env.mjs',
+    'src/environment/load.ts',
+    'src/id_generator.ts',
+    'src/secretary.ts',
+    'docs/credentials-guide.md',
   ])('keeps %s', path => {
     expect(isSecretPath(path)).toBe(false);
   });
@@ -357,6 +389,7 @@ describe('classifyFiles', () => {
           evidence: { startLine: 1, endLine: 5 },
         },
       ],
+      skipped: [],
       counts: {
         classified: 2,
         relevant: 1,
@@ -513,8 +546,37 @@ describe('classifyFiles', () => {
     expect(result.status).toBe('truncated');
     expect(result.reason).toBe('window_too_large');
     expect(result.files.map(entry => entry.path)).toEqual(['a.ts']);
+    // Named, so the reader knows which file to open for themselves.
+    expect(result.skipped).toEqual([{ path: 'wide.ts', reason: 'window_too_large' }]);
     expect(result.counts.unclassified).toBe(1);
     expect(jev.bodies.join('')).not.toContain('xxxxxxxxxx');
+  });
+
+  it('names every file it passed over, and only those, when a budget also cuts the run', async () => {
+    const jev = fakeJev(() => 0.9);
+
+    const result = await classifyFiles({
+      question: QUESTION,
+      files: [
+        { path: 'wide.ts', text: 'x'.repeat(5000) },
+        file('a.ts', 2),
+        { path: 'wider.ts', text: 'y'.repeat(9000) },
+        file('b.ts', 2),
+        file('c.ts', 2),
+      ],
+      settings: settings({ maxRequestChars: 2000, maxFiles: 2 }),
+      fetch: jev.fetch,
+    });
+
+    expect(result.status).toBe('truncated');
+    // The budget is the reason for the run as a whole; the list carries the rest.
+    expect(result.reason).toBe('max_files');
+    expect(result.files.map(entry => entry.path)).toEqual(['a.ts', 'b.ts']);
+    expect(result.skipped).toEqual([
+      { path: 'wide.ts', reason: 'window_too_large' },
+      { path: 'wider.ts', reason: 'window_too_large' },
+    ]);
+    expect(result.counts.unclassified).toBe(3);
   });
 
   it('never runs more requests at once than the configured parallelism', async () => {
@@ -583,6 +645,7 @@ describe('classifyFiles', () => {
       status: 'unavailable',
       reason,
       files: [],
+      skipped: [],
       counts: {
         classified: 0,
         relevant: 0,
@@ -897,21 +960,91 @@ describe('runScout', () => {
     expect(jev.bodies).toEqual([]);
   });
 
-  it('is unavailable when a path reaches outside the checkout', async () => {
-    const root = repo({ 'a.ts': 'a' });
+  // An agent wrote these paths. One git cannot use must not cost the run the others.
+  it('passes over the paths git rejects, counts them, and scouts the rest', async () => {
+    const root = repo({ 'src/a.ts': 'a', 'docs/b.md': 'b', 'other/c.ts': 'c' });
     const jev = fakeJev(() => 0.9);
 
     const result = await runScout({
       question: QUESTION,
-      paths: '["../"]',
+      paths: JSON.stringify(['src', '../outside', ':(bogus)src', '/etc', 'docs', 'no/such/dir']),
       cwd: root,
       env: ENV,
       fetch: jev.fetch,
     });
 
-    expect(result.status).toBe('unavailable');
-    expect(result.reason).toBe('git_failed');
+    expect(result.status).toBe('ok');
+    expect(result.files.map(entry => entry.path).sort()).toEqual(['docs/b.md', 'src/a.ts']);
+    // Outside the checkout twice, and magic git does not know. A path that merely
+    // matches nothing is not rejected: it selects no files.
+    expect(result.counts.badPaths).toBe(3);
+    expect(result.counts.candidates).toBe(2);
+  });
+
+  it('scouts nothing, and never the whole checkout, when git rejects every path', async () => {
+    const root = repo({ 'a.ts': 'a' });
+    const jev = fakeJev(() => 0.9);
+
+    const result = await runScout({
+      question: QUESTION,
+      paths: '["../", "/etc/passwd"]',
+      cwd: root,
+      env: ENV,
+      fetch: jev.fetch,
+    });
+
+    expect(result.status).toBe('ok');
+    expect(result.files).toEqual([]);
+    expect(result.counts).toMatchObject({ badPaths: 2, candidates: 0 });
     expect(jev.bodies).toEqual([]);
+  });
+
+  // The index still names the file, but its directory is now a link out of the checkout.
+  // Reading through it would send a file git never held.
+  it('never reads through a directory that has become a symlink out of the checkout', async () => {
+    const outside = trackTempRoot(mkdtempSync(join(tmpdir(), 'context-scout-outside-dir-')));
+    writeFileSync(join(outside, 'code.ts'), 'export const leaked = "PLANTED_DIR_SYMLINK";\n');
+    const root = repo({
+      'vendor/lib/code.ts': 'export const tracked = 1;\n',
+      'src/app.ts': 'export const visible = "SENT_MARKER";\n',
+    });
+    rmSync(join(root, 'vendor/lib'), { recursive: true });
+    symlinkSync(outside, join(root, 'vendor/lib'));
+    const jev = fakeJev(() => 0.9);
+
+    const result = await runScout({
+      question: QUESTION,
+      paths: '',
+      cwd: root,
+      env: ENV,
+      fetch: jev.fetch,
+    });
+
+    const sent = jev.bodies.join('\n');
+    expect(sent).toContain('SENT_MARKER');
+    expect(sent).not.toContain('PLANTED');
+    expect(result.files.map(entry => entry.path)).toEqual(['src/app.ts']);
+    expect(result.counts.excluded.not_regular_file).toBe(1);
+  });
+
+  it('reads a file inside a symlinked directory that stays within the checkout', async () => {
+    const root = repo({ 'real/code.ts': 'export const inside = "SENT_MARKER";\n' });
+    symlinkSync(join(root, 'real'), join(root, 'alias'));
+    git(root, 'add', '--force', 'alias');
+    git(root, 'commit', '-q', '-m', 'alias');
+    const jev = fakeJev(() => 0.9);
+
+    const result = await runScout({
+      question: QUESTION,
+      paths: '',
+      cwd: root,
+      env: ENV,
+      fetch: jev.fetch,
+    });
+
+    // The link itself is not a file; the real file behind it is read once, by its own path.
+    expect(result.files.map(entry => entry.path)).toEqual(['real/code.ts']);
+    expect(result.counts.excluded.not_regular_file).toBe(1);
   });
 
   it('reports a classifier failure as unavailable rather than throwing', async () => {

@@ -134,14 +134,17 @@ and `plan` include before their agent: a classifier answers one yes/no question
 about every candidate file, in line windows, and the agent starts from the files
 it selected. Three nodes, each doing the one thing its kind is for:
 
-- `config` (script) reports whether a classifier is configured. `when:` cannot
+- `config` (shell) reports whether a classifier is configured. `when:` cannot
   read the environment, so this is the gate that keeps an install without one
-  from paying for the next node.
+  from paying for anything after it. It is `bash:` text using shell built-ins
+  only, because it runs on every investigate and plan, including where Bun is
+  not installed.
 - `question` (agent, small tier) turns the free-text request into one question
   and the paths worth checking, or declines. That is judgment, so no script
   attempts it.
 - `classify` (script) is everything after the judgment: which files may be sent,
-  the budgets, the requests, the result.
+  the budgets, the requests, the result. It is the only node here that needs
+  Bun, and it runs only once the gate says a classifier is configured.
 
 [`.shared/context-scout.ts`](.shared/context-scout.ts) owns all of the last one,
 and it is where to read what "never sent" means. The settings are environment
@@ -149,11 +152,15 @@ variables, documented with the rest of the configuration reference.
 
 Two rules hold it together:
 
-- **The scout can never cost the run.** Every way it cannot answer is a result
-  (`status: unavailable`, with the reason) or a skip, and a consumer binds its
-  output with `if_skipped`. The one exception is the `question` agent itself: it
-  only runs once a classifier is configured, and its failure fails the run like
-  any other agent node's.
+- **Without a classifier it costs nothing; with one, its nodes can fail the
+  run.** No key means the gate alone runs and the consumer reads its
+  `if_skipped` value. With a key, every way the classifier cannot answer is
+  still a result (`status: unavailable`, with the reason), but the scout's own
+  nodes are ordinary nodes and the engine has none that is optional: when the
+  `question` agent still fails after its five retries, or `classify` cannot
+  start because Bun is missing, the run fails before the consumer's agent
+  starts. It is resumable, and `JEV_SCOUT_ENABLED=0` turns the scout off. Do not
+  describe the scout as unable to fail a run.
 - **Its list is a lead, never evidence.** The prompts that read it say so. A file
   the budget cut is counted as unclassified and left out; it is never listed as
   not relevant.
@@ -161,7 +168,9 @@ Two rules hold it together:
 [`.shared/jev-client.ts`](.shared/jev-client.ts) is a byte-for-byte copy of
 `packages/workflows/src/jev/jev-client.ts`, because nothing in a pack can import
 engine code. Edit the engine file and copy it over; `jev-client-mirror.test.ts`
-fails while they differ.
+fails while they differ. The gate's shell text and `readScoutSettings` are the
+other pair that must agree, in two languages; `context-scout-script.test.ts`
+runs the gate under `sh` and `bash` with an empty `PATH` against that function.
 
 Whether the classifier is good enough is measured, not assumed:
 `bun run scout-eval` runs the same code over a labelled fixture repository and

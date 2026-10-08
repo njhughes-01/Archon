@@ -20,8 +20,10 @@ scout__classify:
       relevant: false
       confidence: 0.08
       evidence: { startLine: 1, endLine: 64 }
+  skipped: []
   counts:
     candidates: 9
+    badPaths: 0
     excluded: { ignored: 0, secret: 1, not_regular_file: 0, too_large: 0, binary: 0, empty: 0 }
     classified: 2
     relevant: 1

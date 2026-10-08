@@ -24,11 +24,40 @@ returns: classify
 nodes:
 
   # The classifier is configured in the environment, which `when:` cannot read.
-  # This is the gate that keeps an install without one from paying for the
-  # question below; .shared/context-scout.ts owns what "configured" means.
+  # This is the gate that keeps an install without one from paying for anything
+  # below it, so it must run wherever a `bash:` node runs: shell built-ins only,
+  # no Bun. It decides one thing, whether a key is set and no switch is off.
+  #
+  # .shared/context-scout.ts makes the same decision again before it sends
+  # anything, and is the only place that reads the numeric settings. The two
+  # are held together by context-scout-script.test.ts, which runs this text
+  # under sh and bash with an empty PATH against that function.
   - id: config
-    script: scout-config
-    runtime: bun
+    bash: |
+      # Unquoted on purpose: with globbing off, splitting a value into words and
+      # keeping the first is how sh trims it. Nothing here evaluates a value.
+      set -f
+      set -- ${JEV_API_KEY-}
+      key=${1-}
+      set -- ${JEV_ENABLED-}
+      all=${1-}
+      set -- ${JEV_SCOUT_ENABLED-}
+      scout=${1-}
+
+      off() {
+        case "$1" in
+          0 | [Ff][Aa][Ll][Ss][Ee]) return 0 ;;
+        esac
+        return 1
+      }
+
+      if off "$all" || off "$scout"; then
+        printf '%s\n' '{"available":false,"reason":"disabled"}'
+      elif [ -z "$key" ]; then
+        printf '%s\n' '{"available":false,"reason":"no_api_key"}'
+      else
+        printf '%s\n' '{"available":true,"reason":""}'
+      fi
     output_format:
       type: object
       properties:
@@ -46,6 +75,13 @@ nodes:
     depends_on: [config]
     when: "$config.output.available == true"
     mutates_checkout: false
+    # With a classifier configured, this node failing fails the run before the
+    # caller's agent starts, and the engine has no optional agent node. So it
+    # retries the most the engine allows, on every failure that is not fatal:
+    # a provider hiccup, or a structured-output miss on a best-effort provider.
+    retry:
+      max_attempts: 5
+      on_error: all
     output_format:
       type: object
       properties:
@@ -58,7 +94,8 @@ nodes:
 
   # Never fails the run on purpose: every way the classifier cannot answer is an
   # `unavailable` result, and its own deadline ends it well before this timeout.
-  # The timeout is the backstop, and it skips rather than fails.
+  # The timeout is the backstop, and it skips rather than fails. This is the one
+  # node here that needs Bun, and it runs only once the gate says available.
   - id: classify
     script: context-scout
     runtime: bun
@@ -95,10 +132,20 @@ nodes:
                 additionalProperties: false
             required: [path, relevant, confidence, evidence]
             additionalProperties: false
+        skipped:
+          type: array
+          items:
+            type: object
+            properties:
+              path: { type: string }
+              reason: { type: string, enum: [window_too_large] }
+            required: [path, reason]
+            additionalProperties: false
         counts:
           type: object
           properties:
             candidates: { type: integer, minimum: 0 }
+            badPaths: { type: integer, minimum: 0 }
             excluded:
               type: object
               properties:
@@ -118,6 +165,7 @@ nodes:
             charsSent: { type: integer, minimum: 0 }
           required:
             - candidates
+            - badPaths
             - excluded
             - classified
             - relevant
@@ -126,5 +174,5 @@ nodes:
             - requests
             - charsSent
           additionalProperties: false
-      required: [status, reason, question, paths, files, counts]
+      required: [status, reason, question, paths, files, skipped, counts]
       additionalProperties: false

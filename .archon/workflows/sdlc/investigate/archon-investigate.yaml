@@ -35,8 +35,15 @@ nodes:
     timeout: 600000
 
   # Optional pre-read. With a classifier configured it names the files worth
-  # opening first; without one it spends no AI turn and the investigate node runs as it
-  # always has. It overlaps code-index rather than queueing behind it.
+  # opening first. Without one only its shell gate runs: no AI turn, no Bun, and
+  # the investigate node runs as it always has.
+  #
+  # The engine runs the graph layer by layer, so only that gate shares a layer
+  # with code-index. With a classifier, the scout's question and classification
+  # start after code-index has finished and add their own time before investigate:
+  # one small-tier turn, then the classification, which stands down at its
+  # 120 s deadline. A scout node that fails then fails the run before investigate
+  # starts; JEV_SCOUT_ENABLED=0 turns the scout off.
   - id: scout
     include: archon-scout
     with:

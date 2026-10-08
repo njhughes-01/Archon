@@ -3,22 +3,31 @@
  * question about every candidate file, in line windows, and the result names the files
  * and lines worth opening first.
  *
- * Optional by construction. With no key, either switch off, an unusable setting, a
- * checkout git cannot list, or any classifier failure, the result is `unavailable` with
- * the reason named, and the caller carries on without it. Nothing here throws on purpose
- * and nothing retries.
+ * This module never fails its caller. With no key, either switch off, an unusable
+ * setting, a checkout that is not a git repository, or any classifier failure, the result
+ * is `unavailable` with the reason named. Nothing here throws on purpose and nothing
+ * retries. (The workflow around it is another matter: see the pack README.)
  *
  * What may leave the machine is decided here, before any request is built: only files git
  * tracks and does not ignore, never a secret-shaped path or a private key, never a
- * symlink, a binary or an oversized file. A hard budget bounds the rest. A file the
+ * symlink or anything reached through one that leaves the checkout, never a binary or an
+ * oversized file. A hard budget bounds the rest. A file the
  * budget cut is counted as unclassified and left out of the list; it is never reported as
  * not relevant.
  *
  * The classifier is any Jev-compatible service; ./jev-client.ts owns the wire format.
  */
 
-import { lstatSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
+import { dirname, join, sep } from 'node:path';
 import { askJevNoul, type Fetch, type JevNoulQuestion } from './jev-client.ts';
 
 export interface ScoutSettings {
@@ -56,6 +65,9 @@ type Check = (value: number) => boolean;
 const positiveInteger: Check = value => Number.isInteger(value) && value > 0;
 const wholeNumber: Check = value => Number.isInteger(value) && value >= 0;
 const probability: Check = value => value >= 0 && value <= 1;
+/** One run may not open more requests at once than this against anyone's endpoint. */
+const MAX_PARALLELISM = 16;
+const parallelRequests: Check = value => positiveInteger(value) && value <= MAX_PARALLELISM;
 
 /**
  * Every numeric setting: its variable, its default, and what makes a value usable.
@@ -71,7 +83,7 @@ const NUMBERS = {
   threshold: ['JEV_SCOUT_THRESHOLD', 0.3, probability],
   windowLines: ['JEV_SCOUT_WINDOW_LINES', 120, positiveInteger],
   windowOverlap: ['JEV_SCOUT_WINDOW_OVERLAP', 20, wholeNumber],
-  parallelism: ['JEV_SCOUT_PARALLELISM', 4, positiveInteger],
+  parallelism: ['JEV_SCOUT_PARALLELISM', 4, parallelRequests],
   maxFiles: ['JEV_SCOUT_MAX_FILES', 60, positiveInteger],
   maxWindows: ['JEV_SCOUT_MAX_WINDOWS', 240, positiveInteger],
   maxChars: ['JEV_SCOUT_MAX_CHARS', 600_000, positiveInteger],
@@ -184,46 +196,77 @@ const SECRET_NAMES = new Set([
   '.git-credentials',
   'authorized_keys',
   'known_hosts',
-  'id_rsa',
-  'id_dsa',
-  'id_ecdsa',
-  'id_ed25519',
 ]);
-/** A file named exactly this, whatever its extension, is a store of secrets. */
+/** A file whose name starts with this, whatever follows the next dot, stores secrets. */
 const SECRET_STEMS = new Set(['credentials', 'credential', 'secrets', 'secret']);
+/** SSH private keys keep these prefixes through every rename: `id_rsa.bak`, `id_ed25519_sk`. */
+const KEY_NAME_PREFIXES = ['id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519'];
 const SECRET_EXTENSIONS = new Set([
-  '.pem',
-  '.key',
-  '.p12',
-  '.pfx',
-  '.jks',
-  '.keystore',
-  '.kdbx',
-  '.ppk',
-  '.gpg',
-  '.asc',
-  '.crt',
-  '.cer',
-  '.der',
-  '.tfvars',
-  '.tfstate',
+  'pem',
+  'key',
+  'p12',
+  'pfx',
+  'jks',
+  'keystore',
+  'kdbx',
+  'ppk',
+  'gpg',
+  'asc',
+  'crt',
+  'cer',
+  'der',
+  'tfvars',
+  'tfstate',
+]);
+/**
+ * What makes a file named `env.<something>` code that reads the environment rather than
+ * an env file written without its dot. Everything else called `env` is treated as the
+ * env file: wrongly withholding `env.yaml` costs a hint, wrongly sending it costs a secret.
+ */
+const ENV_CODE_EXTENSIONS = new Set([
+  'ts',
+  'tsx',
+  'js',
+  'jsx',
+  'mjs',
+  'cjs',
+  'py',
+  'rb',
+  'go',
+  'rs',
+  'java',
+  'kt',
+  'php',
+  'cs',
+  'swift',
+  'sh',
 ]);
 
 /**
  * Whether a path is shaped like a secret: an env file, a key, a credential store, or
  * anything inside a directory that holds them. Decided from the path alone, so the file
  * is never opened. Source files that merely handle secrets (`token-validator.ts`) stay.
+ *
+ * A secret store keeps its name when something is appended to it (`secrets.enc.yaml`,
+ * `id_rsa.bak`, `.netrc.old`), so every dotted prefix of the file name is checked, and
+ * every extension after the first dot.
  */
 export function isSecretPath(path: string): boolean {
   const segments = path.toLowerCase().split('/');
   const name = segments.pop() ?? '';
-  if (segments.some(segment => SECRET_DIRECTORIES.has(segment))) return true;
+  if (segments.some(segment => SECRET_DIRECTORIES.has(segment) || segment.startsWith('.env'))) {
+    return true;
+  }
   if (name.startsWith('.env') || name.endsWith('.env')) return true;
-  if (SECRET_NAMES.has(name.replace(/\.pub$/, ''))) return true;
-  const dot = name.lastIndexOf('.');
-  const stem = dot > 0 ? name.slice(0, dot) : name;
-  const extension = dot > 0 ? name.slice(dot) : '';
-  return SECRET_STEMS.has(stem) || SECRET_EXTENSIONS.has(extension);
+  if (KEY_NAME_PREFIXES.some(prefix => name.startsWith(prefix))) return true;
+
+  const parts = name.split('.');
+  if (parts[0] === 'env' && !ENV_CODE_EXTENSIONS.has(parts.at(-1) ?? '')) return true;
+  for (let end = 1; end <= parts.length; end++) {
+    const prefix = parts.slice(0, end).join('.');
+    if (SECRET_NAMES.has(prefix) || SECRET_STEMS.has(prefix.replace(/^\./, ''))) return true;
+  }
+  return parts.slice(1).some(extension => SECRET_EXTENSIONS.has(extension));
 }
 
 /** An armored private key, wherever it was pasted. */
@@ -259,6 +302,8 @@ interface Listing {
   excluded: Exclusions;
   /** Candidates the file budget stopped before reading. */
   unread: number;
+  /** Candidate paths git refused: outside the checkout, or pathspec magic it does not know. */
+  badPaths: number;
 }
 
 /** `git ls-files -z` with these arguments, or null when git refuses. */
@@ -275,11 +320,16 @@ function gitPaths(cwd: string, args: readonly string[]): string[] | null {
 /**
  * One file's text when it may be sent, or the reason it may not.
  *
- * `lstat`, not `stat`: a tracked symlink can point anywhere on the host, and following it
- * would send a file git never held.
+ * Nothing here follows a link out of the checkout. The index can name a file whose
+ * directory has since become a symlink, and a tracked symlink can point anywhere on the
+ * host; either way the bytes would be a file git never held. So the file's directory must
+ * resolve inside `root`, the file is opened with `O_NOFOLLOW`, and its type and size are
+ * read from the open descriptor, which is the file the bytes then come from.
+ *
+ * @param root The checkout, already resolved with `realpath`.
  */
 function readEligible(
-  cwd: string,
+  root: string,
   path: string,
   maxFileBytes: number
 ): { text: string } | { excluded: ExclusionReason } {
@@ -287,18 +337,29 @@ function readEligible(
     excluded: reason,
   });
   if (isSecretPath(path)) return excluded('secret');
-  const absolute = join(cwd, path);
+  const absolute = join(root, path);
   let bytes: Uint8Array;
+  let descriptor: number | undefined;
   try {
-    const stat = lstatSync(absolute);
+    const directory = realpathSync(dirname(absolute));
+    if (directory !== root && !directory.startsWith(root + sep)) {
+      return excluded('not_regular_file');
+    }
+    // Windows has no O_NOFOLLOW (the constant is absent and ORs in as nothing), so the
+    // link check that works everywhere comes first and the atomic one backs it.
+    if (!lstatSync(absolute).isFile()) return excluded('not_regular_file');
+    descriptor = openSync(absolute, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const stat = fstatSync(descriptor);
     if (!stat.isFile()) return excluded('not_regular_file');
     if (stat.size > maxFileBytes) return excluded('too_large');
-    bytes = readFileSync(absolute);
+    bytes = readFileSync(descriptor);
   } catch {
-    // Tracked but gone from the worktree, or unreadable: there is nothing to send.
+    // Tracked but gone from the worktree, a link, or unreadable: there is nothing to send.
     return excluded('not_regular_file');
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
-  // The stat and the read are two looks at a file that can change in between.
+  // A file can grow between the stat and the read.
   if (bytes.length > maxFileBytes) return excluded('too_large');
   if (bytes.subarray(0, BINARY_SNIFF_BYTES).includes(0)) return excluded('binary');
   let text: string;
@@ -313,20 +374,34 @@ function readEligible(
 
 /**
  * The files the candidate paths select that may be sent, or null when git cannot list
- * the checkout (not a repository, or a path that reaches outside it).
+ * the checkout at all (it is not a repository).
  *
  * `git ls-files` is the whole selection: it lists tracked files only, so an untracked
  * file is never a candidate, and it resolves directories and globs itself. Paths are
  * listed one at a time so the candidates keep the order the paths were given in, which
  * is the order a budget cuts from the end of.
+ *
+ * An agent wrote the paths, so one that git refuses (it reaches outside the checkout, or
+ * uses pathspec magic git does not know) is passed over and counted. It never widens the
+ * selection: when every path is refused, nothing is a candidate.
  */
 function listFiles(cwd: string, paths: readonly string[], settings: ScoutSettings): Listing | null {
-  const specs = paths.length === 0 ? [[]] : paths.map(path => ['--', path]);
+  // Tracked files an ignore rule matches: someone force-added what the project hides.
+  // Listed first because it takes no path from the agent, so its failure can only mean
+  // the checkout itself cannot be listed.
+  const ignored = gitPaths(cwd, ['--cached', '--ignored', '--exclude-standard']);
+  if (ignored === null) return null;
+  const hidden = new Set(ignored);
+
   const candidates: string[] = [];
   const seen = new Set<string>();
-  for (const spec of specs) {
+  let badPaths = 0;
+  for (const spec of paths.length === 0 ? [[]] : paths.map(path => ['--', path])) {
     const listed = gitPaths(cwd, spec);
-    if (listed === null) return null;
+    if (listed === null) {
+      badPaths += 1;
+      continue;
+    }
     for (const path of listed) {
       if (!seen.has(path)) {
         seen.add(path);
@@ -334,16 +409,14 @@ function listFiles(cwd: string, paths: readonly string[], settings: ScoutSetting
       }
     }
   }
-  // Tracked files an ignore rule matches: someone force-added what the project hides.
-  const ignored = gitPaths(cwd, ['--cached', '--ignored', '--exclude-standard']);
-  if (ignored === null) return null;
-  const hidden = new Set(ignored);
 
+  const root = realpathSync(cwd);
   const listing: Listing = {
     candidates: candidates.length,
     files: [],
     excluded: noExclusions(),
     unread: 0,
+    badPaths,
   };
   for (const [index, path] of candidates.entries()) {
     if (listing.files.length === settings.maxFiles) {
@@ -352,7 +425,7 @@ function listFiles(cwd: string, paths: readonly string[], settings: ScoutSetting
     }
     const read = hidden.has(path)
       ? { excluded: 'ignored' as const }
-      : readEligible(cwd, path, settings.maxFileBytes);
+      : readEligible(root, path, settings.maxFileBytes);
     if ('excluded' in read) listing.excluded[read.excluded] += 1;
     else listing.files.push({ path, text: read.text });
   }
@@ -440,12 +513,21 @@ interface ClassificationCounts {
   charsSent: number;
 }
 
+/** A file that may be sent but cannot be: no budget would make room for it. */
+export interface ScoutSkip {
+  path: string;
+  /** One of its windows is larger than a whole request (long lines: minified or data). */
+  reason: 'window_too_large';
+}
+
 export interface ScoutClassification {
   status: ScoutStatus;
   /** Empty when ok; otherwise the budget that was hit or why the classifier is unavailable. */
   reason: string;
   /** Relevant files first, most confident first. */
   files: ScoutFileResult[];
+  /** Files passed over one by one, named so a reader can open them unaided. */
+  skipped: ScoutSkip[];
   counts: ClassificationCounts;
 }
 
@@ -463,7 +545,8 @@ interface Plan {
   /** Files that will be classified, in input order. */
   paths: string[];
   windows: PlannedWindow[];
-  /** The first limit that kept a file out, or empty. */
+  skipped: ScoutSkip[];
+  /** The limit that kept files out, or empty. A budget takes precedence over a skip. */
   cut: string;
 }
 
@@ -477,7 +560,7 @@ interface Plan {
  */
 function plan(question: string, files: readonly ScoutFile[], settings: ScoutSettings): Plan {
   const perQuestion = questionChars(question);
-  const planned: Plan = { paths: [], windows: [], cut: '' };
+  const planned: Plan = { paths: [], windows: [], skipped: [], cut: '' };
   let chars = 0;
   for (const file of files) {
     if (planned.paths.length === settings.maxFiles) {
@@ -492,6 +575,7 @@ function plan(question: string, files: readonly ScoutFile[], settings: ScoutSett
       }
     );
     if (windows.some(window => window.chars > settings.maxRequestChars)) {
+      planned.skipped.push({ path: file.path, reason: 'window_too_large' });
       planned.cut ||= 'window_too_large';
       continue;
     }
@@ -604,6 +688,7 @@ export async function classifyFiles(input: ClassifyInput): Promise<ScoutClassifi
       status: 'unavailable',
       reason: failure,
       files: [],
+      skipped: [],
       counts: {
         classified: 0,
         relevant: 0,
@@ -639,6 +724,7 @@ export async function classifyFiles(input: ClassifyInput): Promise<ScoutClassifi
     status: planned.cut === '' ? 'ok' : 'truncated',
     reason: planned.cut,
     files: results,
+    skipped: planned.skipped,
     counts: {
       classified: results.length,
       relevant: results.filter(result => result.relevant).length,
@@ -660,6 +746,8 @@ export interface ScoutResult extends ScoutClassification {
   counts: ClassificationCounts & {
     /** Tracked files the paths selected. */
     candidates: number;
+    /** Candidate paths git refused and the scout passed over. */
+    badPaths: number;
     /** Candidates never sent, by the rule that kept them back. */
     excluded: Exclusions;
   };
@@ -682,8 +770,10 @@ function unavailable(question: string, paths: string[], reason: string): ScoutRe
     question,
     paths,
     files: [],
+    skipped: [],
     counts: {
       candidates: 0,
+      badPaths: 0,
       excluded: noExclusions(),
       classified: 0,
       relevant: 0,
@@ -728,6 +818,7 @@ export async function runScout(run: ScoutRun): Promise<ScoutResult> {
       counts: {
         ...classified.counts,
         candidates: listing.candidates,
+        badPaths: listing.badPaths,
         excluded: listing.excluded,
         unclassified: classified.counts.unclassified + listing.unread,
       },

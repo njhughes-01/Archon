@@ -16,4 +16,7 @@ const result = await runScout({
   env: process.env,
 });
 if (result.status !== 'ok') note(`context-scout: ${result.status} (${result.reason})`);
+if (result.counts.badPaths > 0) {
+  note(`context-scout: passed over ${String(result.counts.badPaths)} path(s) git rejected`);
+}
 emit(result);

@@ -30,6 +30,7 @@ function result(
     reason: '',
     question: KEY.question,
     paths: [],
+    skipped: [],
     files: files.map(([path, confidence]) => ({
       path,
       confidence,
@@ -38,6 +39,7 @@ function result(
     })),
     counts: {
       candidates: files.length,
+      badPaths: 0,
       excluded: { ignored: 0, secret: 0, not_regular_file: 0, too_large: 0, binary: 0, empty: 0 },
       classified: files.length,
       relevant: files.filter(([, confidence]) => confidence >= threshold).length,

@@ -1,11 +1,14 @@
 /**
- * The scout's two script nodes, run as the engine runs them: a Bun subprocess with
+ * The scout's deterministic nodes, run as the engine runs them.
+ *
+ * The gate is the `config` node's own shell text, taken from the workflow file and run
+ * with a shell and nothing else on PATH. The classifier is a Bun subprocess with
  * `--no-env-file`, reading `INPUTS_*` and the `JEV_*` settings from its environment, in a
- * real git checkout, talking HTTP to a local stand-in for the classifier.
+ * real git checkout, talking HTTP to a local stand-in for the service.
  *
  * The subprocess is the subject: what these tests pin is the process contract (exit 0 and
- * one valid JSON document whatever the classifier does) and that the result satisfies the
- * `output_format` the workflow declares for the node.
+ * one valid JSON document whatever happens) and that each result satisfies the
+ * `output_format` the workflow declares for its node.
  */
 import { afterAll, describe, expect, it } from 'bun:test';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -13,6 +16,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
 import { validateStructuredOutput } from '@archon/providers';
+import { stepRetryConfigSchema } from '../../../packages/workflows/src/schemas/retry';
+import { readScoutSettings } from '../../workflows/sdlc/.shared/context-scout';
 
 const SCOUT = resolve(import.meta.dir, '../../workflows/sdlc/scout');
 const API_KEY = 'sk-test-PLANTED-KEY';
@@ -25,7 +30,7 @@ interface ScriptRun {
 }
 
 async function runScript(
-  name: 'scout-config' | 'context-scout',
+  name: 'context-scout',
   cwd: string,
   env: Record<string, string>
 ): Promise<ScriptRun> {
@@ -113,12 +118,27 @@ function answering(noul: (path: string) => number): Respond {
   };
 }
 
+interface AuthoredNode {
+  id: string;
+  bash?: string;
+  script?: string;
+  retry?: unknown;
+  output_format?: Record<string, unknown>;
+}
+
+/** One node of the scout workflow, as authored. */
+async function authoredNode(nodeId: string): Promise<AuthoredNode> {
+  const workflow = Bun.YAML.parse(await Bun.file(join(SCOUT, 'archon-scout.yaml')).text()) as {
+    nodes: AuthoredNode[];
+  };
+  const node = workflow.nodes.find(candidate => candidate.id === nodeId);
+  if (node === undefined) throw new Error(`archon-scout has no node ${nodeId}`);
+  return node;
+}
+
 /** The `output_format` the workflow declares for one of its nodes. */
 async function declaredSchema(nodeId: string): Promise<Record<string, unknown>> {
-  const workflow = Bun.YAML.parse(await Bun.file(join(SCOUT, 'archon-scout.yaml')).text()) as {
-    nodes: { id: string; output_format?: Record<string, unknown> }[];
-  };
-  const schema = workflow.nodes.find(node => node.id === nodeId)?.output_format;
+  const schema = (await authoredNode(nodeId)).output_format;
   if (schema === undefined) throw new Error(`node ${nodeId} declares no output_format`);
   return schema;
 }
@@ -142,32 +162,105 @@ const SOURCES = {
   '.env': 'DATABASE_PASSWORD=PLANTED_DOTENV_SECRET\n',
 };
 
-describe('scout-config', () => {
-  it('reports unavailable, silently, when no key is set', async () => {
-    const run = await runScript('scout-config', repo(SOURCES), {});
+/**
+ * Runs the `config` node's shell text under `shell`, with an empty PATH: whatever it
+ * prints, it printed using the shell alone.
+ */
+async function runGate(shell: string, env: Record<string, string>): Promise<ScriptRun> {
+  const body = (await authoredNode('config')).bash;
+  if (body === undefined) throw new Error('the config node is not a bash node');
+  const shellPath = Bun.which(shell);
+  if (shellPath === null) throw new Error(`${shell} is not installed`);
+  const child = Bun.spawn([shellPath, '-c', body], {
+    env: { PATH: '', ...env },
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [code, stdout, stderr] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { code, stdout, stderr };
+}
 
-    expect(run.code).toBe(0);
-    expect(run.stderr).toBe('');
-    expect(JSON.parse(run.stdout)).toEqual({ available: false, reason: 'no_api_key' });
-    await expectCertified('config', run.stdout);
+describe('the config gate', () => {
+  it('is shell text the workflow carries, not a script that needs a runtime', async () => {
+    const node = await authoredNode('config');
+    expect(typeof node.bash).toBe('string');
+    expect(node.script).toBeUndefined();
   });
 
-  it('reports available without printing the key', async () => {
-    const run = await runScript('scout-config', repo(SOURCES), { JEV_API_KEY: API_KEY });
+  // The gate and `readScoutSettings` both decide "is a classifier configured", in two
+  // languages, because the gate must run where Bun may not be installed. This is the
+  // conformance between them: every environment below gets the same answer from both.
+  // An unusable number is the one deliberate difference. The gate does not read numbers,
+  // so it says available, and the classifier node then reports the setting.
+  const environments: Record<string, string>[] = [
+    {},
+    { JEV_API_KEY: '' },
+    { JEV_API_KEY: '   ' },
+    { JEV_API_KEY: '\t\n' },
+    { JEV_API_KEY: 'k' },
+    { JEV_API_KEY: '  k  ' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '1' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: 'true' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: 'no' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '00' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '0' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: 'false' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: 'FALSE' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: ' False ' },
+    { JEV_API_KEY: 'k', JEV_SCOUT_ENABLED: '0' },
+    { JEV_API_KEY: 'k', JEV_SCOUT_ENABLED: 'fAlSe' },
+    { JEV_API_KEY: 'k', JEV_SCOUT_ENABLED: ' 0\t' },
+    { JEV_API_KEY: 'k', JEV_SCOUT_ENABLED: 'falsey' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '1', JEV_SCOUT_ENABLED: '0' },
+    { JEV_API_KEY: 'k', JEV_ENABLED: '0', JEV_SCOUT_ENABLED: '1' },
+    { JEV_ENABLED: '0' },
+    { JEV_API_KEY: 'k', JEV_SCOUT_THRESHOLD: 'high' },
+    { JEV_API_KEY: '$(echo PLANTED_EXPANSION) * `id` "quoted" \\' },
+  ];
 
-    expect(run.code).toBe(0);
+  it.each(['sh', 'bash'])(
+    'agrees with readScoutSettings on every environment under %s',
+    async shell => {
+      for (const env of environments) {
+        const read = readScoutSettings(env);
+        const numbersOnly = !read.available && read.reason.startsWith('invalid_setting:');
+        const expected =
+          read.available || numbersOnly
+            ? { available: true, reason: '' }
+            : { available: false, reason: read.reason };
+
+        const run = await runGate(shell, env);
+
+        expect(run.stderr).toBe('');
+        expect(run.code).toBe(0);
+        expect({ env, result: JSON.parse(run.stdout) as unknown }).toEqual({
+          env,
+          result: expected,
+        });
+        await expectCertified('config', run.stdout);
+      }
+    }
+  );
+
+  it('never prints the key or anything a value expands to', async () => {
+    const run = await runGate('sh', { JEV_API_KEY: `${API_KEY} $(echo PLANTED_EXPANSION)` });
+
     expect(JSON.parse(run.stdout)).toEqual({ available: true, reason: '' });
-    expect(run.stdout + run.stderr).not.toContain(API_KEY);
-    await expectCertified('config', run.stdout);
+    expect(run.stdout + run.stderr).not.toContain('PLANTED');
   });
+});
 
-  it('reports the scout switched off while the key stays set', async () => {
-    const run = await runScript('scout-config', repo(SOURCES), {
-      JEV_API_KEY: API_KEY,
-      JEV_SCOUT_ENABLED: '0',
-    });
-
-    expect(JSON.parse(run.stdout)).toEqual({ available: false, reason: 'disabled' });
+describe('the question node', () => {
+  // Once a classifier is configured this agent can fail the run, so it retries harder
+  // than the default: every failure class that is not fatal, the most times allowed.
+  it('retries the most the engine allows, on any error that is not fatal', async () => {
+    const retry = stepRetryConfigSchema.parse((await authoredNode('question')).retry);
+    expect(retry).toEqual({ max_attempts: 5, on_error: 'all' });
   });
 });
 
@@ -217,6 +310,38 @@ describe('context-scout', () => {
     expect(printed).not.toContain('PLANTED_DOTENV_SECRET');
     expect(printed).not.toContain('verifyToken');
     expect(printed).not.toContain(API_KEY);
+  });
+
+  it('tells the operator when it passed over a path git rejected', async () => {
+    const jev = classifier(answering(() => 0.9));
+
+    const run = await runScript('context-scout', repo(SOURCES), {
+      JEV_API_KEY: API_KEY,
+      JEV_API_BASE: jev.base,
+      INPUTS_QUESTION: QUESTION,
+      INPUTS_PATHS: '["src", "../elsewhere"]',
+    });
+
+    expect(run.code).toBe(0);
+    expect(run.stderr.trim()).toBe('context-scout: passed over 1 path(s) git rejected');
+    await expectCertified('classify', run.stdout);
+    expect(JSON.parse(run.stdout)).toMatchObject({ status: 'ok', counts: { badPaths: 1 } });
+  });
+
+  it('reports an unusable setting itself, since the gate does not read numbers', async () => {
+    const run = await runScript('context-scout', repo(SOURCES), {
+      JEV_API_KEY: API_KEY,
+      JEV_SCOUT_PARALLELISM: '64',
+      INPUTS_QUESTION: QUESTION,
+      INPUTS_PATHS: '["src"]',
+    });
+
+    expect(run.code).toBe(0);
+    await expectCertified('classify', run.stdout);
+    expect(JSON.parse(run.stdout)).toMatchObject({
+      status: 'unavailable',
+      reason: 'invalid_setting:JEV_SCOUT_PARALLELISM',
+    });
   });
 
   it('marks a result the budget cut as truncated, on stdout and to the operator', async () => {

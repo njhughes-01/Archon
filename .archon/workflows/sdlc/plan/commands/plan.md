@@ -36,7 +36,7 @@ When `status` is `ok` or `truncated`, `question` is what it asked and `paths` is
 
 - Start from the `relevant: true` files, most confident first. Make them the subject of your first code-graph queries — what those files define around their `evidence` lines, and its callers and callees — then read those lines, before you search more widely.
 - The list is a lead, never evidence. The classifier answered one narrow question about a stretch of code with nothing around it, and it can be wrong in both directions. Read a selected file before you treat it as relevant, and verify everything your conclusions rest on in the source itself.
-- `relevant: false` means it saw nothing there, not that the file is ruled out. A file that is not listed was never judged: it lies outside `paths`, was withheld (`counts.excluded` — secrets, binaries, oversized files), or was cut by the budget (`counts.unclassified`, and `status` is `truncated`).
+- `relevant: false` means it saw nothing there, not that the file is ruled out. A file that is not listed was never judged: it lies outside `paths`, was withheld (`counts.excluded` — secrets, binaries, oversized files), could not be sent (named in `skipped`), or was cut by the budget (`counts.unclassified`, and `status` is `truncated`).
 - If `question` is not the question this task turns on, set the list aside.
 
 ## Code graph (Codanna)
