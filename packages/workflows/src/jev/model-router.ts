@@ -47,11 +47,13 @@ export const ROUTER_DEFAULTS = {
   /** An ambiguous-or-multi-step answer at or above this keeps the ceiling. */
   ambiguityThreshold: 0.5,
   /**
-   * Most characters of the step's authored text that are sent. Deliberately short: the
-   * opening of a command or prompt says what the step is for, and the pages of procedure
-   * after it make every step read as long, multi-part work.
+   * Most characters of the step's authored text that are sent: enough of its opening to
+   * say what the step is for and what it must get right, not the whole procedure. Found on
+   * the evaluation's tuning half. With all of a long command every step read as multi-part
+   * work; with only the first 1200 characters a step that carries a contract forward could
+   * not be told from one that lists what a project defines.
    */
-  maxStepChars: 1200,
+  maxStepChars: 3200,
   /** Most characters of the run's task text that are sent. */
   maxTaskChars: 4000,
 } as const;
@@ -439,9 +441,9 @@ const AMBIGUITY_QUESTION = 'ambiguous_or_multi_step';
  */
 const TIER_CRITERIA: Record<TierName, string> = {
   small:
-    'Collecting, listing, sorting or restating facts that already exist, by following fixed instructions. Examples: reading files or command output and listing what they define; putting an observed result into one of a few given categories; writing a short description of a small, single-purpose change from material already at hand. Not for work whose answer depends on weighing trade-offs, on understanding unfamiliar code in depth, or on a sensitive subject.',
+    "Gathering, listing, sorting or restating facts that already exist, by following fixed instructions. Examples: reading a project's files or command output and listing what they already define; putting an observed result into one of a few given categories; writing a short description of a small, single-purpose change from material already at hand. Not for work whose answer depends on weighing trade-offs, on understanding unfamiliar code in depth, or on a sensitive subject.",
   medium:
-    'Engineering judgement on a clearly stated task within one part of a system. Examples: examining a change for defects; finding the cause of a defect that has a known symptom in one area; assessing a request and deciding what it needs next; making a well-specified change; condensing a large, multi-part body of work from several sources. Not for collecting or restating known facts, and not for design decisions or sensitive changes.',
+    'Engineering judgement on a clearly stated task within one part of a system. Examples: examining a change for defects; finding the cause of a defect that has a known symptom in one area; assessing a request and deciding what it needs next; working out the full set of requirements or acceptance criteria that later work will be judged against; making a well-specified change; condensing a large, multi-part body of work from several sources. Not for gathering or restating known facts, and not for design decisions or sensitive changes.',
   large:
     'Hard or consequential reasoning. Examples: architecture or design decisions; requirements that are unclear or conflict; diagnosing a problem that has no reproduction or several possible causes across components; changes to security, data schemas, deletion or money; work that spans several systems.',
 };

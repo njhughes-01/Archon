@@ -735,19 +735,19 @@ describe('routeAgentNode', () => {
     expect(JSON.stringify(standalone)).not.toContain('sdlc-step');
   });
 
-  it('sends only the opening of a long step by default, and far more of the task', async () => {
+  it('sends only the opening of a long step by default, and more of the task', async () => {
     const { fetch, bodies } = fakeFetch(answering());
     await routeAgentNode(
       candidate({
-        loadStepText: () => Promise.resolve('s'.repeat(3000)),
-        taskText: () => 't'.repeat(3000),
+        loadStepText: () => Promise.resolve('s'.repeat(6000)),
+        taskText: () => 't'.repeat(3600),
       }),
       opts({ fetch })
     );
     expect(bodies[0].state.step).toBe(
-      `${'s'.repeat(ROUTER_DEFAULTS.maxStepChars)} [truncated ${String(3000 - ROUTER_DEFAULTS.maxStepChars)} chars]`
+      `${'s'.repeat(ROUTER_DEFAULTS.maxStepChars)} [truncated ${String(6000 - ROUTER_DEFAULTS.maxStepChars)} chars]`
     );
-    expect(bodies[0].state.task).toBe('t'.repeat(3000));
+    expect(bodies[0].state.task).toBe('t'.repeat(3600));
     expect(ROUTER_DEFAULTS.maxStepChars).toBeLessThan(ROUTER_DEFAULTS.maxTaskChars);
   });
 

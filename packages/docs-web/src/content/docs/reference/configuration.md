@@ -689,8 +689,8 @@ Connection and thresholds for the [model router](#model-router). None of these t
 | Variable | Description | Default |
 | --- | --- | --- |
 | `JEV_API_KEY` | API key for the classifier, sent as a Bearer token. Without it the router classifies nothing and every step runs on its authored tier. | -- |
-| `JEV_ENABLED` | Set to `0` or `false` to turn every Jev-backed feature off while keeping the key | on |
-| `JEV_ROUTER_ENABLED` | Set to `0` or `false` to turn only the model router off | on |
+| `JEV_ENABLED` | Set to `0`, `false`, `off` or `no` to turn the router off along with every other Jev-backed feature | on |
+| `JEV_ROUTER_ENABLED` | Set to `0`, `false`, `off` or `no` to turn only the model router off | on |
 | `JEV_API_BASE` | Base URL of the classifier. Any Jev-compatible endpoint works. | `https://api.typesafe.ai` |
 | `JEV_MODEL` | Model id sent with each request | `jev-1.13.0` |
 | `JEV_ROUTER_TIMEOUT_MS` | Longest a step waits for a route before it runs on its authored tier | `3000` |
@@ -698,7 +698,7 @@ Connection and thresholds for the [model router](#model-router). None of these t
 | `JEV_ROUTER_MIN_CONFIDENCE` | The choice needs at least this confidence (0--1) | `0.5` |
 | `JEV_ROUTER_RISK_THRESHOLD` | A "high-risk" answer at or above this keeps the authored tier (0--1) | `0.3` |
 | `JEV_ROUTER_AMBIGUITY_THRESHOLD` | An "ambiguous or multi-step" answer at or above this keeps the authored tier (0--1) | `0.5` |
-| `JEV_ROUTER_MAX_STEP_CHARS` | Most characters of the step's authored text sent per request. Short on purpose: the opening says what the step is for, and pages of procedure make every step read as hard | `1200` |
+| `JEV_ROUTER_MAX_STEP_CHARS` | Most characters of the step's authored text sent per request: its opening, which says what the step is for and what it must get right, not the whole procedure | `3200` |
 | `JEV_ROUTER_MAX_TASK_CHARS` | Most characters of the run's task text sent per request | `4000` |
 
 A value that is not a usable number turns the router off rather than falling back to a default, and every route record then says which variable (`invalid_setting:<NAME>`).
@@ -904,7 +904,7 @@ Provider errors that include an unambiguous epoch or relative reset duration use
 The model router decides, one workflow step at a time, whether the step can run on a cheaper [model tier](#global-configuration) than its author declared. It asks a small classifier (a Jev-compatible service) about the step and the task, and only lowers a step when the answer is confident, low-risk and unambiguous. It is optional and off until you configure it.
 
 ```yaml
-# ~/.archon/config.yaml, or .archon/config.yaml in a repository
+# ~/.archon/config.yaml
 modelRouter:
   tiers: [medium]
   mode: shadow
@@ -915,29 +915,38 @@ modelRouter:
 | `tiers` | `[medium]` | The authored tiers the router may lower. A step on any other tier is never routed. |
 | `mode` | `shadow` | `off`: nothing is classified or recorded. `shadow`: each route is recorded and the step runs exactly as it would with no router. `apply`: the step runs on the routed tier. |
 
-The block can be set globally or per repository; repo fields override matching global fields. It is not accepted in [run-scoped configuration](#run-scoped-configuration). The classifier connection and thresholds are [environment variables](#model-router-optional). With no `modelRouter:` block, with `mode: off`, or with no `JEV_API_KEY`, every step resolves exactly as it does without the router.
+**The install config decides.** The block in `~/.archon/config.yaml` is the operator's opt-in. A repository's `.archon/config.yaml` may carry a `modelRouter:` block too, but it can only narrow the install's: lower the mode (`apply` to `shadow` or `off`, `shadow` to `off`) and remove tiers. It cannot switch the router on, raise the mode, add a tier, or override an install-level `mode: off`; a repository block with no install opt-in is ignored and logged. The block is not accepted in [run-scoped configuration](#run-scoped-configuration). The classifier connection and thresholds are [environment variables](#model-router-optional).
+
+With no `modelRouter:` block in the install config, with `mode: off`, with no `JEV_API_KEY`, or with a switch off, every step resolves exactly as it does without the router and no route is recorded. `JEV_ENABLED` and `JEV_ROUTER_ENABLED` are off at `0`, `false`, `off` or `no`.
 
 **The authored tier is the ceiling.** The router keeps a step's authored tier or goes below it, never above. A step that names a literal model or an `@alias` is never routed: its author pinned one exact model. There is no workflow field for the router and no `model: auto`.
 
 ### Which steps are routed
 
-Only single-shot agent steps (`prompt:` or `command:`) at the top level of a workflow, including steps a workflow brings in through `include:`. These are never routed:
+Only single-shot agent steps (`prompt:` or `command:`) at the top level of a workflow, including steps a workflow brings in through `include:`. These are never routed, and get no route record:
 
 - `loop:` steps, anything inside a `loop_group:`, composed fan-out instances, and the rework prompt of an approval step;
 - a step with `context: { resume: ... }`, a step another step resumes from, and a step with `persist_session` (their provider session outlives the attempt);
 - a step whose authored tier is not listed in `tiers`.
 
-In the bundled SDLC pack, the default `tiers: [medium]` makes these commands routable wherever a workflow runs them as a top-level step: `discover-checks` and `classify-red` (validate), `pr`, `sync-pr-body`, `triage`, `investigate`, `assess`, and the eight review commands (`review-scope`, `review-code`, `review-seams`, `review-simplify`, `review-tests`, `review-errors`, `review-docs`, `review-synthesize`). `plan` (large), `implement` (a loop) and `classify-review-scope` (already small) are not. Routable means the classifier is asked; whether a step is lowered depends on the task of each run.
+**A step is lowered only where a bad result would be caught.** Escalation can see one thing: a failed output contract. So a step with no `output_format` is never lowered, on any provider, and the classifier is not asked about it; its route record says `unverifiable`. In the bundled SDLC pack that rules out the six review lenses.
+
+In the bundled SDLC pack, the default `tiers: [medium]` puts these commands on a routable tier wherever a workflow runs them as a top-level step: `discover-checks` and `classify-red` (validate), `pr`, `sync-pr-body`, `triage`, `investigate`, `assess`, and the eight review commands. `plan` (large), `implement` (a loop) and `classify-review-scope` (already small) are not. Of those, the ones that declare an output contract and can therefore be lowered are `discover-checks`, `classify-red`, `pr`, `sync-pr-body`, `triage`, `investigate`, `assess`, `review-scope` and `review-synthesize`. Which of them can move to **another provider** depends on the rules below; `bun run scripts/model-router-eval.ts --lowerable <tier-map>` prints the answer for every step of the pack on a named tier map.
 
 ### What is offered
 
-A lower tier is offered only when it has a preset of its own, differs from the authored tier's preset, and names a provider that can run the step. For a tier on a different provider that means all of:
+A lower tier is offered only when it has a preset of its own, differs from the authored tier's preset, and names a provider that:
 
-- the provider is registered, and can run inside the container when the run uses one;
-- the provider honours every field the authored provider honours: `allowed_tools`/`denied_tools`, `hooks`, `mcp`, `skills`, `agents`, `effort`, `maxBudgetUsd`, `fallbackModel`, `sandbox`, `settingSources`, injected env, and `webSearchMode`. A routed step never loses a tool restriction, a sandbox or a spend limit;
-- for a step with `output_format`: the provider's structured-output guarantee is at least as strong, and its strict-schema rule accepts the schema;
+- is registered and usable in this run;
+- enforces the step's `output_format` as written: constrained decoding (not best effort), every property listed in `required` where the provider demands that, and no open `additionalProperties` that a strict provider would silently close.
+
+A tier on a **different provider** must also pass all of these:
+
+- the provider can run inside the container when the run uses one;
+- the provider honours every field the authored provider honours: `allowed_tools`/`denied_tools`, `hooks`, `mcp`, `skills`, `agents`, `effort`, `maxBudgetUsd`, `fallbackModel`, `sandbox`, `settingSources`, `betas`, injected env, and `webSearchMode`. A routed step never loses a tool restriction, a sandbox or a spend limit;
 - the step does not name another `provider:` itself;
-- the step is in a parallel layer. A step that runs on its own may continue the previous step's session and hand its own to the next, and a session only resumes on the provider that created it, so such a step is only lowered within its own provider.
+- the step does not declare `mutates_checkout: false`. A lower tier that writes to such a checkout fails a run that would have succeeded, and no second attempt can undo the write. Within its own provider such a step may still be lowered;
+- no provider session can cross the step. A session only resumes on the provider that created it, so moving a step that inherits a session, or whose session a later step inherits, would silently change what that step knows. The engine reads this off the workflow's plan: a step in a parallel layer never inherits and is never inherited from; a parallel layer clears the thread; a `bash:` or `script:` step between two agent steps does **not** separate them; a `context: fresh` step does not inherit, but because it may be skipped it does not shield the steps after it. Where it cannot be shown that no session crosses a step, the step stays on its provider.
 
 If no lower tier can be offered, the classifier is not called.
 
@@ -947,9 +956,9 @@ One request per routed step, to `JEV_API_BASE`:
 
 - the run's task input: the message that started the run and its named inputs, up to `JEV_ROUTER_MAX_TASK_CHARS`;
 - the opening of the step's **authored** command or prompt text, before any variable or upstream output is substituted into it, up to `JEV_ROUTER_MAX_STEP_CHARS`;
-- facts computed in code: the command's name (or the step's id for an inline prompt), whether the step declares an output format, tool restrictions, MCP servers or skills, whether the engine enforces that it leaves the checkout unchanged, and the size of the two texts. The authored tier is not among them: telling the classifier which tier the author picked pulls its answer toward that tier.
+- facts computed in code: whether the step declares tool restrictions, MCP servers or skills, whether the engine enforces that it leaves the checkout unchanged, and the size of the two texts. Nothing sent depends on whether a command runs in its own workflow or composed into another, so the step's id and name are not sent. The authored tier is not sent either: telling the classifier which tier the author picked pulls its answer toward that tier.
 
-Before either text is cut, exact values of credentials Archon injected or holds under secret-named environment variables are removed, and text shaped like a credential is masked: `KEY=value` under a secret-like name, `Authorization` and bearer values, `user:password@` in URLs, PEM blocks, and common token prefixes. Shape masking is defence in depth, not a guarantee: do not put secrets in a task message. Upstream step outputs, node-local `with:` bindings, file contents and the key are never sent, and no log line contains the step text, the task text or the key.
+Before either text is sent, exact values of credentials Archon injected or holds under secret-named environment variables are removed, and text shaped like a credential is masked: `KEY=value` under a secret-like name, `Authorization` and bearer values, `user:password@` in URLs, PEM blocks, cookies, JSON and CLI-flag secrets, JWTs, webhook URLs and common token prefixes. Masking runs over a bounded window of each text, so its cost does not grow with the size of a task message. Shape masking is defence in depth, not a guarantee: do not put secrets in a task message. Upstream step outputs, node-local `with:` bindings, file contents and the key are never sent, and no log line contains the step text, the task text or the key.
 
 ### How a route is decided
 
@@ -959,11 +968,15 @@ The classifier answers three questions in that one request:
 2. **High-risk.** Whether the subject of the task is a sensitive area: authentication or authorization, credentials or secrets, database schemas or migrations, deleting data or files, money or billing, or a change made directly to production. A step that only reviews or describes such a change still counts. Pushing a work-in-progress branch or writing a pull-request description does not make an ordinary task sensitive.
 3. **Ambiguous or open-ended.** Whether the task leaves open what should be done: under-specified, open to more than one reading, or leaving a design decision across several parts of a system. A step whose fixed instructions list several things to do is not ambiguous for that reason.
 
-Deterministic floors then apply, risk first: either yes/no answer at or above its threshold, or a choice below the probability or confidence minimum, keeps the authored tier. So does a timeout, an HTTP error, an unreadable or out-of-range answer, and a choice that was not offered. Routing never fails or blocks a step; the longest it can add is `JEV_ROUTER_TIMEOUT_MS`.
+Deterministic floors then apply, risk first: either yes/no answer at or above its threshold, or a choice below the probability or confidence minimum, keeps the authored tier. So does a timeout, an HTTP error, an unreadable or out-of-range answer, and a choice that was not offered. Routing never fails or blocks a step: an error anywhere inside it leaves the step on its authored tier. The longest wait it adds is the classifier request, bounded by `JEV_ROUTER_TIMEOUT_MS`, plus a few milliseconds of local work (reading a command file once and redacting two bounded texts).
 
 ### Escalation
 
-In `apply` mode, a step that ran on a lower tier and failed runs once more on its authored tier, under its own `retry:` policy, starting from the session the step would have started from without the router (never the failed attempt's session). The trigger is the failure kind the engine recorded, not error text: a failed output contract (`output_contract`), or a provider error (`fatal`, `rate_limited`, `transient`, `unknown`, `timeout`). A cancelled step and a configuration fault are not escalated. Usage from both rounds is counted.
+In `apply` mode, a step that ran on a lower tier and failed runs once more on its authored tier, under its own `retry:` policy. The trigger is the failure kind the engine recorded, not error text: a failed output contract (`output_contract`), or a provider error (`fatal`, `rate_limited`, `transient`, `unknown`, `timeout`). A cancelled step and a configuration fault are not escalated. Usage from both rounds is counted.
+
+The escalation attempt starts from the session the step would have started from without the router: none, or the one it inherits. It is never handed the failed attempt's own new session. On a provider that can fork a session the inherited one is untouched by the failed attempt. A provider that can only resume in place may have appended the failed attempt's turns to the inherited session, as it would for any retry.
+
+A lower-tier attempt that changed the checkout of a `mutates_checkout: false` step is not escalated, whether it completed or failed: the step stays failed on the attempt that made the change.
 
 ### The record
 
@@ -976,26 +989,28 @@ Each attempt of a routed step carries a `route` object on its execution binding,
 | `authoredTier`, `routedTier` | The ceiling, and the decision |
 | `applied` | Whether this attempt actually ran on a lower tier |
 | `chosenTier`, `probability`, `confidence`, `riskNoul`, `ambiguityNoul` | The classifier's answers, kept even when a floor overrode the choice |
-| `reason` | Why the decision is the ceiling, e.g. `high_risk`, `low_confidence`, `timeout`, `no_lower_tier`, `no_api_key` |
+| `reason` | Why the decision is the ceiling, e.g. `high_risk`, `low_confidence`, `timeout`, `no_lower_tier`, `unverifiable`, `router_error` |
 | `escalatedFrom`, `escalationReason` | Set on the escalation attempt |
 
-The step's own status and failure kind are the result. A resumed or restarted run reuses the route it recorded for a step instead of classifying it again, and a step that escalated stays on its authored tier. `archon workflow run --dry-run` makes no classifier call: it reports the unrouted resolution and marks the steps the router may lower.
+The step's own status and failure kind are the result. A resumed or restarted run reuses the route it recorded for a step instead of classifying it again, and a step that escalated stays on its authored tier. `archon workflow run --dry-run` makes no classifier call: it reports the unrouted resolution and marks the steps the router may lower, or says the router is inactive when it has no key or a switch is off.
 
 ### Rolling it out
 
 1. Add the block with `mode: shadow` and set `JEV_API_KEY`. Runs behave as before; route records accumulate.
 2. Read the records. Look for steps routed below a tier you would not accept, and at the answers behind them; tune the thresholds.
-3. Run the labelled evaluation: `bun --env-file="$HOME/.archon/.env" run scripts/model-router-eval.ts`. It must report zero under-routing.
+3. See what can move at all on your tiers: `bun run scripts/model-router-eval.ts --lowerable <tier-map>`. Then run the labelled evaluation: `bun --env-file="$HOME/.archon/.env" run scripts/model-router-eval.ts`, with `--map <tier-map>` to ask only about the steps that can move. It must report zero under-routing.
 4. Switch to `mode: apply`.
 
 The evaluation compares the router with hand-written labels, so a pass is a proxy for "no quality regression", not a measurement of it. The shadow records are the evidence from real workloads; a true measurement needs paired runs of the same step on both tiers.
 
 ### Known limits
 
-- The default `tiers: [medium]` covers every medium single-shot step, including review lenses and investigations (see the list above), not only extraction steps. Whether one is lowered is the classifier's call on each run.
+- The default `tiers: [medium]` puts every medium single-shot step on a routable tier (see the list above). Steps with no output contract are recorded as `unverifiable` and never lowered; for the rest, whether one is lowered is the classifier's call on each run.
 - The classifier's answers vary a little between identical requests. A case that sits on a threshold can land on either side, so read thresholds from many shadow records, not from one run.
 - A lower-tier attempt that completes with a worse answer that still satisfies the step's contract is not detected. Escalation catches failures, not quality.
-- A lower-tier attempt that modifies the checkout of a `mutates_checkout: false` step fails the step. It is not escalated, because the tree is already changed.
+- A lower-tier attempt that modifies the checkout of a `mutates_checkout: false` step fails the step. It is not escalated, because the tree is already changed. This can only happen within one provider: such a step is never moved to another.
+- **A step moved to another provider leaves the first provider's own hooks behind.** Hooks, permission rules and guard scripts that live in a provider's user or project settings (for example a Claude Code `PreToolUse` guard in `~/.claude/settings.json`) apply to that provider's sessions only. Archon's capability checks cannot see them, so a step lowered from Claude to another provider runs without them. If you rely on such a guard, keep every tier on that provider or leave the router in shadow mode.
+- Expect modest savings. With the small tier on another provider, only a minority of the bundled pack's medium steps can be lowered at all (`--lowerable` prints the current list), and on the labelled evaluation the classifier reliably lowers only the simplest of them.
 - Escalation runs the step again, as a retry does, so a step with side effects may repeat them.
 - Escalation is a second round of attempts. A failed output contract costs one attempt on each tier. A provider error is retried under the step's `retry:` policy on the lower tier first (by default up to 3 attempts, or 6 when rate-limited) and then again on the authored tier, so in the worst case a routed step uses twice the attempts of an unrouted one.
 - When the lower tier and the authored tier share a provider, a provider-wide failure (quota, authentication) fails on both; escalation costs one more failed attempt.
