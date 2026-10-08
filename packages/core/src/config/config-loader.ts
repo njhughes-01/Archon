@@ -56,6 +56,7 @@ import {
 } from '@archon/workflows/schemas/model-binding';
 import {
   modelRouterConfigInputSchema,
+  narrowModelRouterConfig,
   resolveModelRouterConfig,
 } from '@archon/workflows/schemas/model-router';
 
@@ -758,8 +759,18 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
     result.workflows = { ...result.workflows, ...repo.workflows };
   }
 
+  // The operator's install config owns the model router. A repository block narrows it and
+  // nothing else; one in a repository whose install has not opted in does nothing, and
+  // says so, because a silent no-op here would read as "the router is on".
   if (repo.modelRouter) {
-    result.modelRouter = resolveModelRouterConfig({ ...merged.modelRouter, ...repo.modelRouter });
+    if (merged.modelRouter) {
+      result.modelRouter = narrowModelRouterConfig(merged.modelRouter, repo.modelRouter);
+    } else {
+      getLog().warn(
+        { requested: repo.modelRouter },
+        'config.model_router_repo_block_ignored_without_install_opt_in'
+      );
+    }
   }
 
   // Commands config

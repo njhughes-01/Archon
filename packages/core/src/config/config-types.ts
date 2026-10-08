@@ -250,7 +250,10 @@ export interface RepoConfig {
   /** Project override for quota-failure continuation. */
   workflows?: WorkflowContinuationConfig;
 
-  /** Project override for the model router; each field overrides the install's. */
+  /**
+   * Narrows the install's model-router opt-in for this project: it may lower the mode and
+   * remove tiers, never raise the mode, add a tier or opt in where the install has not.
+   */
   modelRouter?: ModelRouterConfigInput;
 
   /**
@@ -440,8 +443,8 @@ export interface MergedConfig {
     quotaDeadlineMs: number;
   };
   /**
-   * The model router's opt-in with defaults applied (repo > global, per field). Undefined
-   * when neither config file has a `modelRouter:` block, which leaves the router off.
+   * The install's model-router opt-in with defaults applied, narrowed by the repo's block.
+   * Undefined when the install config has no `modelRouter:` block, which leaves the router off.
    */
   modelRouter?: ModelRouterConfig;
   commands: {

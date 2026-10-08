@@ -439,19 +439,68 @@ recommendedWorkflows: "archon-plan"
       expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'shadow' });
     });
 
-    test('merges global and repo modelRouter settings per field', async () => {
+    test.each([
+      ['turn it off', 'mode: off', { tiers: ['medium', 'large'], mode: 'off' }],
+      ['turn apply down to shadow', 'mode: shadow', { tiers: ['medium', 'large'], mode: 'shadow' }],
+      ['take a tier away', 'tiers: [medium]', { tiers: ['medium'], mode: 'apply' }],
+      ['take every tier away', 'tiers: []', { tiers: [], mode: 'apply' }],
+    ])('a repo modelRouter block can %s', async (_label, line, expected) => {
       mockFsReadFile.mockResolvedValueOnce(`
 modelRouter:
   tiers: [medium, large]
-  mode: shadow
+  mode: apply
 `).mockResolvedValueOnce(`
 modelRouter:
-  mode: apply
+  ${line}
 `);
 
       const config = await loadConfig('/test/repo');
 
-      expect(config.modelRouter).toEqual({ tiers: ['medium', 'large'], mode: 'apply' });
+      expect<unknown>(config.modelRouter).toEqual(expected);
+    });
+
+    test.each([
+      ['switch shadow to apply', 'mode: apply'],
+      ['add a tier', 'tiers: [small, medium, large]'],
+      ['add a tier while keeping the mode', 'tiers: [large]\n  mode: shadow'],
+    ])('a repo modelRouter block cannot %s', async (_label, line) => {
+      mockFsReadFile.mockResolvedValueOnce(`
+modelRouter:
+  tiers: [medium]
+  mode: shadow
+`).mockResolvedValueOnce(`
+modelRouter:
+  ${line}
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter?.mode).toBe('shadow');
+      expect(config.modelRouter?.tiers.every(tier => tier === 'medium')).toBe(true);
+    });
+
+    test('a repo modelRouter block cannot override an install-level off', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce('modelRouter:\n  mode: off')
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'off' });
+    });
+
+    test('a repo modelRouter block cannot opt in where the install has not, and says so', async () => {
+      mockLogger.warn.mockClear();
+      mockFsReadFile
+        .mockResolvedValueOnce('defaultAssistant: claude')
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply\n  tiers: [medium, large]');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
+      expect(mockLogger.warn.mock.calls.map(call => call[1])).toContain(
+        'config.model_router_repo_block_ignored_without_install_opt_in'
+      );
     });
 
     test('merges global and repo quota continuation policy per field', async () => {

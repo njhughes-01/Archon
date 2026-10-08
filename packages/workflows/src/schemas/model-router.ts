@@ -11,8 +11,9 @@ export const modelRouterModeSchema = z.enum(MODEL_ROUTER_MODES);
 export type ModelRouterMode = z.infer<typeof modelRouterModeSchema>;
 
 /**
- * Operator opt-in for the model router, as written under `modelRouter:` in the install or
- * repo config. Sparse, so a repo block can change one setting and keep the install's other.
+ * The model router's block as written under `modelRouter:`. In the install config it is
+ * the operator's opt-in; in a repository's config it can only narrow that opt-in (see
+ * `narrowModelRouterConfig`). Sparse, so a block can set one field and leave the other.
  */
 export const modelRouterConfigInputSchema = z.object({
   tiers: z.array(tierNameSchema).optional(),
@@ -33,6 +34,32 @@ export interface ModelRouterConfig {
 export const DEFAULT_MODEL_ROUTER_TIERS: readonly TierName[] = ['medium'];
 /** A configured router records its routes without applying them until told to. */
 export const DEFAULT_MODEL_ROUTER_MODE: ModelRouterMode = 'shadow';
+
+/**
+ * Apply a repository's `modelRouter:` block to the install's. A repository can only narrow
+ * what the operator allowed: turn the router down or off, and take tiers away. It cannot
+ * switch the router on, move it toward `apply`, or add a tier. `MODEL_ROUTER_MODES` is
+ * ordered from least to most effect, which is the order "narrower" means here.
+ *
+ * The operator's install config decides what may be sent off the machine and which steps
+ * may run on a cheaper model. A repository's committed config is written by whoever can
+ * open a pull request against it.
+ */
+export function narrowModelRouterConfig(
+  install: ModelRouterConfig,
+  repo: ModelRouterConfigInput
+): ModelRouterConfig {
+  const repoTiers = repo.tiers;
+  const rank = (mode: ModelRouterMode): number => MODEL_ROUTER_MODES.indexOf(mode);
+  return {
+    tiers:
+      repoTiers === undefined
+        ? install.tiers
+        : install.tiers.filter(tier => repoTiers.includes(tier)),
+    mode:
+      repo.mode !== undefined && rank(repo.mode) < rank(install.mode) ? repo.mode : install.mode,
+  };
+}
 
 export function resolveModelRouterConfig(input: ModelRouterConfigInput): ModelRouterConfig {
   return {
