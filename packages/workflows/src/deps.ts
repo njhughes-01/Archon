@@ -19,6 +19,13 @@ import type {
   ProviderCapabilities,
 } from '@archon/providers/types';
 import type { RawAliasesConfig, RawTiersConfig } from './model-validation';
+import type { ToolGateConfig } from './tool-gate/config';
+
+// The gate's config vocabulary is part of `WorkflowConfig`, so it is exported
+// from here: the config loader that builds a `WorkflowConfig` gets the block's
+// types and its parse and merge rules without loading the gate itself.
+export { mergeToolGateConfig, parseToolGateConfig } from './tool-gate/config';
+export type { ToolGateConfig, ToolGateConfigInput } from './tool-gate/config';
 import type {
   WorkflowRunConfigLayer,
   WorkflowRunConfigMetadata,
@@ -123,6 +130,11 @@ export interface WorkflowConfig {
     loadDefaultWorkflows?: boolean;
     loadDefaultCommands?: boolean;
   };
+  /**
+   * The Tool Action Gate's install and repository settings. Absent or
+   * `enabled: false` means off: no node is given a gate.
+   */
+  toolGate?: ToolGateConfig;
   // Intersection: generic map for community providers + typed built-in entries.
   // Built-ins are typed so executor/dag-executor get type-safe config access for
   // Claude settingSources, Codex reasoningEffort, etc. without casts.

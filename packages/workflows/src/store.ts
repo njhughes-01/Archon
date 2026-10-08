@@ -190,6 +190,14 @@ export const WORKFLOW_EVENT_TYPES = [
   // event at the time, so a resume (a newer `workflow_started`) re-arms the follow-up.
   // `data.mode` is 'wake' | 'note' | 'skipped'; `data.attention` names what happened.
   'chat_follow_up_sent',
+  // One Tool Action Gate decision, written on the step whose tool call was judged.
+  // `data` is the gate's `ToolGateDecisionEvent` as it stands: tool, kind, decision,
+  // needsApproval, source (rule | jev | fallback), ruleId, latencyMs, commandHash and
+  // redactedPreview, plus score, noul and confidence when the classifier answered and
+  // classifierFailure when a configured classifier gave no usable answer.
+  // It never holds the raw command or tool input. Absence means the gate was off for
+  // the run, the tool was read-only, or the run predates this event type.
+  'tool_gate_decision',
 ] as const;
 
 export type WorkflowEventType = (typeof WORKFLOW_EVENT_TYPES)[number];

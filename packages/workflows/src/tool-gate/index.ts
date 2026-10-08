@@ -14,6 +14,7 @@ export {
   DEFAULT_NOUL_THRESHOLD,
   DEFAULT_SCORE_THRESHOLD,
   ESCALATION_LEVELS,
+  MAX_ESCALATION_TARGETS,
   NOUL_THRESHOLD_BOUNDS,
   REPEATED_DENIALS_RULE_ID,
   SCORE_THRESHOLD_BOUNDS,
@@ -48,4 +49,21 @@ export type {
 } from './rules';
 export { ESCALATION_TEXT_CAP, PREVIEW_TEXT_CAP, redactInput, redactText } from './redact';
 export type { RedactOptions } from './redact';
+export { collectCredentialValues, redactCredentialValues } from './credential-values';
+export { mergeToolGateConfig, parseToolGateConfig } from './config';
+export type { ToolGateConfig, ToolGateConfigInput } from './config';
+export {
+  createJevEscalator,
+  DEFAULT_GATE_TIMEOUT_MS,
+  MAX_GATE_TIMEOUT_MS,
+  readToolGateJevSettings,
+} from './escalate-jev';
+export type { ToolGateJevAvailability, ToolGateJevSettings } from './escalate-jev';
+export {
+  assertProviderHonoursToolGate,
+  createRunToolGate,
+  createWorkflowRunToolGate,
+  workflowToolGateRecorder,
+} from './run-gate';
+export type { RunToolGate, RunToolGateInput, WorkflowRunToolGateInput } from './run-gate';
 export { isSecretPath } from './secret-paths';

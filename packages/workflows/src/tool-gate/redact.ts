@@ -64,7 +64,7 @@ const SECRET_FLAG = new RegExp(
 const TOKEN_SHAPES =
   /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})/g;
 
-function maskCredentialValues(text: string, credentialValues: readonly string[]): string {
+export function maskCredentialValues(text: string, credentialValues: readonly string[]): string {
   const ordered = [...new Set(credentialValues)]
     .filter(value => value.length > 0)
     .sort((a, b) => b.length - a.length);
