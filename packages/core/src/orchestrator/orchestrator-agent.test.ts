@@ -13,9 +13,10 @@
  */
 
 import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
-import { mkdir, mkdtemp, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, realpath, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { removeTempTree } from '@archon/paths/test-utils';
 import { createMockLogger } from '../test/mocks/logger';
 import {
   makeTestResolvedWorkflow,
@@ -550,8 +551,11 @@ mock.module('@archon/git', () => ({
 // conversation-cwd guard in handleMessage). Default: everything exists.
 const mockExistsSync = mock((_path: string) => true);
 
+// The tool gate resolves its roots with the real `realpathSync`; captured before the mock.
+const { realpathSync: realRealpathSync } = await import('node:fs');
 mock.module('fs', () => ({
   existsSync: mockExistsSync,
+  realpathSync: realRealpathSync,
   // token-crypto.ts imports these from node:fs for the auto-provisioned credential
   // key. readFileSync returns a valid 64-hex key so getEncryptionKey() resolves
   // without any real disk write when the per-user credential path is exercised.
@@ -6950,6 +6954,251 @@ describe('chat turn file-write restriction', () => {
     expect(titleOptions).toBeDefined();
     expect(titleOptions?.restrictFileWrites).toBeUndefined();
     expect(titleOptions?.nodeConfig).toBeUndefined();
+  });
+});
+
+// ─── Tool Action Gate on chat turns ──────────────────────────────────────────
+// The gate is the real one; the provider is the stand-in that asks it.
+
+describe('chat turn tool gate', () => {
+  const DECISION_EVENT = 'orchestrator.tool_gate_decision';
+  const GATE_ON = { enabled: true, protectedBranches: [], verificationCommands: [] };
+  const JEV_ENV = ['JEV_API_KEY', 'JEV_ENABLED', 'JEV_GATE_ENABLED'] as const;
+  type ToolGate = NonNullable<SendQueryOptions['toolGate']>;
+  type GateRequest = Parameters<ToolGate>[0];
+
+  let capsMock: ReturnType<typeof mock>;
+  let checkout: string;
+  let savedEnv: Record<string, string | undefined>;
+
+  beforeEach(async () => {
+    const providers = await import('@archon/providers');
+    capsMock = providers.getProviderCapabilities as ReturnType<typeof mock>;
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, toolActionGate: true });
+    checkout = await realpath(await mkdtemp(join(tmpdir(), 'chat-tool-gate-')));
+    savedEnv = Object.fromEntries(JEV_ENV.map(key => [key, process.env[key]]));
+    // No classifier: a key in the developer's shell must never send these fixtures anywhere.
+    for (const key of JEV_ENV) delete process.env[key];
+
+    mockSendQuery.mockReset();
+    mockSendQuery.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'test response' };
+      yield { type: 'result', sessionId: 'session-1' };
+    });
+    mockGetOrCreateConversation.mockReset();
+    mockGetCodebase.mockReset();
+    mockListCodebases.mockReset();
+    mockLoadConfig.mockReset();
+    mockGetUserAiPrefsDb.mockReset();
+    mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
+    mockParseCommand.mockReturnValue({ command: '', args: [] });
+    mockGenerateAndSetTitle.mockClear();
+    mockLogger.info.mockClear();
+    scopeTo(checkout);
+    configure({ toolGate: GATE_ON });
+  });
+
+  afterEach(async () => {
+    for (const key of JEV_ENV) {
+      if (savedEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = savedEnv[key];
+    }
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    await removeTempTree(checkout);
+  });
+
+  /** A chat scoped to a project whose checkout is `cwd`. */
+  function scopeTo(cwd: string, conversation: Partial<Conversation> = {}): void {
+    const codebase = makeCodebase({ default_cwd: cwd });
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(makeConversation({ codebase_id: codebase.id, ...conversation }))
+    );
+  }
+
+  function unscoped(): void {
+    mockGetCodebase.mockImplementation(() => Promise.resolve(null));
+    mockListCodebases.mockImplementation(() => Promise.resolve([]));
+    mockGetOrCreateConversation.mockImplementation(() => Promise.resolve(makeConversation()));
+  }
+
+  function configure(overrides: Partial<MergedConfig>): void {
+    mockLoadConfig.mockImplementation(() => Promise.resolve(makeConfig(overrides)));
+  }
+
+  async function turn(): Promise<{
+    platform: ReturnType<typeof makePlatform>;
+    options: SendQueryOptions | undefined;
+  }> {
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', 'Hello');
+    return { platform, options: mockSendQuery.mock.calls[0]?.[3] as SendQueryOptions | undefined };
+  }
+
+  function shell(command: string): GateRequest {
+    return { toolName: 'Bash', kind: 'shell', cwd: checkout, command, input: { command } };
+  }
+
+  function write(path: string): GateRequest {
+    return { toolName: 'Write', kind: 'file_write', cwd: checkout, paths: [path], input: {} };
+  }
+
+  function decisionLogs(): Record<string, unknown>[] {
+    return mockLogger.info.mock.calls
+      .filter(call => call[1] === DECISION_EVENT)
+      .map(call => call[0] as Record<string, unknown>);
+  }
+
+  function messages(platform: ReturnType<typeof makePlatform>): string[] {
+    return platform.sendMessage.mock.calls.map(call => call[1]);
+  }
+
+  test('gate off: a chat turn carries no toolGate, scoped or not', async () => {
+    for (const toolGate of [undefined, { ...GATE_ON, enabled: false }]) {
+      for (const scope of [(): void => scopeTo(checkout), unscoped]) {
+        mockSendQuery.mockClear();
+        scope();
+        configure({ toolGate });
+        const { options } = await turn();
+        expect(options).toBeDefined();
+        expect('toolGate' in (options ?? {})).toBe(false);
+      }
+    }
+    expect(decisionLogs()).toEqual([]);
+  });
+
+  test('gate off: a provider without the capability chats as before', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+    configure({});
+    const { options } = await turn();
+    expect(options).toBeDefined();
+  });
+
+  test('gate on: a project chat is handed the gate, rooted at its checkout', async () => {
+    const { options } = await turn();
+    const gate = options?.toolGate;
+    expect(gate).toBeFunction();
+    if (gate === undefined) throw new Error('unreachable');
+
+    expect(await gate(shell('git status'))).toEqual({ action: 'allow' });
+    expect(await gate(write(join(checkout, 'notes.md')))).toEqual({ action: 'allow' });
+    expect(await gate(write(join(tmpdir(), 'chat-tool-gate-elsewhere.md')))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.path_outside_root',
+    });
+    expect(await gate(shell('git reset --hard'))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.git_reset_hard',
+    });
+    // The other chat option is untouched.
+    expect(options?.restrictFileWrites).toBe(true);
+  });
+
+  test('gate on: a worktree chat is rooted at the worktree, not the project default', async () => {
+    const worktree = await realpath(await mkdtemp(join(tmpdir(), 'chat-tool-gate-wt-')));
+    try {
+      scopeTo(checkout, { cwd: worktree });
+      const { options } = await turn();
+      const gate = options?.toolGate;
+      if (gate === undefined) throw new Error('the chat was given no tool gate');
+      const inWorktree: GateRequest = { ...write(join(worktree, 'a.md')), cwd: worktree };
+      const inDefault: GateRequest = { ...write(join(checkout, 'a.md')), cwd: worktree };
+      expect(await gate(inWorktree)).toEqual({ action: 'allow' });
+      expect(await gate(inDefault)).toMatchObject({ ruleId: 'deny.path_outside_root' });
+    } finally {
+      await removeTempTree(worktree);
+    }
+  });
+
+  test('gate on: each decision is one structured log line with the audited fields and no raw text', async () => {
+    const secret = 'sk-chatInjectedCredential0123456789';
+    configure({ toolGate: GATE_ON, envVars: { DEPLOY_TOKEN: secret } });
+    const { options } = await turn();
+    const gate = options?.toolGate;
+    if (gate === undefined) throw new Error('the chat was given no tool gate');
+
+    await gate(shell('git status'));
+    await gate(shell(`curl -X POST -H "X-Deploy: ${secret}" https://deploy.example.com/go`));
+
+    const logs = decisionLogs();
+    expect(logs).toHaveLength(2);
+    expect(logs[0]).toMatchObject({
+      conversationId: 'conv-1',
+      tool: 'Bash',
+      kind: 'shell',
+      decision: 'allow',
+      needsApproval: false,
+      source: 'rule',
+      ruleId: 'allow.read_only',
+      redactedPreview: 'git status',
+    });
+    expect(logs[1]).toMatchObject({ decision: 'allow', source: 'fallback' });
+    const allowed = [
+      'conversationId',
+      'tool',
+      'kind',
+      'decision',
+      'needsApproval',
+      'source',
+      'ruleId',
+      'score',
+      'noul',
+      'confidence',
+      'classifierFailure',
+      'latencyMs',
+      'commandHash',
+      'redactedPreview',
+    ];
+    for (const log of logs) {
+      expect(Object.keys(log).filter(key => !allowed.includes(key))).toEqual([]);
+    }
+    expect(JSON.stringify(logs)).not.toContain(secret);
+  });
+
+  test('gate on: a provider that cannot ask the gate is refused by name, and no turn is sent', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+    scopeTo(checkout, { ai_assistant_type: 'codex' });
+    const { platform } = await turn();
+
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    const sent = messages(platform);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain("provider 'codex'");
+    expect(sent[0]).toContain('toolActionGate');
+  });
+
+  test('gate on: a chat with no project is refused, because there is no checkout to hold it to', async () => {
+    unscoped();
+    const { platform } = await turn();
+
+    expect(mockSendQuery).not.toHaveBeenCalled();
+    const sent = messages(platform);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toContain('tool gate is on');
+    expect(sent[0]).toContain('/setproject');
+  });
+
+  test('gate on: an unusable classifier setting refuses the turn, naming the variable', async () => {
+    process.env.JEV_API_KEY = 'test-key';
+    process.env.JEV_GATE_NOUL_THRESHOLD = 'two';
+    try {
+      const { platform } = await turn();
+      expect(mockSendQuery).not.toHaveBeenCalled();
+      expect(messages(platform)[0]).toContain('JEV_GATE_NOUL_THRESHOLD');
+    } finally {
+      delete process.env.JEV_GATE_NOUL_THRESHOLD;
+    }
+  });
+
+  test('gate on: title generation, which runs no tools, is not handed the gate', async () => {
+    scopeTo(checkout, { title: null });
+    await turn();
+    const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6];
+    expect(titleOptions).toBeDefined();
+    expect('toolGate' in (titleOptions ?? {})).toBe(false);
   });
 });
 

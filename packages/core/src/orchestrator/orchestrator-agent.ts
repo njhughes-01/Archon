@@ -58,6 +58,11 @@ import {
   type PreparedWorkflowSource,
 } from '@archon/workflows/executor';
 import { InProcessWorkflowEngine } from '@archon/workflows/in-process-engine';
+import {
+  assertProviderHonoursToolGate,
+  collectCredentialValues,
+  createRunToolGate,
+} from '@archon/workflows/tool-gate';
 import type { WorkflowResumeAdmission } from '@archon/workflows/engine-port';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { liveSourceRoots } from '@archon/workflows/workflow-discovery';
@@ -2570,6 +2575,51 @@ export async function handleMessage(
     }
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
+    }
+
+    // Tool Action Gate: the same option workflow nodes get, held to the checkout
+    // this chat works in. A gate that is on and cannot judge the turn refuses it,
+    // like the missing-directory guards above: an ungated turn is not a fallback.
+    if (config.toolGate?.enabled === true) {
+      try {
+        if (scopedCodebase === undefined) {
+          // The fallback cwd is the workspaces root, which holds every project:
+          // rooting the gate there would call all of them "inside".
+          throw new Error(
+            'The tool gate is on, but this chat is not scoped to a project, so there is no ' +
+              'checkout to hold its tool calls to. Use `/setproject <name>` to scope it, or ' +
+              'switch the gate off (toolGate.enabled in ~/.archon/config.yaml).'
+          );
+        }
+        assertProviderHonoursToolGate(
+          config.toolGate,
+          providerKey,
+          getProviderCapabilities(providerKey)
+        );
+        // A chat has no run, so its decisions are recorded as structured log lines.
+        requestOptions.toolGate = createRunToolGate({
+          config: config.toolGate,
+          env: process.env,
+          repoRoot: cwd,
+          credentialValues: collectCredentialValues(
+            { ...process.env, ...effectiveEnv },
+            protectedEnvKeys,
+            undefined
+          ),
+          baseBranch: config.baseBranch,
+          record: event => {
+            getLog().info({ conversationId, ...event }, 'orchestrator.tool_gate_decision');
+          },
+        })?.forStep('chat');
+      } catch (error) {
+        const err = toError(error);
+        getLog().warn(
+          { err, conversationId, provider: providerKey },
+          'orchestrator.tool_gate_refused'
+        );
+        await platform.sendMessage(conversationId, `⚠️ ${err.message}`);
+        return;
+      }
     }
 
     if (!conversation.title && !trimmedMessage.startsWith('/')) {

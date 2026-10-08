@@ -170,6 +170,13 @@ import {
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
 import {
+  assertProviderHonoursToolGate,
+  collectCredentialValues,
+  createWorkflowRunToolGate,
+  redactCredentialValues,
+  type RunToolGate,
+} from './tool-gate';
+import {
   logNodeComplete,
   logAssistant,
   logExecOutput,
@@ -1715,6 +1722,9 @@ async function resolveNodeProviderAndModel(
         'capability). Use provider claude, or run without --container.'
     );
   }
+  // Same kind of backstop for the tool gate: a provider that cannot ask it would
+  // run every tool unchecked, so the node fails here instead.
+  assertProviderHonoursToolGate(config.toolGate, provider, caps);
 
   // Capability warnings — inform users when features are unsupported
   const capChecks: [string, keyof ProviderCapabilities, boolean][] = [
@@ -2270,6 +2280,7 @@ async function executeNodeInternal(
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
     ...(shouldForkSession ? { forkSession: true } : {}),
+    ...(ctx.toolGateRun && { toolGate: ctx.toolGateRun.forStep(stepName) }),
   };
   let nodeIdleTimedOut = false;
   let lastWatchdogReset: WatchdogReset | undefined;
@@ -3300,36 +3311,6 @@ function isSubprocessTimeout(error: RawSubprocessRejection): boolean {
   return error.killed === true && error.code === null;
 }
 
-const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
-const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
-
-function collectSubprocessCredentialValues(
-  env: NodeJS.ProcessEnv,
-  protectedEnvKeys: readonly string[] | undefined,
-  protectedCredentialValues: readonly string[] | undefined
-): string[] {
-  const explicitlyProtected = new Set(protectedEnvKeys);
-  const values = Object.entries(env).flatMap(([key, value]) =>
-    value &&
-    (explicitlyProtected.has(key) ||
-      CREDENTIAL_ENV_KEYS.has(key) ||
-      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
-      ? [value]
-      : []
-  );
-  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
-    .filter(value => value.length > 0)
-    .sort((a, b) => b.length - a.length);
-}
-
-function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
-  let result = input;
-  for (const value of credentialValues) {
-    result = result.replaceAll(value, '[REDACTED]');
-  }
-  return result;
-}
-
 /**
  * Scrub credentials from every subprocess rejection field that can carry
  * subprocess text. The exact values come from the engine's injected-credential
@@ -3409,7 +3390,7 @@ async function runSubprocess(
   // Both outcomes redact against the same values, so the credential set is resolved
   // once here rather than separately per path — a success path that redacted less than
   // the failure path would be the security hole, not a style difference.
-  const credentialValues = collectSubprocessCredentialValues(
+  const credentialValues = collectCredentialValues(
     subprocessEnv,
     options.protectedEnvKeys,
     options.protectedCredentialValues
@@ -5050,6 +5031,7 @@ async function executeLoopGroupBody(
       // enclosing tier and preset in place would run the group's model, attribute it to
       // the workflow's tier, and apply the workflow preset's effort to it.
       workflowLevelOptions: { ...ctx.workflowLevelOptions, workflowTier },
+      toolGateRun: ctx.toolGateRun,
       aiProfile: ctx.aiProfile,
       workflowPreset,
       artifactsDir: ctx.artifactsDir,
@@ -5652,6 +5634,8 @@ async function executeLoopNode(
   // ('' → node.id at top level, #2090). The loop's own per-iteration number lives in
   // each event's data (`iteration`), so no separate iteration param is threaded here.
   const stepName = stepNamePrefix + node.id;
+  // One gate for the whole loop node, so its denial count spans the iterations.
+  const loopToolGate = ctx.toolGateRun?.forStep(stepName);
 
   // A bare approval completes the captured execution without starting another attempt.
   // Feedback continues the invocation with a new attempt and the currently resolved binding.
@@ -6129,6 +6113,7 @@ async function executeLoopNode(
           const iterationOptions: SendQueryOptions | undefined = {
             ...resolvedOptions,
             abortSignal: iterationAbortController.signal,
+            ...(loopToolGate && { toolGate: loopToolGate }),
           };
 
           // Reask attempts start a FRESH session (mirrors runStreamPass in
@@ -9263,6 +9248,7 @@ async function executeComposeFanOutNode(
         workflowProvider: ctx.workflowProvider,
         workflowModel: ctx.workflowModel,
         workflowLevelOptions: ctx.workflowLevelOptions,
+        toolGateRun: ctx.toolGateRun,
         aiProfile: ctx.aiProfile,
         workflowPreset: ctx.workflowPreset,
         artifactsDir: ctx.artifactsDir,
@@ -9557,6 +9543,12 @@ interface RunDerived {
   /** Workflow name — used for persist_session keying + telemetry. */
   workflowName: string;
   workflowLevelOptions: WorkflowLevelOptions;
+  /**
+   * The run's Tool Action Gate, or undefined when the gate is off. Required rather
+   * than optional so every context builder has to forward it: a loop_group body
+   * built without it would run its agents ungated.
+   */
+  toolGateRun: RunToolGate | undefined;
   /** Cross-run session-persistence scope key (DB conversation UUID), or undefined to skip. */
   persistScopeKey: string | undefined;
   /** Workflow-level default for per-node `persist_session` (opt-in). */
@@ -11491,6 +11483,20 @@ export async function executeDagWorkflow(
   } = options;
   const dagStartTime = Date.now();
 
+  // Built before anything runs: a gate that is on and cannot judge this run (a
+  // container, an unusable classifier setting) stops it here.
+  const toolGateRun = createWorkflowRunToolGate({
+    config,
+    store: deps.store,
+    workflowRunId: workflowRun.id,
+    cwd,
+    artifactsDir,
+    stateDir,
+    logDir,
+    baseBranch,
+    inContainer: execContext.kind === 'container',
+  });
+
   // Container capability fail-fast: before ANY node runs (and before any
   // container work), reject a container run whose AI nodes resolve to a provider
   // that can't spawn in-container. No silent downgrade to the host — the user
@@ -11722,6 +11728,7 @@ export async function executeDagWorkflow(
     workflowProvider,
     workflowModel,
     workflowLevelOptions,
+    toolGateRun,
     aiProfile,
     workflowPreset,
     artifactsDir,
