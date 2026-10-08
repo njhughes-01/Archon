@@ -53,6 +53,18 @@ export class OpencodeProvider implements IAgentProvider {
     resumeSessionId?: string,
     requestOptions?: SendQueryOptions
   ): AsyncGenerator<MessageChunk> {
+    // The tool gate has no OpenCode translation (see `toolActionGate` in
+    // capabilities.ts). Running the request anyway would run every tool
+    // unasked while the caller believes the gate is on, so it is refused here
+    // as well as by the caller's capability check.
+    if (requestOptions?.toolGate) {
+      throw new Error(
+        'OpenCode cannot honour the tool action gate: this provider has no way to ask the gate ' +
+          'before every tool call. Turn the gate off for this request or use a provider that ' +
+          'declares toolActionGate.'
+      );
+    }
+
     const assistantConfig = parseOpencodeConfig(requestOptions?.assistantConfig ?? {});
     const modelRef = requestOptions?.model ?? assistantConfig.model;
     const parsedModelOrNull = modelRef ? parseModelRef(modelRef) : undefined;

@@ -1654,6 +1654,38 @@ describe('OpencodeProvider', () => {
     expect(runtime.client.session.update).not.toHaveBeenCalled();
   });
 
+  // ─── toolGate: not translated for OpenCode ──────────────────────────────
+
+  test('a request that turns the tool gate on is refused before anything runs', async () => {
+    const provider = new OpencodeProvider();
+    expect(provider.getCapabilities().toolActionGate).toBe(false);
+
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [idle('session-1')];
+    const gate = mock(async () => ({ action: 'allow' as const }));
+
+    let thrown: Error | undefined;
+    try {
+      for await (const _ of provider.sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        toolGate: gate,
+      })) {
+        // consume
+      }
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    // Running ungated while the caller believes the gate is on is the failure
+    // this guards: no runtime, no session, no prompt.
+    expect(thrown?.message).toContain('cannot honour the tool action gate');
+    expect(createdRuntimes).not.toContain(runtime);
+    expect(runtime.client.session.create).not.toHaveBeenCalled();
+    expect(runtime.client.session.promptAsync).not.toHaveBeenCalled();
+    expect(gate).not.toHaveBeenCalled();
+  });
+
   test('without restrictFileWrites no permission is sent on create or resume', async () => {
     const fresh = makeRuntime();
     runtimeQueue.push(fresh);

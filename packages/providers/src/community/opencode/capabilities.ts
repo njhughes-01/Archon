@@ -32,6 +32,30 @@ export const OPENCODE_CAPABILITIES: ProviderCapabilities = {
   // restrictFileWrites → session permission ruleset with `edit` denied
   // (session.ts). Wired from the SDK typings only; not run against OpenCode.
   fileWriteRestriction: true,
+  // toolGate has NO translation, and the provider refuses a request that sets
+  // it (provider.ts). The planned route was a session rule `ask` for the
+  // state-changing permissions, answered from `permission.asked` through the
+  // reply endpoint. Every piece exists in the SDK's `./v2` typings
+  // (`PermissionRuleset` on session create/update, `EventPermissionAsked`,
+  // `POST /permission/{requestID}/reply` with a `message`), but that route
+  // cannot deliver "ask before every state-changing call" as far as the typings
+  // and OpenCode's own source show; none of it was run, no OpenCode exists on
+  // the host this was written on:
+  //   - Rules are flattened and the LAST match wins (upstream
+  //     `permission.evaluate`). A session `ask` therefore beats the user's
+  //     `allow`, and equally the user's `deny`: with the gate on, a command the
+  //     user's own config forbids would run whenever the gate allows it.
+  //   - The same evaluation reads the user's saved "always" approvals after the
+  //     session rules, so an approval stored earlier answers before any ask.
+  //   - A `task` sub-agent runs in a child session whose rules OpenCode derives
+  //     itself; nothing in the typings puts this session's `ask` rules there.
+  //   - MCP tools ask under their own tool names, which cannot be listed ahead
+  //     of time, and a catch-all rule would also override every user rule.
+  //   - This provider's client is the SDK's v1 surface, whose reply route takes
+  //     no message, so the reason would need a second (v2) client.
+  // Still unknown: whether `permission.asked` carries the full command text
+  // (`patterns`/`metadata` are untyped), and what the model is shown on a reject.
+  toolActionGate: false,
   structuredOutput: 'enforced', // sends format:{json_schema}; reads info.structured_output
   requiresAllPropertiesRequired: false, // OpenCode does not enforce the required-coverage rule
   envInjection: true,
