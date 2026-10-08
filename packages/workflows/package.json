@@ -39,7 +39,8 @@
     "./node-execution": "./src/node-execution.ts",
     "./node-record-serialization": "./src/node-record-serialization.ts",
     "./node-event-write": "./src/node-event-write.ts",
-    "./logger": "./src/logger.ts"
+    "./logger": "./src/logger.ts",
+    "./tool-gate": "./src/tool-gate/index.ts"
   },
   "scripts": {
     "test": "bun run ../../scripts/package-tests.ts",
@@ -183,6 +184,9 @@
     ],
     [
       "src/jev/"
+    ],
+    [
+      "src/tool-gate/"
     ]
   ]
 }
