@@ -133,34 +133,6 @@ function getLog(): ReturnType<typeof createLogger> {
 const MAX_BATCH_ASSISTANT_CHUNKS = 20;
 /** Max total chunks (assistant + tool) to keep in batch mode */
 const MAX_BATCH_TOTAL_CHUNKS = 200;
-
-/**
- * File-writing built-ins a direct-chat turn runs without: chat answers and
- * researches, workflows change files. `Bash` stays — project setup clones with
- * it and read-only inspection needs it — so this narrows the turn rather than
- * sandboxing it; the routing rules in the system prompt carry the rest.
- */
-const CHAT_DENIED_TOOLS = ['Write', 'Edit', 'NotebookEdit'] as const;
-
-/**
- * The subset of {@link CHAT_DENIED_TOOLS} a provider can actually deny, or
- * `undefined` when it can deny none of them.
- *
- * Tool names are provider vocabulary, so `toolRestrictions` alone is not enough
- * to send them: only a name the provider lists in `knownToolNames` is one it
- * will match. A provider that restricts tools without declaring a vocabulary
- * is left alone — a foreign name there is either ignored while looking like
- * protection, or (Pi) switches the turn onto a different tool set. For those
- * providers, and for ones with no tool restrictions at all, the routing rules
- * are the only control.
- */
-function resolveChatDeniedTools(provider: string): string[] | undefined {
-  const { toolRestrictions, knownToolNames } = getProviderCapabilities(provider);
-  if (!toolRestrictions || knownToolNames === undefined) return undefined;
-  const denied = CHAT_DENIED_TOOLS.filter(name => knownToolNames.includes(name));
-  return denied.length > 0 ? denied : undefined;
-}
-
 function applyPresetToRequestOptions(
   provider: string,
   preset: ModelAliasPreset,
@@ -2549,15 +2521,18 @@ export async function handleMessage(
       protectedEnvKeys: protectedEnvKeys.length > 0 ? protectedEnvKeys : undefined,
       model: chatRequest.model,
       systemPrompt,
+      restrictFileWrites: true,
     };
-    // Chat-only, and set before the preset: applyPresetToRequestOptions merges
-    // its effort into this nodeConfig rather than replacing it. No nodeId, so
-    // the provider keeps treating the turn as chat (ambient skills and MCP stay).
-    // Title generation and workflow nodes build their own options and never
-    // see this.
-    const chatDeniedTools = resolveChatDeniedTools(providerKey);
-    if (chatDeniedTools !== undefined) {
-      requestOptions.nodeConfig = { denied_tools: chatDeniedTools };
+    // Chat answers and researches; workflows change files. Stated to every
+    // provider as one neutral option, which each translates into its own
+    // mechanism. A provider that cannot is warned about by name, because there
+    // the routing rules in the system prompt are the only control. Title
+    // generation and workflow nodes build their own options and never carry it.
+    if (getProviderCapabilities(providerKey).fileWriteRestriction !== true) {
+      getLog().warn(
+        { provider: providerKey },
+        'orchestrator.chat_file_write_restriction_unsupported'
+      );
     }
     if (chatRequest.preset) {
       applyPresetToRequestOptions(providerKey, chatRequest.preset, requestOptions);
@@ -2592,11 +2567,7 @@ export async function handleMessage(
     // 5. Send to AI provider
     const aiClient = getAgentProvider(providerKey);
     getLog().debug(
-      {
-        assistantType: conversation.ai_assistant_type,
-        resolvedAssistantType: providerKey,
-        deniedTools: chatDeniedTools,
-      },
+      { assistantType: conversation.ai_assistant_type, resolvedAssistantType: providerKey },
       'sending_to_ai'
     );
 

@@ -842,6 +842,17 @@ archon ai default pi openrouter/minimax/minimax-m2 --scope user
 
 The model-tier presets are the same ones you can hand-write in `~/.archon/config.yaml`; see [Configuration](/reference/configuration/) for the YAML format.
 
+**What chat can change.** The chat agent answers questions and does read-only research; work that changes files runs in a workflow. Archon tells the agent this in its instructions and also asks the provider to run every chat turn without its built-in file-editing tools. How that request is honoured depends on the provider:
+
+| Provider | Chat turn runs with |
+| --- | --- |
+| `claude` | `Write`, `Edit` and `NotebookEdit` removed |
+| `pi` | `read` and `bash` only (no `edit` or `write`) |
+| `copilot` | file-write permission requests refused |
+| `codex`, `opencode` | no restriction available — the instructions are the only control, and Archon logs `orchestrator.chat_file_write_restriction_unsupported` on each chat turn |
+
+The shell stays available on every provider (project setup clones with it, and research reads with it), so this is a guard against the agent quietly editing a project, not a sandbox. Workflow nodes are never restricted this way. The [capability matrix](/reference/provider-capabilities/) row "Direct chat without file-editing tools" is generated from the same flags.
+
 ### Per-run model bindings
 
 The console's **Start a new run** card and `archon workflow run --model <name>=<spec>` can sparsely rebind tiers and existing aliases for one invocation. For example, `--model large=openai/gpt-5.6` changes only `large`; `small`, `medium`, and every alias still resolve through personal preferences, repository config, install config, and built-in defaults. A node pinned to a literal model does not change.

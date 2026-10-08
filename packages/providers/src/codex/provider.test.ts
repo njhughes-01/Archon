@@ -100,6 +100,7 @@ describe('CodexProvider', () => {
         skills: false,
         agents: false,
         toolRestrictions: false,
+        fileWriteRestriction: false,
         structuredOutput: 'enforced',
         requiresAllPropertiesRequired: true,
         envInjection: true,
@@ -1035,6 +1036,32 @@ describe('CodexProvider', () => {
         expect.objectContaining({
           workingDirectory: '/my/workspace',
           skipGitRepoCheck: true,
+          sandboxMode: 'danger-full-access',
+          networkAccessEnabled: true,
+          approvalPolicy: 'never',
+        })
+      );
+    });
+
+    test('restrictFileWrites does not change the thread sandbox', async () => {
+      // No Codex sandbox mode blocks project writes while leaving the shell able
+      // to write elsewhere and reach the network, so the capability is declared
+      // false and the thread options stay as they are (see capabilities.ts).
+      mockRunStreamed.mockResolvedValue({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: defaultUsage };
+        })(),
+      });
+
+      for await (const _ of client.sendQuery('test prompt', '/my/workspace', undefined, {
+        restrictFileWrites: true,
+      })) {
+        // consume
+      }
+
+      expect(client.getCapabilities().fileWriteRestriction).toBe(false);
+      expect(mockStartThread).toHaveBeenCalledWith(
+        expect.objectContaining({
           sandboxMode: 'danger-full-access',
           networkAccessEnabled: true,
           approvalPolicy: 'never',

@@ -603,7 +603,8 @@ export class PiProvider implements IAgentProvider {
     const { tools: filteredTools, unknownTools } = resolvePiTools(
       cwd,
       nodeConfig,
-      requestOptions?.env
+      requestOptions?.env,
+      requestOptions?.restrictFileWrites
     );
     if (unknownTools.length > 0) {
       yield {

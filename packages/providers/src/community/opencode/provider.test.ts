@@ -1558,6 +1558,31 @@ describe('OpencodeProvider', () => {
     });
   });
 
+  test('restrictFileWrites is declared unsupported and no tool map is guessed for it', async () => {
+    // OpenCode's per-prompt `tools` map takes tool ids the installed SDK does
+    // not type, and its typed `permission.edit` lives in server or agent
+    // config, which the embedded runtime deliberately leaves to the user. The
+    // capability says so; the request must not carry an invented restriction.
+    expect(new OpencodeProvider().getCapabilities().fileWriteRestriction).toBe(false);
+
+    const runtime = makeRuntime();
+    runtimeQueue.push(runtime);
+    scriptedEvents = [{ type: 'session.idle', properties: { sessionID: 'session-1' } }];
+
+    const { error } = await consume(
+      new OpencodeProvider().sendQuery('hi', '/tmp', undefined, {
+        assistantConfig: TEST_MODEL,
+        restrictFileWrites: true,
+      })
+    );
+
+    expect(error).toBeUndefined();
+    const [{ body }] = runtime.client.session.promptAsync.mock.calls[0] as [
+      { body: Record<string, unknown> },
+    ];
+    expect(body).not.toHaveProperty('tools');
+  });
+
   test('external baseUrl mode is rejected to enforce managed runtime control', async () => {
     const cwd = await createTempProjectDir();
     const nodeConfig = {

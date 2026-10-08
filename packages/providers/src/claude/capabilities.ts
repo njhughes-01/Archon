@@ -35,6 +35,17 @@ const CLAUDE_KNOWN_TOOL_NAMES = [
 ] as const;
 
 /**
+ * The built-ins that write files, removed from a turn that sets
+ * `restrictFileWrites`. Typed against the audited vocabulary above so a name the
+ * list no longer carries fails to compile instead of denying nothing (#2084).
+ */
+export const CLAUDE_FILE_WRITE_TOOLS = [
+  'Write',
+  'Edit',
+  'NotebookEdit',
+] as const satisfies readonly (typeof CLAUDE_KNOWN_TOOL_NAMES)[number][];
+
+/**
  * Tools the SDK renamed — a stale old name in allowed_tools/denied_tools is a
  * silent no-op at runtime (the trigger for #2084: `denied_tools: [Task]`
  * denied nothing after the 0.3.193 Task → Agent rename).
@@ -53,6 +64,7 @@ export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   skills: true,
   agents: true,
   toolRestrictions: true,
+  fileWriteRestriction: true, // restrictFileWrites → disallowedTools (CLAUDE_FILE_WRITE_TOOLS)
   knownToolNames: CLAUDE_KNOWN_TOOL_NAMES,
   renamedTools: CLAUDE_RENAMED_TOOLS,
   structuredOutput: 'enforced', // SDK output_config.format grammar-constrains decoding

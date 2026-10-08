@@ -181,6 +181,58 @@ describe('CopilotProvider.sendQuery', () => {
     expect(opts.model).toBe('auto');
   });
 
+  // ─── restrictFileWrites: the provider-neutral "no file writes" intent ────
+
+  async function sessionConfigFor(options: Parameters<CopilotProvider['sendQuery']>[3]): Promise<{
+    onPermissionRequest: (request: { kind: string }, invocation: { sessionId: string }) => unknown;
+    excludedTools?: string[];
+  }> {
+    const session = makeFakeSession('sess-restrict');
+    nextCreateSessionResult = session;
+    const gen = new CopilotProvider().sendQuery('hi', '/tmp', undefined, options);
+    const firstNext = gen.next();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    session.fire(evt('assistant.message_delta', { messageId: 'm', deltaContent: 'hi' }));
+    session.resolveSend(undefined);
+    await firstNext;
+    await collect(gen);
+    return createSessionSpy.mock.calls[0]![0] as Awaited<ReturnType<typeof sessionConfigFor>>;
+  }
+
+  test('restrictFileWrites rejects file-write permission requests', async () => {
+    const config = await sessionConfigFor({ assistantConfig: {}, restrictFileWrites: true });
+
+    const decision = config.onPermissionRequest({ kind: 'write' }, { sessionId: 's' }) as {
+      kind: string;
+      feedback?: string;
+    };
+
+    expect(decision.kind).toBe('reject');
+    expect(decision.feedback).toContain('workflow');
+    expect(approveAllStub).not.toHaveBeenCalled();
+    // The refusal is the permission decision, not a guessed built-in tool name.
+    expect(config.excludedTools).toBeUndefined();
+  });
+
+  test('restrictFileWrites still approves every other permission kind', async () => {
+    const config = await sessionConfigFor({ assistantConfig: {}, restrictFileWrites: true });
+
+    for (const kind of ['shell', 'read', 'mcp', 'url', 'custom-tool']) {
+      expect(config.onPermissionRequest({ kind }, { sessionId: 's' })).toEqual({
+        kind: 'approved',
+      });
+    }
+    expect(approveAllStub).toHaveBeenCalledTimes(5);
+  });
+
+  test('without restrictFileWrites file writes are approved like everything else', async () => {
+    const config = await sessionConfigFor({ assistantConfig: {} });
+
+    expect(config.onPermissionRequest({ kind: 'write' }, { sessionId: 's' })).toEqual({
+      kind: 'approved',
+    });
+  });
+
   test('passes model + streaming=true + workingDirectory to createSession', async () => {
     const session = makeFakeSession('sess-1');
     nextCreateSessionResult = session;

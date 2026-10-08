@@ -93,6 +93,44 @@ describe('resolvePiTools', () => {
     expect(result.unknownTools).toEqual([]);
   });
 
+  // ─── restrictFileWrites: the provider-neutral "no file writes" intent ────
+
+  const toolNames = (result: ReturnType<typeof resolvePiTools>): string[] | undefined =>
+    result.tools?.map(tool => tool.name);
+
+  test('restrictFileWrites leaves Pi its default tools minus edit and write', () => {
+    // Not `denied_tools`: that starts from all seven built-ins and would hand
+    // the chat grep/find/ls it does not have today.
+    const result = resolvePiTools(cwd, undefined, undefined, true);
+    expect(toolNames(result)).toEqual(['read', 'bash']);
+    expect(result.unknownTools).toEqual([]);
+  });
+
+  test('restrictFileWrites holds when env forces a custom bash tool', () => {
+    const result = resolvePiTools(cwd, undefined, { DATABASE_URL: 'postgres://x' }, true);
+    expect(toolNames(result)).toEqual(['read', 'bash']);
+  });
+
+  test('restrictFileWrites removes edit and write from an explicit allow list', () => {
+    const result = resolvePiTools(
+      cwd,
+      { allowed_tools: ['read', 'edit', 'write'] },
+      undefined,
+      true
+    );
+    expect(toolNames(result)).toEqual(['read']);
+  });
+
+  test('restrictFileWrites removes edit and write from a deny-list selection', () => {
+    const result = resolvePiTools(cwd, { denied_tools: ['bash'] }, undefined, true);
+    expect(toolNames(result)).toEqual(['read', 'grep', 'find', 'ls']);
+  });
+
+  test('without restrictFileWrites edit and write stay available', () => {
+    const result = resolvePiTools(cwd, undefined, { DATABASE_URL: 'postgres://x' });
+    expect(toolNames(result)).toEqual(['read', 'bash', 'edit', 'write']);
+  });
+
   test('denied_tools alone starts from full built-in set', () => {
     const result = resolvePiTools(cwd, { denied_tools: ['bash', 'write'] });
     // Pi has 7 built-in tools, 2 denied → 5 remain

@@ -54,7 +54,6 @@ import type * as UserProviderKeyStore from '../db/user-provider-key-store';
 import type * as Paths from '@archon/paths';
 import type * as RunLiveOwnerModule from '../services/run-live-owner';
 import { captureWorkflowSource } from '../../../workflows/src/workflow-source';
-import { CLAUDE_CAPABILITIES } from '../../../providers/src/claude/capabilities';
 import { trackTempRoots } from '@archon/paths/test-utils';
 
 const trackTempRoot = trackTempRoots();
@@ -6722,15 +6721,8 @@ describe('per-user AI prefs in chat + tier-fallback nudge', () => {
 
 // ─── Chat turns cannot write files: chat talks, workflows build ───────────────
 
-describe('chat turn tool restriction', () => {
-  // The real Claude vocabulary rather than a copy: if an SDK bump renames one of
-  // the denied tools, the provider's audited list changes and this suite fails
-  // instead of the denial quietly shrinking.
-  const claudeLikeCaps: ProviderCapabilities = {
-    ...DEFAULT_PROVIDER_CAPS,
-    toolRestrictions: true,
-    knownToolNames: CLAUDE_CAPABILITIES.knownToolNames,
-  };
+describe('chat turn file-write restriction', () => {
+  const UNSUPPORTED_EVENT = 'orchestrator.chat_file_write_restriction_unsupported';
   let capsMock: ReturnType<typeof mock>;
 
   beforeEach(async () => {
@@ -6749,6 +6741,7 @@ describe('chat turn tool restriction', () => {
     mockGetUserAiPrefsDb.mockImplementation(async () => ({}));
     mockParseCommand.mockReturnValue({ command: '', args: [] });
     mockGenerateAndSetTitle.mockClear();
+    mockLogger.warn.mockClear();
   });
 
   afterEach(() => {
@@ -6760,21 +6753,64 @@ describe('chat turn tool restriction', () => {
     return mockSendQuery.mock.calls[0][3] as SendQueryOptions;
   }
 
-  test('a Claude chat turn runs with the file-writing tools denied and Bash kept', async () => {
-    capsMock.mockReturnValue(claudeLikeCaps);
+  function unsupportedWarning(): Record<string, unknown> | undefined {
+    const call = mockLogger.warn.mock.calls.find(c => c[1] === UNSUPPORTED_EVENT) as
+      | [Record<string, unknown>, string]
+      | undefined;
+    return call?.[0];
+  }
+
+  test('every chat turn states the intent, in provider-neutral terms', async () => {
+    // One flag for every provider. Tool names are each provider's own business,
+    // so none travel in the request — and no nodeConfig is invented to carry them.
+    for (const provider of ['claude', 'codex', 'pi', 'copilot', 'opencode']) {
+      mockSendQuery.mockClear();
+      mockGetOrCreateConversation.mockImplementation(() =>
+        Promise.resolve(makeConversation({ ai_assistant_type: provider }))
+      );
+      // Only claude and codex ship built-in tiers; give every provider one.
+      mockLoadConfig.mockImplementation(() =>
+        Promise.resolve(makeConfig({ tiers: { large: { provider, model: 'test-model' } } }))
+      );
+
+      const options = await chatRequestOptions();
+
+      expect(options.restrictFileWrites).toBe(true);
+      expect(options.nodeConfig).toBeUndefined();
+    }
+  });
+
+  test('a provider that honours the restriction raises no warning', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, fileWriteRestriction: true });
+
+    await chatRequestOptions();
+
+    expect(unsupportedWarning()).toBeUndefined();
+  });
+
+  test('a provider that cannot honour it is named in a warning: the prompt rule is the only control', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, fileWriteRestriction: false });
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(makeConversation({ ai_assistant_type: 'codex' }))
+    );
 
     const options = await chatRequestOptions();
 
-    expect(options.nodeConfig?.denied_tools).toEqual(['Write', 'Edit', 'NotebookEdit']);
-    // Project setup clones with Bash and research reads with it.
-    expect(options.nodeConfig?.denied_tools).not.toContain('Bash');
-    // No nodeId: the turn must not be mistaken for a workflow node, which would
-    // strip the chat's ambient skills and MCP servers.
-    expect(options.nodeConfig?.nodeId).toBeUndefined();
+    expect(unsupportedWarning()).toEqual({ provider: 'codex' });
+    // The intent is still stated; the provider is free to start honouring it.
+    expect(options.restrictFileWrites).toBe(true);
   });
 
-  test('a tier effort and the denial share nodeConfig without overwriting each other', async () => {
-    capsMock.mockReturnValue(claudeLikeCaps);
+  test('a provider that does not declare the capability is treated as unable', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
+
+    await chatRequestOptions();
+
+    expect(unsupportedWarning()).toEqual({ provider: 'claude' });
+  });
+
+  test('a tier effort still rides nodeConfig, alone', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, fileWriteRestriction: true });
     mockLoadConfig.mockImplementation(() =>
       Promise.resolve(
         makeConfig({ tiers: { large: { provider: 'claude', model: 'opus', effort: 'high' } } })
@@ -6783,33 +6819,12 @@ describe('chat turn tool restriction', () => {
 
     const options = await chatRequestOptions();
 
-    expect(options.nodeConfig).toEqual({
-      denied_tools: ['Write', 'Edit', 'NotebookEdit'],
-      effort: 'high',
-    });
+    expect(options.nodeConfig).toEqual({ effort: 'high' });
+    expect(options.restrictFileWrites).toBe(true);
   });
 
-  test('a provider without tool restrictions gets no denial (Codex: the prompt rule is the only control)', async () => {
-    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, toolRestrictions: false });
-
-    const options = await chatRequestOptions();
-
-    expect(options.nodeConfig).toBeUndefined();
-  });
-
-  test('a provider that restricts tools but declares no vocabulary is not sent Claude tool names', async () => {
-    // Pi, OpenCode and Copilot: `toolRestrictions` without `knownToolNames`.
-    // Sending them Claude's names would either change their tool set (Pi) or
-    // be ignored while looking like protection.
-    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, toolRestrictions: true });
-
-    const options = await chatRequestOptions();
-
-    expect(options.nodeConfig).toBeUndefined();
-  });
-
-  test('title generation is not given the denial', async () => {
-    capsMock.mockReturnValue(claudeLikeCaps);
+  test('title generation is not given the restriction', async () => {
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS, fileWriteRestriction: true });
     mockGetOrCreateConversation.mockImplementation(() =>
       Promise.resolve(makeConversation({ title: null }))
     );
@@ -6818,6 +6833,7 @@ describe('chat turn tool restriction', () => {
 
     const titleOptions = mockGenerateAndSetTitle.mock.calls[0]?.[6];
     expect(titleOptions).toBeDefined();
+    expect(titleOptions?.restrictFileWrites).toBeUndefined();
     expect(titleOptions?.nodeConfig).toBeUndefined();
   });
 });

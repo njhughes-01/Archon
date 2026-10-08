@@ -46,7 +46,7 @@ import type {
   NodeConfig,
 } from '../types';
 import { parseClaudeConfig } from './config';
-import { CLAUDE_CAPABILITIES } from './capabilities';
+import { CLAUDE_CAPABILITIES, CLAUDE_FILE_WRITE_TOOLS } from './capabilities';
 import { buildContainerSpawn } from './container-spawn';
 import { resolveClaudeBinaryPath, pathKind } from './binary-resolver';
 import { buildArchonMcpServer, ARCHON_TOOL_SERVER } from './native-tools';
@@ -1568,6 +1568,15 @@ export class ClaudeProvider implements IAgentProvider {
       // 2. Apply nodeConfig translation (re-applied per attempt since options are fresh)
       if (requestOptions?.nodeConfig) {
         await applyNodeConfig(options, requestOptions.nodeConfig, cwd, skillSearch);
+      }
+
+      // restrictFileWrites → disallowedTools. Outside the nodeConfig block: a
+      // chat turn usually carries no nodeConfig. Added to any node denial
+      // rather than replacing it.
+      if (requestOptions?.restrictFileWrites) {
+        options.disallowedTools = [
+          ...new Set([...(options.disallowedTools ?? []), ...CLAUDE_FILE_WRITE_TOOLS]),
+        ];
       }
 
       options.systemPrompt = withPerRequestSystemPrompt(options.systemPrompt);
