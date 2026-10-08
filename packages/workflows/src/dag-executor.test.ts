@@ -2710,7 +2710,8 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     'JEV_ROUTER_MIN_CONFIDENCE',
     'JEV_ROUTER_RISK_THRESHOLD',
     'JEV_ROUTER_AMBIGUITY_THRESHOLD',
-    'JEV_ROUTER_MAX_CHARS',
+    'JEV_ROUTER_MAX_STEP_CHARS',
+    'JEV_ROUTER_MAX_TASK_CHARS',
   ] as const;
   const savedEnv = new Map<string, string | undefined>();
   const API_KEY = 'router-test-key-never-logged';

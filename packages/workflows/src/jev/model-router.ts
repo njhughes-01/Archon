@@ -38,15 +38,21 @@ export const ROUTER_DEFAULTS = {
   /** The longest a node waits for a route before it runs on its authored tier. */
   timeoutMs: 3000,
   /** The chosen tier needs at least this probability. */
-  minProbability: 0.7,
+  minProbability: 0.75,
   /** The choice needs at least this confidence. */
   minConfidence: 0.5,
   /** A high-risk answer at or above this keeps the ceiling. */
   riskThreshold: 0.3,
   /** An ambiguous-or-multi-step answer at or above this keeps the ceiling. */
   ambiguityThreshold: 0.5,
-  /** Most characters of the step text, and separately of the task text, that are sent. */
-  maxChars: 6000,
+  /**
+   * Most characters of the step's authored text that are sent. Deliberately short: the
+   * opening of a command or prompt says what the step is for, and the pages of procedure
+   * after it make every step read as long, multi-part work.
+   */
+  maxStepChars: 1200,
+  /** Most characters of the run's task text that are sent. */
+  maxTaskChars: 4000,
 } as const;
 
 export interface RouterThresholds {
@@ -61,7 +67,8 @@ export interface RouterSettings extends RouterThresholds {
   apiBase: string;
   model: string;
   timeoutMs: number;
-  maxChars: number;
+  maxStepChars: number;
+  maxTaskChars: number;
 }
 
 export type RouterEnv = Readonly<Record<string, string | undefined>>;
@@ -113,7 +120,16 @@ export function readRouterSettings(
       ROUTER_DEFAULTS.ambiguityThreshold,
       isUnit
     ),
-    maxChars: read('JEV_ROUTER_MAX_CHARS', ROUTER_DEFAULTS.maxChars, isPositiveInteger),
+    maxStepChars: read(
+      'JEV_ROUTER_MAX_STEP_CHARS',
+      ROUTER_DEFAULTS.maxStepChars,
+      isPositiveInteger
+    ),
+    maxTaskChars: read(
+      'JEV_ROUTER_MAX_TASK_CHARS',
+      ROUTER_DEFAULTS.maxTaskChars,
+      isPositiveInteger
+    ),
   };
   if (invalid.length > 0) return { ok: false, reason: `invalid_setting:${invalid[0]}` };
   return { ok: true, settings };
@@ -344,32 +360,37 @@ export function decideTier(
 /** Facts about a step computed in code, so the classifier need not infer them from prose. */
 export interface RouteFeatures {
   [key: string]: JevStateValue;
+  /** The command a step runs, or the node's id for an inline prompt. Authored, never run data. */
+  step_name: string;
   node_kind: 'command' | 'inline';
-  authored_tier: TierName;
   has_output_format: boolean;
   tools_declared: boolean;
   mcp_present: boolean;
   skills_present: boolean;
-  /** False only when the node declares `mutates_checkout: false`. */
-  mutates_checkout: boolean;
+  /**
+   * The node declares `mutates_checkout: false`, so the engine fails it if it changes the
+   * working tree. Named for what is known: a node that does not declare it may still be
+   * read-only by its instructions, so the reverse (`mutates_checkout: true`) would claim
+   * more than the engine knows.
+   */
+  read_only_enforced: boolean;
   /** Characters of step and task text before either is cut. */
   context_chars: number;
 }
 
-export function routeFeatures(
-  node: AgentNode,
-  authoredTier: TierName,
-  stepText: string,
-  taskText: string
-): RouteFeatures {
+/**
+ * The authored tier is deliberately not among the facts: the offered tiers are already the
+ * question's options, and telling the classifier which one the author picked anchors it there.
+ */
+export function routeFeatures(node: AgentNode, stepText: string, taskText: string): RouteFeatures {
   return {
+    step_name: node.source.kind === 'command' ? node.source.name : node.id,
     node_kind: node.source.kind,
-    authored_tier: authoredTier,
     has_output_format: node.output_format !== undefined,
     tools_declared: node.allowed_tools !== undefined || node.denied_tools !== undefined,
     mcp_present: node.mcp !== undefined,
     skills_present: node.skills !== undefined && node.skills.length > 0,
-    mutates_checkout: node.mutates_checkout !== false,
+    read_only_enforced: node.mutates_checkout === false,
     context_chars: stepText.length + taskText.length,
   };
 }
@@ -390,33 +411,54 @@ const TIER_QUESTION = 'tier';
 const RISK_QUESTION = 'high_risk';
 const AMBIGUITY_QUESTION = 'ambiguous_or_multi_step';
 
-/** What each tier is for. Keyed by `TierName`, so a new tier cannot be offered undescribed. */
+/**
+ * What each tier is for. Keyed by `TierName`, so a new tier cannot be offered undescribed.
+ *
+ * Each entry stands on its own: what the work is, the kinds of step that are that work,
+ * and what it is not. The classifier otherwise reads "several instructions" as "hard".
+ */
 const TIER_CRITERIA: Record<TierName, string> = {
   small:
-    'Routine, bounded work with one clear answer: extracting or listing facts, classifying into given categories, summarising, formatting, or running commands and reporting the result.',
+    'Collecting, listing, sorting or restating facts that already exist, by following fixed instructions. Examples: finding which commands a project uses to check itself; sorting a failure or a change into given categories; writing or updating a pull-request description for a small or single-purpose change from existing notes and results. Not for work whose answer depends on weighing trade-offs, on understanding unfamiliar code in depth, or on a sensitive subject.',
   medium:
-    'Ordinary engineering work that follows a clear plan: implementing or reviewing a well-specified change, or analysis that needs judgement within one part of a system.',
+    'Engineering judgement on a clearly stated task within one part of a system. Examples: reviewing a change for defects; investigating a defect with a known symptom in one area; triaging an issue; implementing a well-specified change; summarising a large, multi-part change from several sources. Not for collecting or restating known facts, and not for design decisions or sensitive changes.',
   large:
-    'Hard reasoning: architecture or design decisions, unclear or conflicting requirements, security-sensitive changes, or work spanning several systems.',
+    'Hard or consequential reasoning. Examples: architecture or design decisions; requirements that are unclear or conflict; diagnosing a problem that has no reproduction or several possible causes across components; changes to security, data schemas, deletion or money; work that spans several systems.',
 };
 
+/**
+ * The three judgments, asked together over one state. Each is one narrow question about
+ * the task or the step, and each says what does not count, because the two failure modes
+ * seen in evaluation were reading a long fixed procedure as ambiguity and reading a
+ * routine push or pull-request description as risk.
+ */
 function buildQuestions(tiers: readonly TierName[]): Record<string, JevQuestion> {
   return {
     [TIER_QUESTION]: {
       type: 'choice',
       instructions:
-        'A workflow step is described by `step` (its authored instructions), `task` (what this run was asked to do) and `features` (facts the engine computed). Which model tier is the smallest that can complete this step for this task correctly?',
+        "A workflow engine is about to run one step. `task` is what this run was asked to do. `step` is the opening of the step's fixed instructions, and `features` are facts about the step. Which is the smallest model tier that can do this step well for this task? Judge the thinking the step needs, not the length of its instructions: a step that follows a fixed procedure is not harder because the procedure has many parts.",
       criteria: Object.fromEntries(tiers.map(tier => [tier, TIER_CRITERIA[tier]])),
     },
     [RISK_QUESTION]: {
       type: 'noul',
       instructions:
-        'Is completing `step` for `task` high-risk: does it touch authentication or authorization, database schemas or migrations, deletion of data or files, credentials or secrets, money or billing, or external or production state?',
+        'Is the subject of `task` a sensitive area where a wrong result is costly or hard to undo: authentication or authorization, credentials or secrets, database schemas or migrations, deleting data or files, money or billing, or a change made directly to production systems or data?',
+      criteria: {
+        true: 'The task is about one of those sensitive areas, so a mistake could open a security hole, lose data, charge someone wrongly or break production. This holds even when the step only reviews, describes or summarises such a change.',
+        false:
+          'The task is about ordinary code, tests, documentation or tooling. Pushing a work-in-progress branch, or writing or updating a pull-request description or a report, does not make a task sensitive by itself.',
+      },
     },
     [AMBIGUITY_QUESTION]: {
       type: 'noul',
       instructions:
-        'Is `task` ambiguous or under-specified, or does completing `step` for it need several dependent steps of reasoning or changes across several parts of a system?',
+        'Does `task` leave open what should be done: is it under-specified, open to more than one reasonable reading, or does it leave a design decision across several parts of a system to whoever does the work?',
+      criteria: {
+        true: 'A careful engineer would have to guess the intent, choose between designs, or settle requirements before starting.',
+        false:
+          'The task says what is wanted. A step whose fixed instructions list several things to do, in order, is not unclear for that reason.',
+      },
     },
   };
 }
@@ -559,10 +601,12 @@ export async function routeAgentNode(
     timeoutMs: settings.timeoutMs,
     fetch: options.fetch,
     questions: buildQuestions([...offer.offered, ceiling]),
+    // The task and the computed facts come first and the step text is only its opening:
+    // what the run was asked to do decides the tier far more than the step's procedure.
     state: {
-      step: redactForClassifier(stepText, credentialValues, settings.maxChars),
-      task: redactForClassifier(taskText, credentialValues, settings.maxChars),
-      features: routeFeatures(input.node, ceiling, stepText, taskText),
+      task: redactForClassifier(taskText, credentialValues, settings.maxTaskChars),
+      features: routeFeatures(input.node, stepText, taskText),
+      step: redactForClassifier(stepText, credentialValues, settings.maxStepChars),
     },
   });
   if (!result.ok) {

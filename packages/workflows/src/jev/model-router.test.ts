@@ -125,7 +125,7 @@ function candidate(overrides: CandidateOverrides = {}): RouteAgentNodeInput {
 
 interface SentBody {
   model: string;
-  state: { step: string; task: string; features: Record<string, unknown> };
+  state: { task: string; features: Record<string, unknown>; step: string };
   questions: Record<string, { type: string; instructions: string; criteria?: unknown }>;
 }
 
@@ -524,7 +524,8 @@ describe('readRouterSettings', () => {
       JEV_ROUTER_MIN_CONFIDENCE: '0.6',
       JEV_ROUTER_RISK_THRESHOLD: '0.2',
       JEV_ROUTER_AMBIGUITY_THRESHOLD: '0.4',
-      JEV_ROUTER_MAX_CHARS: '1000',
+      JEV_ROUTER_MAX_STEP_CHARS: '1000',
+      JEV_ROUTER_MAX_TASK_CHARS: '2000',
     });
     expect(result).toEqual({
       ok: true,
@@ -537,7 +538,8 @@ describe('readRouterSettings', () => {
         minConfidence: 0.6,
         riskThreshold: 0.2,
         ambiguityThreshold: 0.4,
-        maxChars: 1000,
+        maxStepChars: 1000,
+        maxTaskChars: 2000,
       },
     });
   });
@@ -552,7 +554,8 @@ describe('readRouterSettings', () => {
     [{ ...ENV, JEV_ROUTER_MIN_PROB: '1.5' }, 'invalid_setting:JEV_ROUTER_MIN_PROB'],
     [{ ...ENV, JEV_ROUTER_RISK_THRESHOLD: 'high' }, 'invalid_setting:JEV_ROUTER_RISK_THRESHOLD'],
     [{ ...ENV, JEV_ROUTER_TIMEOUT_MS: '0' }, 'invalid_setting:JEV_ROUTER_TIMEOUT_MS'],
-    [{ ...ENV, JEV_ROUTER_MAX_CHARS: '1.5' }, 'invalid_setting:JEV_ROUTER_MAX_CHARS'],
+    [{ ...ENV, JEV_ROUTER_MAX_STEP_CHARS: '1.5' }, 'invalid_setting:JEV_ROUTER_MAX_STEP_CHARS'],
+    [{ ...ENV, JEV_ROUTER_MAX_TASK_CHARS: '-4' }, 'invalid_setting:JEV_ROUTER_MAX_TASK_CHARS'],
   ] as [Record<string, string>, string][])('is off for %p', (env, reason) => {
     expect(readRouterSettings(env)).toEqual({ ok: false, reason });
   });
@@ -611,7 +614,7 @@ describe('routeAgentNode', () => {
     });
   });
 
-  it('asks its three questions over the step, the task and the features in one request', async () => {
+  it('asks its three questions over the task, the features and the step in one request', async () => {
     const node = agentNode({
       allowed_tools: ['Read'],
       mcp: 'servers.json',
@@ -619,7 +622,7 @@ describe('routeAgentNode', () => {
       mutates_checkout: false,
       output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
     });
-    const { fetch, bodies } = fakeFetch(answering());
+    const { fetch, bodies, raw } = fakeFetch(answering());
     await routeAgentNode(candidate({ node }), opts({ fetch }));
 
     expect(bodies).toHaveLength(1);
@@ -629,23 +632,57 @@ describe('routeAgentNode', () => {
     expect(body.questions.tier.type).toBe('choice');
     // The ceiling is always an option: the classifier must be able to say "do not lower".
     expect(Object.keys(body.questions.tier.criteria as object)).toEqual(['small', 'medium']);
-    expect(body.questions.high_risk.type).toBe('noul');
-    expect(body.questions.ambiguous_or_multi_step.type).toBe('noul');
+    // Each yes/no judgment says what a yes and what a no mean.
+    for (const name of ['high_risk', 'ambiguous_or_multi_step']) {
+      expect(body.questions[name].type).toBe('noul');
+      expect(Object.keys(body.questions[name].criteria as object)).toEqual(['true', 'false']);
+    }
+    // What the run was asked to do comes first; the step text comes last.
+    expect(Object.keys(body.state)).toEqual(['task', 'features', 'step']);
     expect(body.state.step).toBe(STEP_TEXT);
     expect(body.state.task).toBe(TASK_TEXT);
     expect(body.state.features).toEqual({
+      step_name: 'step',
       node_kind: 'inline',
-      authored_tier: 'medium',
       has_output_format: true,
       tools_declared: true,
       mcp_present: true,
       skills_present: true,
-      mutates_checkout: false,
+      read_only_enforced: true,
       context_chars: STEP_TEXT.length + TASK_TEXT.length,
+    });
+    // The author's own tier would anchor the answer, so it is never among the facts.
+    expect(raw[0]).not.toContain('authored_tier');
+  });
+
+  it('names a command step by its command and does not claim an undeclared step is read-only', async () => {
+    const node = agentNode({ prompt: undefined, command: 'discover-checks' });
+    const { fetch, bodies } = fakeFetch(answering());
+    await routeAgentNode(candidate({ node }), opts({ fetch }));
+    expect(bodies[0].state.features).toMatchObject({
+      step_name: 'discover-checks',
+      node_kind: 'command',
+      read_only_enforced: false,
     });
   });
 
-  it('removes planted secrets from the outgoing body and cuts both texts to the cap', async () => {
+  it('sends only the opening of a long step by default, and far more of the task', async () => {
+    const { fetch, bodies } = fakeFetch(answering());
+    await routeAgentNode(
+      candidate({
+        loadStepText: () => Promise.resolve('s'.repeat(3000)),
+        taskText: () => 't'.repeat(3000),
+      }),
+      opts({ fetch })
+    );
+    expect(bodies[0].state.step).toBe(
+      `${'s'.repeat(ROUTER_DEFAULTS.maxStepChars)} [truncated ${String(3000 - ROUTER_DEFAULTS.maxStepChars)} chars]`
+    );
+    expect(bodies[0].state.task).toBe('t'.repeat(3000));
+    expect(ROUTER_DEFAULTS.maxStepChars).toBeLessThan(ROUTER_DEFAULTS.maxTaskChars);
+  });
+
+  it('removes planted secrets from the outgoing body and cuts each text to its cap', async () => {
     const { fetch, raw, bodies } = fakeFetch(answering());
     await routeAgentNode(
       candidate({
@@ -655,7 +692,10 @@ describe('routeAgentNode', () => {
           `Use injected-exact-credential and password: task-shaped-secret, clone https://bot:url-secret@git.example.com/x. ${'t'.repeat(400)}`,
         credentialValues: () => ['injected-exact-credential'],
       }),
-      opts({ env: { ...ENV, JEV_ROUTER_MAX_CHARS: '200' }, fetch })
+      opts({
+        env: { ...ENV, JEV_ROUTER_MAX_STEP_CHARS: '200', JEV_ROUTER_MAX_TASK_CHARS: '300' },
+        fetch,
+      })
     );
     for (const secret of [
       'step-shaped-secret',
@@ -665,8 +705,8 @@ describe('routeAgentNode', () => {
     ]) {
       expect(raw[0]).not.toContain(secret);
     }
-    expect(bodies[0].state.step).toMatch(/\[truncated \d+ chars\]$/);
-    expect(bodies[0].state.task).toMatch(/\[truncated \d+ chars\]$/);
+    expect(bodies[0].state.step).toMatch(/^.{200} \[truncated \d+ chars\]$/s);
+    expect(bodies[0].state.task).toMatch(/^.{300} \[truncated \d+ chars\]$/s);
     // The size the classifier is told about is the real one, not the cut one.
     expect(bodies[0].state.features.context_chars).toBeGreaterThan(800);
   });

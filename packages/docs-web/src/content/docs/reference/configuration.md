@@ -694,11 +694,12 @@ Connection and thresholds for the [model router](#model-router). None of these t
 | `JEV_API_BASE` | Base URL of the classifier. Any Jev-compatible endpoint works. | `https://api.typesafe.ai` |
 | `JEV_MODEL` | Model id sent with each request | `jev-1.13.0` |
 | `JEV_ROUTER_TIMEOUT_MS` | Longest a step waits for a route before it runs on its authored tier | `3000` |
-| `JEV_ROUTER_MIN_PROB` | The chosen tier needs at least this probability (0--1) | `0.7` |
+| `JEV_ROUTER_MIN_PROB` | The chosen tier needs at least this probability (0--1) | `0.75` |
 | `JEV_ROUTER_MIN_CONFIDENCE` | The choice needs at least this confidence (0--1) | `0.5` |
 | `JEV_ROUTER_RISK_THRESHOLD` | A "high-risk" answer at or above this keeps the authored tier (0--1) | `0.3` |
 | `JEV_ROUTER_AMBIGUITY_THRESHOLD` | An "ambiguous or multi-step" answer at or above this keeps the authored tier (0--1) | `0.5` |
-| `JEV_ROUTER_MAX_CHARS` | Most characters of the step text, and separately of the task text, sent per request | `6000` |
+| `JEV_ROUTER_MAX_STEP_CHARS` | Most characters of the step's authored text sent per request. Short on purpose: the opening says what the step is for, and pages of procedure make every step read as hard | `1200` |
+| `JEV_ROUTER_MAX_TASK_CHARS` | Most characters of the run's task text sent per request | `4000` |
 
 A value that is not a usable number turns the router off rather than falling back to a default, and every route record then says which variable (`invalid_setting:<NAME>`).
 
@@ -926,6 +927,8 @@ Only single-shot agent steps (`prompt:` or `command:`) at the top level of a wor
 - a step with `context: { resume: ... }`, a step another step resumes from, and a step with `persist_session` (their provider session outlives the attempt);
 - a step whose authored tier is not listed in `tiers`.
 
+In the bundled SDLC pack, the default `tiers: [medium]` makes these commands routable wherever a workflow runs them as a top-level step: `discover-checks` and `classify-red` (validate), `pr`, `sync-pr-body`, `triage`, `investigate`, `assess`, and the eight review commands (`review-scope`, `review-code`, `review-seams`, `review-simplify`, `review-tests`, `review-errors`, `review-docs`, `review-synthesize`). `plan` (large), `implement` (a loop) and `classify-review-scope` (already small) are not. Routable means the classifier is asked; whether a step is lowered depends on the task of each run.
+
 ### What is offered
 
 A lower tier is offered only when it has a preset of its own, differs from the authored tier's preset, and names a provider that can run the step. For a tier on a different provider that means all of:
@@ -942,15 +945,21 @@ If no lower tier can be offered, the classifier is not called.
 
 One request per routed step, to `JEV_API_BASE`:
 
-- the step's **authored** command or prompt text, before any variable or upstream output is substituted into it;
-- the run's task input: the message that started the run and its named inputs;
-- facts computed in code: whether the step declares an output format, tool restrictions, MCP servers or skills, whether it may modify the checkout, its authored tier, and the size of the two texts.
+- the run's task input: the message that started the run and its named inputs, up to `JEV_ROUTER_MAX_TASK_CHARS`;
+- the opening of the step's **authored** command or prompt text, before any variable or upstream output is substituted into it, up to `JEV_ROUTER_MAX_STEP_CHARS`;
+- facts computed in code: the command's name (or the step's id for an inline prompt), whether the step declares an output format, tool restrictions, MCP servers or skills, whether the engine enforces that it leaves the checkout unchanged, and the size of the two texts. The authored tier is not among them: telling the classifier which tier the author picked pulls its answer toward that tier.
 
-Both texts are cut to `JEV_ROUTER_MAX_CHARS`. Before that, exact values of credentials Archon injected or holds under secret-named environment variables are removed, and text shaped like a credential is masked: `KEY=value` under a secret-like name, `Authorization` and bearer values, `user:password@` in URLs, PEM blocks, and common token prefixes. Shape masking is defence in depth, not a guarantee: do not put secrets in a task message. Upstream step outputs, node-local `with:` bindings, file contents and the key are never sent, and no log line contains the step text, the task text or the key.
+Before either text is cut, exact values of credentials Archon injected or holds under secret-named environment variables are removed, and text shaped like a credential is masked: `KEY=value` under a secret-like name, `Authorization` and bearer values, `user:password@` in URLs, PEM blocks, and common token prefixes. Shape masking is defence in depth, not a guarantee: do not put secrets in a task message. Upstream step outputs, node-local `with:` bindings, file contents and the key are never sent, and no log line contains the step text, the task text or the key.
 
 ### How a route is decided
 
-The classifier answers three questions in that one request: the smallest sufficient tier among those offered, whether the work is high-risk (authentication, schemas or migrations, deletion, credentials, money, external or production state), and whether it is ambiguous or multi-step. Deterministic floors then apply, risk first: either yes/no answer at or above its threshold, or a choice below the probability or confidence minimum, keeps the authored tier. So does a timeout, an HTTP error, an unreadable or out-of-range answer, and a choice that was not offered. Routing never fails or blocks a step; the longest it can add is `JEV_ROUTER_TIMEOUT_MS`.
+The classifier answers three questions in that one request:
+
+1. **Tier.** The smallest tier, among those offered, that can do this step well for this task. It is told to judge the thinking the step needs, not the length of its instructions. Small is collecting, listing, sorting or restating existing facts by fixed instructions; medium is engineering judgement on a clearly stated task within one part of a system; large is hard or consequential reasoning.
+2. **High-risk.** Whether the subject of the task is a sensitive area: authentication or authorization, credentials or secrets, database schemas or migrations, deleting data or files, money or billing, or a change made directly to production. A step that only reviews or describes such a change still counts. Pushing a work-in-progress branch or writing a pull-request description does not make an ordinary task sensitive.
+3. **Ambiguous or open-ended.** Whether the task leaves open what should be done: under-specified, open to more than one reading, or leaving a design decision across several parts of a system. A step whose fixed instructions list several things to do is not ambiguous for that reason.
+
+Deterministic floors then apply, risk first: either yes/no answer at or above its threshold, or a choice below the probability or confidence minimum, keeps the authored tier. So does a timeout, an HTTP error, an unreadable or out-of-range answer, and a choice that was not offered. Routing never fails or blocks a step; the longest it can add is `JEV_ROUTER_TIMEOUT_MS`.
 
 ### Escalation
 
@@ -983,7 +992,8 @@ The evaluation compares the router with hand-written labels, so a pass is a prox
 
 ### Known limits
 
-- The default `tiers: [medium]` covers every medium single-shot step, including review lenses and investigations, not only extraction steps. Whether one is lowered is the classifier's call on each run.
+- The default `tiers: [medium]` covers every medium single-shot step, including review lenses and investigations (see the list above), not only extraction steps. Whether one is lowered is the classifier's call on each run.
+- The classifier's answers vary a little between identical requests. A case that sits on a threshold can land on either side, so read thresholds from many shadow records, not from one run.
 - A lower-tier attempt that completes with a worse answer that still satisfies the step's contract is not detected. Escalation catches failures, not quality.
 - A lower-tier attempt that modifies the checkout of a `mutates_checkout: false` step fails the step. It is not escalated, because the tree is already changed.
 - Escalation runs the step again, as a retry does, so a step with side effects may repeat them.
