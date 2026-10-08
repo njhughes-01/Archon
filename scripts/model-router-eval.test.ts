@@ -68,11 +68,20 @@ const evalCase = (
   label: EvalCase['label_min_tier'],
   kind: EvalCase['kind'],
   node = 'discover-checks'
-): EvalCase => ({ id, node, task: `task for ${id}`, features, label_min_tier: label, kind });
+): EvalCase => ({
+  id,
+  node,
+  task: `task for ${id}`,
+  features,
+  label_min_tier: label,
+  kind,
+  split: 'tuning',
+});
 
 const result = (fields: Partial<CaseResult> & Pick<CaseResult, 'id'>): CaseResult => ({
   node: 'discover-checks',
   kind: 'extraction',
+  split: 'tuning',
   label: 'small',
   routedTier: 'small',
   answered: true,
@@ -129,6 +138,15 @@ describe('the labelled set', () => {
         'validate',
       ].some(workflow => existsSync(join(PACK_ROOT, workflow, 'commands', `${node}.md`)));
       expect({ node, found }).toEqual({ node, found: true });
+    }
+  });
+
+  it('splits every kind evenly into a tuning half and a held-out half', async () => {
+    const cases = await readCases(EVAL_CASES);
+    const count = (split: string, kind: string): number =>
+      cases.filter(c => c.split === split && c.kind === kind).length;
+    for (const kind of new Set(cases.map(c => c.kind))) {
+      expect(Math.abs(count('tuning', kind) - count('heldout', kind))).toBeLessThanOrEqual(1);
     }
   });
 
@@ -406,6 +424,26 @@ describe('main', () => {
     expect(code).toBe(2);
     expect(tasks).toEqual([]);
     expect(text).toContain('no_api_key');
+  });
+
+  it('runs one half with --split, and reports each half beside the whole otherwise', async () => {
+    const all = await readCases(EVAL_CASES);
+    const tuning = JSON.parse(
+      (await capture(['--dry', '--json', '--split', 'tuning'], {})).text
+    ) as {
+      results: { id: string }[];
+      splits: Record<string, { pass: boolean }>;
+    };
+    expect(tuning.results.map(r => r.id)).toEqual(
+      all.filter(c => c.split === 'tuning').map(c => c.id)
+    );
+    expect(Object.keys(tuning.splits)).toEqual(['tuning']);
+
+    const whole = await capture(['--dry'], {});
+    expect(whole.text).toContain('tuning half');
+    expect(whole.text).toContain('heldout half');
+    expect(whole.text.match(/passes on its own/g)).toHaveLength(2);
+    expect((await capture(['--split', 'nope'], {})).code).toBe(2);
   });
 
   it('exits 2 on bad usage and on a cases file it cannot read', async () => {

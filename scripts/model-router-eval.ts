@@ -24,7 +24,12 @@
  * sent. It proves the pipeline and the arithmetic, not the classifier.
  *
  * Usage:
- *   bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--cases <file>]
+ *   bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large]
+ *                                        [--split tuning|heldout] [--cases <file>]
+ *
+ * `--split` runs one half of the set. The questions and thresholds are tuned against the
+ * `tuning` half only; a full run reports each half beside the whole, so a change that only
+ * fits the cases it was tuned on shows up as a gap between them.
  *
  * `--ceiling` is the authored tier every case is given (default `large`, so all three
  * tiers are in play; `medium` mirrors the default `modelRouter.tiers`).
@@ -76,6 +81,9 @@ const CASE_KINDS = [
 type CaseKind = (typeof CASE_KINDS)[number];
 const ROUTINE_KINDS: readonly CaseKind[] = ['extraction', 'mechanical'];
 
+const CASE_SPLITS = ['tuning', 'heldout'] as const;
+type CaseSplit = (typeof CASE_SPLITS)[number];
+
 const FEATURE_NAMES = [
   'has_output_format',
   'tools_declared',
@@ -96,6 +104,11 @@ export interface EvalCase {
   /** The lowest tier judged sufficient for this step on this task. */
   label_min_tier: TierName;
   kind: CaseKind;
+  /**
+   * Which half of the set the case belongs to. Wording and thresholds are tuned against
+   * `tuning` only, so `heldout` shows whether a change generalises or was fitted.
+   */
+  split: CaseSplit;
 }
 
 function messageOf(error: unknown): string {
@@ -112,13 +125,15 @@ function isTier(value: unknown): value is TierName {
 
 function parseCase(value: unknown): EvalCase | string {
   if (!isRecord(value)) return 'not an object';
-  const { id, node, task, features, label_min_tier: label, kind } = value;
+  const { id, node, task, features, label_min_tier: label, kind, split } = value;
   if (typeof id !== 'string' || typeof node !== 'string' || typeof task !== 'string') {
     return '"id", "node" and "task" must be strings';
   }
   if (!isTier(label)) return `"label_min_tier" must be one of ${TIER_NAMES.join(', ')}`;
   const caseKind = CASE_KINDS.find(known => known === kind);
   if (caseKind === undefined) return `"kind" must be one of ${CASE_KINDS.join(', ')}`;
+  const caseSplit = CASE_SPLITS.find(known => known === split);
+  if (caseSplit === undefined) return `"split" must be one of ${CASE_SPLITS.join(', ')}`;
   if (!isRecord(features)) return '"features" must be an object';
   const parsed = {} as CaseFeatures;
   for (const name of FEATURE_NAMES) {
@@ -126,7 +141,15 @@ function parseCase(value: unknown): EvalCase | string {
     if (typeof flag !== 'boolean') return `"features.${name}" must be true or false`;
     parsed[name] = flag;
   }
-  return { id, node, task, features: parsed, label_min_tier: label, kind: caseKind };
+  return {
+    id,
+    node,
+    task,
+    features: parsed,
+    label_min_tier: label,
+    kind: caseKind,
+    split: caseSplit,
+  };
 }
 
 /** Read a JSON Lines file of cases. Blank lines are skipped; any bad line fails the read. */
@@ -165,6 +188,7 @@ export interface CaseResult {
   id: string;
   node: string;
   kind: CaseKind;
+  split: CaseSplit;
   /** The label, capped at the ceiling: no router can route above it. */
   label: TierName;
   routedTier: TierName;
@@ -388,7 +412,10 @@ export interface EvalReport {
   ceiling: TierName;
   thresholds: RouterThresholds;
   results: CaseResult[];
+  /** Every case that was run, scored together. This decides the exit code. */
   score: EvalScore;
+  /** The same arithmetic over each half that had cases in this run. */
+  splits: Partial<Record<CaseSplit, EvalScore>>;
 }
 
 export interface RunEvalOptions {
@@ -487,6 +514,7 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
       id: evalCase.id,
       node: evalCase.node,
       kind: evalCase.kind,
+      split: evalCase.split,
       label,
       routedTier: route.routedTier,
       answered: route.source === 'jev',
@@ -515,6 +543,16 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
     },
     results,
     score: scoreResults(results, ceiling, thresholds),
+    splits: Object.fromEntries(
+      CASE_SPLITS.filter(split => results.some(result => result.split === split)).map(split => [
+        split,
+        scoreResults(
+          results.filter(result => result.split === split),
+          ceiling,
+          thresholds
+        ),
+      ])
+    ),
   };
 }
 
@@ -563,14 +601,24 @@ export function formatReport(report: EvalReport): string {
       ].join('  ')
     );
   }
-  lines.push(
-    '',
-    'Confusion matrix (rows: label, columns: routed)',
-    `         ${TIER_NAMES.map(tier => tier.padStart(7)).join('')}`
-  );
-  for (const label of TIER_NAMES) {
+  const matrix = (heading: string, part: EvalScore): void => {
+    lines.push('', heading, `         ${TIER_NAMES.map(tier => tier.padStart(7)).join('')}`);
+    for (const label of TIER_NAMES) {
+      lines.push(
+        `${label.padEnd(9)}${TIER_NAMES.map(routed => String(part.confusion[label][routed]).padStart(7)).join('')}`
+      );
+    }
+  };
+  matrix('Confusion matrix (rows: label, columns: routed)', score);
+  // Each half on its own, so a change tuned on one can be seen to hold on the other.
+  for (const split of CASE_SPLITS) {
+    const part = report.splits[split];
+    if (part === undefined || Object.keys(report.splits).length < 2) continue;
+    matrix(`${split} half`, part);
     lines.push(
-      `${label.padEnd(9)}${TIER_NAMES.map(routed => String(score.confusion[label][routed]).padStart(7)).join('')}`
+      `  under-routed: ${String(part.underRouted.length)}${part.underRouted.length > 0 ? ` (${part.underRouted.join(', ')})` : ''}` +
+        `; routine routed below the ceiling: ${String(part.routineLowered)} of ${String(part.routineCases)}` +
+        `; ${part.pass ? 'passes' : 'does not pass'} on its own`
     );
   }
   lines.push(
@@ -616,7 +664,7 @@ export function formatReport(report: EvalReport): string {
 }
 
 const USAGE =
-  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--cases <file>]';
+  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--split tuning|heldout] [--cases <file>]';
 
 /** The command. Returns the exit code; `write` receives each output line. */
 export async function main(
@@ -629,14 +677,18 @@ export async function main(
   let json = false;
   let ceiling: TierName = 'large';
   let casesPath = EVAL_CASES;
+  let split: CaseSplit | undefined;
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = argv[index + 1];
     if (argument === '--dry') dry = true;
     else if (argument === '--json') json = true;
     else if (argument === '--ceiling' && isTier(value)) ceiling = argv[++index] as TierName;
-    else if (argument === '--cases' && value !== undefined) casesPath = resolve(argv[++index]);
-    else {
+    else if (argument === '--split' && CASE_SPLITS.some(known => known === value)) {
+      split = argv[++index] as CaseSplit;
+    } else if (argument === '--cases' && value !== undefined) {
+      casesPath = resolve(argv[++index]);
+    } else {
       write(`Unsupported argument: ${argument}`);
       write(USAGE);
       return 2;
@@ -645,8 +697,9 @@ export async function main(
 
   let report: EvalReport;
   try {
+    const cases = await readCases(casesPath);
     report = await runEval({
-      cases: await readCases(casesPath),
+      cases: split === undefined ? cases : cases.filter(evalCase => evalCase.split === split),
       packRoot: PACK_ROOT,
       ceiling,
       env,
