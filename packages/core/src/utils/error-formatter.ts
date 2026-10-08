@@ -45,6 +45,19 @@ export function classifyAndFormatError(error: Error, surface: WorkflowCommandSur
     return `⚠️ ${message}`;
   }
 
+  // A gated Codex turn that ran a tool the gate was never asked about. Matched on
+  // the provider's own result subtype, which leads the message; the generic
+  // fallbacks below would hide it behind `/reset`, which fixes nothing here.
+  if (message.startsWith('codex_tool_gate_inactive')) {
+    return (
+      '⚠️ Codex ran a tool without asking the tool gate, so Archon stopped the turn. ' +
+      'What that tool call did was not checked: look at what changed before you continue. ' +
+      'The gate reaches Codex through a hook, so the usual cause is a managed Codex policy ' +
+      'that disables hooks, or a Codex CLI too old to run them. Fix that, use another ' +
+      'provider, or switch the gate off (`toolGate.enabled` in ~/.archon/config.yaml).'
+    );
+  }
+
   // AI-provider rate-limit / usage-cap classification
   // Broad substrings are intentional: every call site feeds errors from handling
   // an AI conversation turn, so a bare "usage limit" needs no provider prefix.

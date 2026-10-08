@@ -309,6 +309,21 @@ describe('classifyAndFormatError', () => {
       expect(result).not.toContain('Claude authentication');
     });
 
+    test('a Codex turn stopped for running a tool past the tool gate says so in plain words', () => {
+      // The orchestrator joins the result's errorSubtype and its error text.
+      const error = new Error(
+        "codex_tool_gate_inactive: Codex ran a tool without asking Archon's tool gate, so the turn was stopped. " +
+          'The gate reaches Codex through a PreToolUse hook, which Archon turns on for the turn.'
+      );
+      const formatted = classifyAndFormatError(error);
+      expect(formatted).toContain('ran a tool without asking the tool gate');
+      expect(formatted).toContain('was not checked');
+      expect(formatted).toContain('toolGate.enabled');
+      // Not the generic fallbacks: /reset fixes nothing here.
+      expect(formatted).not.toContain('/reset');
+      expect(formatted).not.toContain('unexpected error');
+    });
+
     test('routes "codex_stream_incomplete:" synthetic shape to Codex auth guidance (orchestrator isError shape)', () => {
       // The orchestrator's isError branch also emits `codex_stream_incomplete:
       // <inner>` for the post-loop fail-stop path (orchestrator-agent.ts:
