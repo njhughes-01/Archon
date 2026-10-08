@@ -2,9 +2,14 @@ import { describe, test, expect, mock, beforeEach, afterEach, spyOn } from 'bun:
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { Options, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
+import type { HookCallback, Options, query as sdkQuery } from '@anthropic-ai/claude-agent-sdk';
 import { createMockLogger } from '../test/mocks/logger';
-import type { MessageChunk } from '../types';
+import type {
+  MessageChunk,
+  SendQueryOptions,
+  ToolActionDecision,
+  ToolActionRequest,
+} from '../types';
 
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
@@ -27,6 +32,7 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
 import { ClaudeProvider, classifySubprocessError, shouldPassNoEnvFile } from './provider';
 import * as claudeModule from './provider';
 import * as binaryResolver from './binary-resolver';
+import { CLAUDE_TOOL_CLASSES, toClaudeToolAction } from './tool-gate';
 
 describe('shouldPassNoEnvFile', () => {
   test('returns false when cliPath is undefined (dev mode — SDK 0.2.x resolves a native binary)', () => {
@@ -3577,5 +3583,450 @@ describe('classifySubprocessError (#2715)', () => {
     expect(classifySubprocessError('rate limit exceeded', '')).toBe('rate_limit');
     expect(classifySubprocessError('too many requests, please slow down', '')).toBe('rate_limit');
     expect(classifySubprocessError('server overloaded', '')).toBe('rate_limit');
+  });
+});
+
+// ─── toolGate: the provider-neutral Tool Action Gate ─────────────────────
+// The mocked `query` stands in for the SDK: it fires every PreToolUse matcher
+// that fits the tool name and, as the SDK documents, lets one `deny` from any
+// hook stop the call before the tool body runs.
+
+type GateStub = (request: ToolActionRequest) => Promise<ToolActionDecision>;
+type PreToolUseOutput = Awaited<ReturnType<HookCallback>>;
+
+const GATE_DENIAL: ToolActionDecision = {
+  action: 'deny',
+  needsApproval: true,
+  reason: 'It deletes every file under the home directory.',
+  alternatives: [
+    'Remove one named directory inside the repository.',
+    'Report the work as blocked.',
+  ],
+  ruleId: 'recursive-rm',
+};
+
+function preToolUseDecision(output: PreToolUseOutput): string | undefined {
+  if (!('hookSpecificOutput' in output)) return undefined;
+  const specific = output.hookSpecificOutput;
+  return specific?.hookEventName === 'PreToolUse' ? specific.permissionDecision : undefined;
+}
+
+function preToolUseReason(output: PreToolUseOutput): string | undefined {
+  if (!('hookSpecificOutput' in output)) return undefined;
+  const specific = output.hookSpecificOutput;
+  return specific?.hookEventName === 'PreToolUse' ? specific.permissionDecisionReason : undefined;
+}
+
+async function firePreToolUse(
+  options: Options | undefined,
+  call: Record<string, unknown>,
+  signal: AbortSignal = new AbortController().signal
+): Promise<PreToolUseOutput[]> {
+  const outputs: PreToolUseOutput[] = [];
+  for (const matcher of options?.hooks?.PreToolUse ?? []) {
+    if (matcher.matcher !== undefined && !new RegExp(matcher.matcher).test(String(call.tool_name)))
+      continue;
+    for (const hook of matcher.hooks) {
+      outputs.push(
+        await hook(
+          {
+            hook_event_name: 'PreToolUse',
+            session_id: 'sid',
+            transcript_path: '/tmp/transcript.jsonl',
+            cwd: '/workspace/repo',
+            tool_use_id: 'toolu_1',
+            ...call,
+          } as never,
+          typeof call.tool_use_id === 'string' ? call.tool_use_id : 'toolu_1',
+          { signal }
+        )
+      );
+    }
+  }
+  return outputs;
+}
+
+describe('ClaudeProvider toolGate', () => {
+  let client: ClaudeProvider;
+
+  beforeEach(() => {
+    client = new ClaudeProvider({ retryBaseDelayMs: 1 });
+    mockQuery.mockClear();
+    mockLogger.error.mockClear();
+  });
+
+  /** Run one query whose fake SDK attempts `calls`; returns what each hook said and what ran. */
+  async function runToolCalls(
+    requestOptions: SendQueryOptions,
+    calls: Record<string, unknown>[],
+    signal?: AbortSignal
+  ): Promise<{
+    outputs: PreToolUseOutput[][];
+    toolBody: ReturnType<typeof mock>;
+    options: Options;
+  }> {
+    const outputs: PreToolUseOutput[][] = [];
+    const toolBody = mock((_call: Record<string, unknown>) => undefined);
+    mockQuery.mockImplementation(async function* (args) {
+      for (const [index, attempted] of calls.entries()) {
+        // The SDK gives every tool call its own id.
+        const call = { tool_use_id: `toolu_${index + 1}`, ...attempted };
+        const fired = await firePreToolUse(args.options, call, signal);
+        outputs.push(fired);
+        if (!fired.some(output => preToolUseDecision(output) === 'deny')) toolBody(call);
+      }
+      yield { type: 'result', session_id: 'sid' };
+    });
+    for await (const _ of client.sendQuery('test', '/workspace', undefined, requestOptions)) {
+      // consume
+    }
+    const options = (mockQuery.mock.calls[0][0] as { options: Options }).options;
+    return { outputs, toolBody, options };
+  }
+
+  const destructiveBash = {
+    tool_name: 'Bash',
+    tool_input: { command: 'rm -rf ~', description: 'clean up' },
+  };
+
+  test('declares the toolActionGate capability', () => {
+    expect(client.getCapabilities().toolActionGate).toBe(true);
+  });
+
+  test('a denied call never runs and the model gets the reason and every alternative', async () => {
+    const gate = mock<GateStub>(async () => GATE_DENIAL);
+    const { outputs, toolBody } = await runToolCalls({ toolGate: gate }, [destructiveBash]);
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(outputs[0].map(preToolUseDecision)).toEqual(['deny']);
+    const reason = preToolUseReason(outputs[0][0]) ?? '';
+    expect(reason).toContain('It deletes every file under the home directory.');
+    expect(reason).toContain('Remove one named directory inside the repository.');
+    expect(reason).toContain('Report the work as blocked.');
+  });
+
+  test('an allowed call runs, and the hook never answers allow or ask', async () => {
+    const gate = mock<GateStub>(async () => ({ action: 'allow' }));
+    const { outputs, toolBody } = await runToolCalls({ toolGate: gate }, [destructiveBash]);
+
+    expect(toolBody).toHaveBeenCalledTimes(1);
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(outputs[0]).toHaveLength(1);
+    expect(preToolUseDecision(outputs[0][0])).toBeUndefined();
+  });
+
+  test('read-only tools never reach the gate', async () => {
+    const gate = mock<GateStub>(async () => GATE_DENIAL);
+    const { toolBody } = await runToolCalls({ toolGate: gate }, [
+      { tool_name: 'Read', tool_input: { file_path: '/workspace/repo/.env' } },
+      { tool_name: 'Grep', tool_input: { pattern: 'x' } },
+      { tool_name: 'Glob', tool_input: { pattern: '**/*' } },
+      { tool_name: 'ListMcpResourcesTool', tool_input: {} },
+      { tool_name: 'ReadMcpResourceTool', tool_input: { server: 's', uri: 'u' } },
+      { tool_name: 'TaskGet', tool_input: { taskId: '1' } },
+      { tool_name: 'TaskList', tool_input: {} },
+    ]);
+
+    expect(gate).not.toHaveBeenCalled();
+    expect(toolBody).toHaveBeenCalledTimes(7);
+  });
+
+  test('a gate that throws is a denial', async () => {
+    const gate = mock<GateStub>(async () => {
+      throw new Error('classifier unreachable');
+    });
+    const { outputs, toolBody } = await runToolCalls({ toolGate: gate }, [destructiveBash]);
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(outputs[0].map(preToolUseDecision)).toEqual(['deny']);
+    expect(preToolUseReason(outputs[0][0])).toContain('tool gate');
+  });
+
+  test('a gate that answers with neither allow nor deny is a denial', async () => {
+    const gate = mock<GateStub>(async () => undefined as never);
+    const { outputs, toolBody } = await runToolCalls({ toolGate: gate }, [destructiveBash]);
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(outputs[0].map(preToolUseDecision)).toEqual(['deny']);
+  });
+
+  test('an aborted query denies without asking the gate', async () => {
+    const gate = mock<GateStub>(async () => ({ action: 'allow' }));
+    const controller = new AbortController();
+    controller.abort();
+    const { outputs, toolBody } = await runToolCalls(
+      { toolGate: gate },
+      [destructiveBash],
+      controller.signal
+    );
+
+    expect(gate).not.toHaveBeenCalled();
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(outputs[0].map(preToolUseDecision)).toEqual(['deny']);
+  });
+
+  test('without toolGate the SDK options carry no PreToolUse hook', async () => {
+    const { options, toolBody } = await runToolCalls({}, [destructiveBash]);
+
+    expect(Object.keys(options.hooks ?? {})).toEqual(['PostToolUse', 'PostToolUseFailure']);
+    expect(toolBody).toHaveBeenCalledTimes(1);
+  });
+
+  test('maps each tool to its kind, command, paths and url', async () => {
+    const seen: ToolActionRequest[] = [];
+    const gate = mock<GateStub>(async request => {
+      seen.push(request);
+      return { action: 'allow' };
+    });
+    await runToolCalls({ toolGate: gate }, [
+      { tool_name: 'Bash', tool_use_id: 'toolu_bash', tool_input: { command: 'git push' } },
+      { tool_name: 'PowerShell', tool_input: { command: 'Remove-Item x' } },
+      { tool_name: 'Write', tool_input: { file_path: '/workspace/repo/a.ts', content: 'x' } },
+      { tool_name: 'Edit', tool_input: { file_path: '/workspace/repo/b.ts' } },
+      { tool_name: 'NotebookEdit', tool_input: { notebook_path: '/workspace/repo/n.ipynb' } },
+      { tool_name: 'WebFetch', tool_input: { url: 'https://example.com/x', prompt: 'read' } },
+      { tool_name: 'WebSearch', tool_input: { query: 'archon' } },
+      { tool_name: 'mcp__github__create_issue', tool_input: { title: 't' } },
+      { tool_name: 'Agent', tool_input: { prompt: 'do it' } },
+      { tool_name: 'TodoWrite', tool_input: { todos: [] } },
+      { tool_name: 'ToolFromANewerSdk', tool_input: { anything: true } },
+      { tool_name: 'constructor', tool_input: {} },
+    ]);
+
+    expect(seen).toEqual([
+      {
+        toolName: 'Bash',
+        kind: 'shell',
+        cwd: '/workspace/repo',
+        command: 'git push',
+        input: { command: 'git push' },
+        toolCallId: 'toolu_bash',
+      },
+      {
+        toolName: 'PowerShell',
+        kind: 'shell',
+        cwd: '/workspace/repo',
+        command: 'Remove-Item x',
+        input: { command: 'Remove-Item x' },
+        toolCallId: 'toolu_2',
+      },
+      {
+        toolName: 'Write',
+        kind: 'file_write',
+        cwd: '/workspace/repo',
+        paths: ['/workspace/repo/a.ts'],
+        input: { file_path: '/workspace/repo/a.ts', content: 'x' },
+        toolCallId: 'toolu_3',
+      },
+      {
+        toolName: 'Edit',
+        kind: 'file_write',
+        cwd: '/workspace/repo',
+        paths: ['/workspace/repo/b.ts'],
+        input: { file_path: '/workspace/repo/b.ts' },
+        toolCallId: 'toolu_4',
+      },
+      {
+        toolName: 'NotebookEdit',
+        kind: 'file_write',
+        cwd: '/workspace/repo',
+        paths: ['/workspace/repo/n.ipynb'],
+        input: { notebook_path: '/workspace/repo/n.ipynb' },
+        toolCallId: 'toolu_5',
+      },
+      {
+        toolName: 'WebFetch',
+        kind: 'network',
+        cwd: '/workspace/repo',
+        url: 'https://example.com/x',
+        input: { url: 'https://example.com/x', prompt: 'read' },
+        toolCallId: 'toolu_6',
+      },
+      {
+        toolName: 'WebSearch',
+        kind: 'network',
+        cwd: '/workspace/repo',
+        input: { query: 'archon' },
+        toolCallId: 'toolu_7',
+      },
+      {
+        toolName: 'mcp__github__create_issue',
+        kind: 'mcp',
+        cwd: '/workspace/repo',
+        input: { title: 't' },
+        toolCallId: 'toolu_8',
+      },
+      {
+        toolName: 'Agent',
+        kind: 'other',
+        cwd: '/workspace/repo',
+        input: { prompt: 'do it' },
+        toolCallId: 'toolu_9',
+      },
+      {
+        toolName: 'TodoWrite',
+        kind: 'other',
+        cwd: '/workspace/repo',
+        input: { todos: [] },
+        toolCallId: 'toolu_10',
+      },
+      // A name this audit has never seen is gated, never assumed read-only.
+      {
+        toolName: 'ToolFromANewerSdk',
+        kind: 'other',
+        cwd: '/workspace/repo',
+        input: { anything: true },
+        toolCallId: 'toolu_11',
+      },
+      {
+        toolName: 'constructor',
+        kind: 'other',
+        cwd: '/workspace/repo',
+        input: {},
+        toolCallId: 'toolu_12',
+      },
+    ]);
+  });
+
+  test("Archon's own native tools are gated as 'other', a user's MCP server as 'mcp'", () => {
+    const call = {
+      hook_event_name: 'PreToolUse',
+      session_id: 'sid',
+      transcript_path: '/tmp/t.jsonl',
+      cwd: '/workspace/repo',
+      tool_name: 'mcp__archon__manage_run',
+      tool_input: { action: 'start' },
+      tool_use_id: 'toolu_native',
+    } as const;
+
+    expect(toClaudeToolAction(call, true)?.kind).toBe('other');
+    // Without native tools on the request, `archon` is whatever the user's MCP config named.
+    expect(toClaudeToolAction(call, false)?.kind).toBe('mcp');
+  });
+
+  test('every audited tool name has a gate classification', () => {
+    for (const name of client.getCapabilities().knownToolNames ?? []) {
+      expect(Object.keys(CLAUDE_TOOL_CLASSES)).toContain(name);
+    }
+  });
+
+  test('a tool call made inside a subagent is flagged', async () => {
+    const seen: ToolActionRequest[] = [];
+    const gate = mock<GateStub>(async request => {
+      seen.push(request);
+      return GATE_DENIAL;
+    });
+    const { toolBody } = await runToolCalls({ toolGate: gate }, [
+      { ...destructiveBash, tool_use_id: 'toolu_sub', agent_id: 'agent-7', agent_type: 'worker' },
+      { ...destructiveBash, tool_use_id: 'toolu_main' },
+    ]);
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(seen.map(request => request.fromSubagent)).toEqual([true, undefined]);
+  });
+
+  test("a workflow's own PreToolUse hook cannot turn a gate denial into an allow", async () => {
+    const gate = mock<GateStub>(async () => GATE_DENIAL);
+    const { outputs, toolBody } = await runToolCalls(
+      {
+        toolGate: gate,
+        nodeConfig: {
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: 'Bash',
+                response: {
+                  hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'allow' },
+                },
+              },
+            ],
+          },
+        },
+      },
+      [destructiveBash]
+    );
+
+    expect(toolBody).not.toHaveBeenCalled();
+    // Every hook that fired says deny, so the result does not rest on how the
+    // SDK ranks an allow against a deny.
+    expect(outputs[0]).toHaveLength(2);
+    expect(outputs[0].map(preToolUseDecision)).toEqual(['deny', 'deny']);
+    // One tool call is one question to the gate, however many hooks fired.
+    expect(gate).toHaveBeenCalledTimes(1);
+  });
+
+  test("a workflow's own PreToolUse hook still answers when the gate allows", async () => {
+    const gate = mock<GateStub>(async () => ({ action: 'allow' }));
+    const { outputs, toolBody } = await runToolCalls(
+      {
+        toolGate: gate,
+        nodeConfig: {
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: 'Bash',
+                response: {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    permissionDecision: 'deny',
+                    permissionDecisionReason: 'node policy: no shell',
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+      [destructiveBash]
+    );
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(outputs[0].map(preToolUseReason)).toContain('node policy: no shell');
+  });
+
+  test("a workflow hook's rewritten input is put to the gate before it can run", async () => {
+    const seen: (string | undefined)[] = [];
+    const gate = mock<GateStub>(async request => {
+      seen.push(request.command);
+      return request.command === 'git status' ? { action: 'allow' } : GATE_DENIAL;
+    });
+    const { outputs, toolBody } = await runToolCalls(
+      {
+        toolGate: gate,
+        nodeConfig: {
+          hooks: {
+            PreToolUse: [
+              {
+                response: {
+                  hookSpecificOutput: {
+                    hookEventName: 'PreToolUse',
+                    updatedInput: { command: 'rm -rf ~' },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      },
+      [{ tool_name: 'Bash', tool_input: { command: 'git status' } }]
+    );
+
+    expect(seen).toEqual(['git status', 'rm -rf ~']);
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(outputs[0].map(preToolUseDecision)).toContain('deny');
+  });
+
+  test('works together with restrictFileWrites', async () => {
+    const gate = mock<GateStub>(async () => GATE_DENIAL);
+    const { options, toolBody } = await runToolCalls({ toolGate: gate, restrictFileWrites: true }, [
+      destructiveBash,
+    ]);
+
+    expect(options.disallowedTools).toEqual(['Write', 'Edit', 'NotebookEdit']);
+    expect(toolBody).not.toHaveBeenCalled();
+    // The capture hooks the stream normalizer depends on are still registered.
+    expect(options.hooks?.PostToolUse).toHaveLength(1);
+    expect(options.hooks?.PostToolUseFailure).toHaveLength(1);
   });
 });

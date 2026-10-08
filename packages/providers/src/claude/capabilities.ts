@@ -34,6 +34,9 @@ const CLAUDE_KNOWN_TOOL_NAMES = [
   'Write',
 ] as const;
 
+/** One audited built-in name. The tool gate's classification table is keyed by it. */
+export type ClaudeKnownToolName = (typeof CLAUDE_KNOWN_TOOL_NAMES)[number];
+
 /**
  * The built-ins that write files, removed from a turn that sets
  * `restrictFileWrites`. Typed against the audited vocabulary above so a name the
@@ -43,7 +46,7 @@ export const CLAUDE_FILE_WRITE_TOOLS = [
   'Write',
   'Edit',
   'NotebookEdit',
-] as const satisfies readonly (typeof CLAUDE_KNOWN_TOOL_NAMES)[number][];
+] as const satisfies readonly ClaudeKnownToolName[];
 
 /**
  * Tools the SDK renamed — a stale old name in allowed_tools/denied_tools is a
@@ -65,6 +68,7 @@ export const CLAUDE_CAPABILITIES: ProviderCapabilities = {
   agents: true,
   toolRestrictions: true,
   fileWriteRestriction: true, // restrictFileWrites → disallowedTools (CLAUDE_FILE_WRITE_TOOLS)
+  toolActionGate: true, // toolGate → PreToolUse hook that answers deny (tool-gate.ts)
   knownToolNames: CLAUDE_KNOWN_TOOL_NAMES,
   renamedTools: CLAUDE_RENAMED_TOOLS,
   structuredOutput: 'enforced', // SDK output_config.format grammar-constrains decoding
