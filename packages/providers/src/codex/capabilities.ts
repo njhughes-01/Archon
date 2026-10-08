@@ -20,6 +20,29 @@ export const CODEX_CAPABILITIES: ProviderCapabilities = {
   // profile passed through `CodexOptions.config` might express it; that route
   // has not been evaluated.
   fileWriteRestriction: false,
+  // Through Codex's PreToolUse command hook (tool-gate-bridge.ts), proven with
+  // real runs on codex-cli 0.157.0 and 0.159.3: shell commands, `apply_patch`
+  // edits and MCP tools are asked about before they run, on new and resumed
+  // threads; a denied call does not run and its reason and alternatives reach
+  // the model. A gated turn changes how Codex runs, for that invocation only:
+  //   - No TTY sessions (`features.unified_exec_tty=false`), so a gated Codex
+  //     turn cannot drive an interactive program. `write_stdin` to a running
+  //     command is not hooked, and with a TTY the model could type commands
+  //     into a shell it had been allowed to start.
+  //   - Hooks are forced on (`features.hooks=true`) and Codex's hook-trust
+  //     check is bypassed, so hooks the user has configured — including ones
+  //     not yet reviewed, and ones they had switched off — run as well.
+  //   - Codex CLI older than 0.157.0, or of unreadable version, is refused.
+  // What the gate does not cover:
+  //   - macOS and Linux only. A gated request on Windows is refused.
+  //   - Hosted tools (web search) run inside OpenAI and never reach a hook.
+  //   - The hook is Codex's to run. If it does not run anyway (a managed policy
+  //     that disables hooks), the first tool call of a gated turn runs unasked
+  //     before the provider sees it in the stream and stops the turn with
+  //     `codex_tool_gate_inactive`.
+  //   - The gate is told the session's working directory, not a directory the
+  //     model may have chosen for one command.
+  toolActionGate: true,
   structuredOutput: 'enforced', // SDK outputSchema grammar-constrains decoding
   requiresAllPropertiesRequired: true, // OpenAI strict-mode: every key in properties must appear in required
   envInjection: true,

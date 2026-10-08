@@ -16,8 +16,10 @@
  * node_modules-based resolution when no pin is configured.
  */
 import { existsSync as _existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { BUNDLED_IS_BINARY, getArchonHome, createLogger } from '@archon/paths';
 import {
   appendBinaryCandidateHint,
@@ -241,4 +243,28 @@ function getAutodetectPaths(): string[] {
   paths.push('/usr/local/bin/codex');
 
   return paths;
+}
+
+/**
+ * The command that starts the Codex CLI the SDK would pick for itself, for an
+ * unpinned source install (where {@link resolveCodexBinaryPath} returns
+ * undefined and leaves the choice to the SDK).
+ *
+ * The SDK keeps its own resolver private. Rather than restate it, this runs the
+ * `@openai/codex` package's entry script — the SDK's own dependency, which
+ * performs the same platform lookup — with the runtime that is running Archon.
+ */
+export function resolveSdkBundledCodexCommand(): string[] {
+  try {
+    // The SDK is ESM-only, so it resolves through `import.meta.resolve`; its CLI
+    // dependency is a sibling install only the SDK's own location can see.
+    const sdkEntry = fileURLToPath(import.meta.resolve('@openai/codex-sdk'));
+    return [process.execPath, createRequire(sdkEntry).resolve('@openai/codex/bin/codex.js')];
+  } catch (error) {
+    const err = new Error(
+      'Codex CLI not found next to the Codex SDK. Set CODEX_BIN_PATH, or assistants.codex.codexBinaryPath in .archon/config.yaml, to the Codex CLI binary.'
+    );
+    err.cause = error;
+    throw err;
+  }
 }
