@@ -18,8 +18,13 @@
  * from the labels instead of a classifier: no key, nothing sent. It proves the
  * pipeline and the arithmetic, not the classifier.
  *
+ * The labelled set is two halves. The classifier's questions and thresholds are
+ * tuned against `tuning` only; `heldout` holds rows it was never tuned on, some
+ * from command families the tuning half does not contain at all, and is what a
+ * result should be judged by.
+ *
  * Usage:
- *   bun run scripts/tool-gate-eval.ts [--dry] [--json] [--cases <file>]
+ *   bun run scripts/tool-gate-eval.ts [--dry] [--json] [--split tuning|heldout] [--cases <file>]
  *
  * Exit codes:
  *   0  scored, and it passed: no row labelled destructive was allowed
@@ -58,12 +63,18 @@ export const EVAL_CASES = resolve(
 const LABELS = ['destructive', 'safe'] as const;
 export type EvalLabel = (typeof LABELS)[number];
 const KINDS: readonly ToolActionKind[] = ['shell', 'file_write', 'network', 'mcp', 'other'];
+const SPLITS = ['tuning', 'heldout'] as const;
+export type EvalSplit = (typeof SPLITS)[number];
 
 /** One labelled tool call. `{root}` in `cwd`, `command` and `paths` is the scratch repository. */
 export interface EvalCase {
   id: string;
   /** Whether an unattended agent must be stopped from running it. */
   label: EvalLabel;
+  /** The kind of command, e.g. `github-cli`: what the halves are balanced by. */
+  family: string;
+  /** Which half the row belongs to. */
+  split: EvalSplit;
   tool: string;
   kind: ToolActionKind;
   cwd: string;
@@ -87,11 +98,15 @@ function isStringList(value: unknown): value is string[] {
 
 function toCase(value: unknown, where: string): EvalCase {
   if (!isRecord(value)) throw new Error(`${where} is not an object`);
-  const { id, label, tool, kind, cwd, command, paths, url, input } = value;
+  const { id, label, family, split, tool, kind, cwd, command, paths, url, input } = value;
   if (typeof id !== 'string' || id === '') throw new Error(`${where} has no "id"`);
   const knownLabel = LABELS.find(known => known === label);
   if (knownLabel === undefined) {
     throw new Error(`${where} (${id}) needs "label" to be one of: ${LABELS.join(', ')}`);
+  }
+  const knownSplit = SPLITS.find(known => known === split);
+  if (typeof family !== 'string' || family === '' || knownSplit === undefined) {
+    throw new Error(`${where} (${id}) needs a "family" and a "split" of: ${SPLITS.join(', ')}`);
   }
   const knownKind = KINDS.find(known => known === kind);
   if (typeof tool !== 'string' || knownKind === undefined || typeof cwd !== 'string') {
@@ -110,6 +125,8 @@ function toCase(value: unknown, where: string): EvalCase {
   return {
     id,
     label: knownLabel,
+    family,
+    split: knownSplit,
     tool,
     kind: knownKind,
     cwd,
@@ -248,6 +265,8 @@ export interface EvalRun {
   env: NodeJS.ProcessEnv;
   /** Where the cases came from, for the report. */
   casesPath?: string;
+  /** Run only this half. Default: every row. */
+  split?: EvalSplit;
   /** Answer from the labels instead of a classifier. Nothing is sent anywhere. */
   dry?: boolean;
   /** Replaces the network of a live run. Tests inject it; a live run leaves it out. */
@@ -262,6 +281,8 @@ export interface EvalReport extends Score {
   /** True when the labels answered instead of a classifier. Such a run measures nothing about one. */
   dry: boolean;
   casesPath: string;
+  /** The half that was run, or `all`. */
+  split: EvalSplit | 'all';
   /** What answered: the dry oracle, an injected classifier, or the endpoint and model. */
   classifier: string;
   /** Why the run is `unavailable`. Empty otherwise. */
@@ -390,6 +411,9 @@ async function judge(
 /** One evaluation: every row through the gate, scored against its label. */
 export async function runEval(run: EvalRun): Promise<EvalReport> {
   const casesPath = run.casesPath ?? 'in-memory cases';
+  const split = run.split ?? 'all';
+  const cases = run.cases.filter(testCase => split === 'all' || testCase.split === split);
+  if (cases.length === 0) throw new Error(`The labelled set holds no rows of the ${split} half`);
   const now = run.now ?? ((): number => performance.now());
   const dry = run.dry === true;
 
@@ -416,7 +440,7 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
 
   const tree = makeTree();
   try {
-    await assertEscalationBand(run.cases, tree);
+    await assertEscalationBand(cases, tree);
     if (classify === undefined) {
       const reason = jev.status === 'off' ? jev.reason : '';
       return {
@@ -425,6 +449,7 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
         pass: false,
         dry,
         casesPath,
+        split,
         classifier: 'unavailable',
         reason,
         thresholds,
@@ -432,10 +457,10 @@ export async function runEval(run: EvalRun): Promise<EvalReport> {
     }
     // One at a time, so a latency figure is one request's and not a queue's.
     const results: CaseResult[] = [];
-    for (const testCase of run.cases) {
+    for (const testCase of cases) {
       results.push(await judge(testCase, tree, classify, thresholds, now));
     }
-    return { ...scoreCases(results), dry, casesPath, classifier, reason: '', thresholds };
+    return { ...scoreCases(results), dry, casesPath, split, classifier, reason: '', thresholds };
   } finally {
     rmSync(tree.base, { recursive: true, force: true });
   }
@@ -465,7 +490,8 @@ function resultLabel(report: EvalReport): string {
 export function formatReport(report: EvalReport): string {
   const lines = [
     'Tool gate evaluation',
-    `cases:      ${report.casesPath} (${String(report.total)} rows: ${String(report.destructive)} destructive, ${String(report.safe)} safe)`,
+    `cases:      ${report.casesPath}`,
+    `split:      ${report.split} (${String(report.total)} rows: ${String(report.destructive)} destructive, ${String(report.safe)} safe)`,
     `classifier: ${report.classifier}`,
     `thresholds: deny at score >= ${String(report.thresholds.score)} or noul >= ${String(report.thresholds.noul)}`,
   ];
@@ -533,7 +559,8 @@ export function formatReport(report: EvalReport): string {
   return lines.join('\n');
 }
 
-const USAGE = 'Usage: bun run scripts/tool-gate-eval.ts [--dry] [--json] [--cases <file>]';
+const USAGE =
+  'Usage: bun run scripts/tool-gate-eval.ts [--dry] [--json] [--split tuning|heldout] [--cases <file>]';
 
 /**
  * The command. Returns the exit code; `write` receives each output line. `inject`
@@ -548,13 +575,17 @@ export async function main(
   let dry = false;
   let json = false;
   let casesPath = EVAL_CASES;
+  let split: EvalSplit | undefined;
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = argv[index + 1];
     if (argument === '--dry') dry = true;
     else if (argument === '--json') json = true;
     else if (argument === '--cases' && value !== undefined) casesPath = resolve(argv[++index]);
-    else {
+    else if (argument === '--split' && SPLITS.some(known => known === value)) {
+      split = SPLITS.find(known => known === value);
+      index++;
+    } else {
       write(`Unsupported argument: ${argument}`);
       write(USAGE);
       return 2;
@@ -563,7 +594,14 @@ export async function main(
 
   let report: EvalReport;
   try {
-    report = await runEval({ ...inject, cases: await readCases(casesPath), casesPath, env, dry });
+    report = await runEval({
+      ...inject,
+      cases: await readCases(casesPath),
+      casesPath,
+      env,
+      dry,
+      ...(split !== undefined && { split }),
+    });
   } catch (error) {
     // Deliberately every error: exit 1 means "the classifier was measured and fell
     // short", and nothing that stops the run before a score may be mistaken for that.

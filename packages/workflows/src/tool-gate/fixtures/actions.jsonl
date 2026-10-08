@@ -23,7 +23,7 @@
 {"id":"deny-push-mirror","tool":"Bash","kind":"shell","command":"git push --mirror origin","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push"}
 {"id":"deny-push-lease-protected","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin main","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push_protected"}
 {"id":"deny-push-lease-protected-refspec","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin HEAD:refs/heads/master","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push_protected"}
-{"id":"escalate-push-lease-bare-on-feature-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"allow-push-lease-bare-on-checked-out-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"deny-push-lease-variable-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin \"$BRANCH\"","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push_protected"}
 {"id":"deny-push-lease-mirror","tool":"Bash","kind":"shell","command":"git push --mirror --force-with-lease origin","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push_protected"}
 {"id":"deny-push-force-git-dash-c-dir","tool":"Bash","kind":"shell","command":"git -C sub push --force origin topic","cwd":"{root}","expect":"deny","ruleId":"deny.git_force_push"}
@@ -188,12 +188,12 @@
 {"id":"escalate-gh-pr-merge","tool":"Bash","kind":"shell","command":"gh pr merge 5","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-psql-drop-table","tool":"Bash","kind":"shell","command":"psql -c \"DROP TABLE users\"","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-rm-variable-glob","tool":"Bash","kind":"shell","command":"rm -rf \"$DIR\"/*","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-rm-file-inside","tool":"Bash","kind":"shell","command":"rm build/tmp.txt","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-rm-recursive-subdir","tool":"Bash","kind":"shell","command":"rm -rf build","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-rm-subdir-glob","tool":"Bash","kind":"shell","command":"rm -rf build/*","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"allow-rm-file-in-build-output","tool":"Bash","kind":"shell","command":"rm build/tmp.txt","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-rm-recursive-build-output","tool":"Bash","kind":"shell","command":"rm -rf build","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-rm-build-output-glob","tool":"Bash","kind":"shell","command":"rm -rf build/*","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"escalate-mv-inside","tool":"Bash","kind":"shell","command":"mv src/app.ts src/main.ts","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-git-push","tool":"Bash","kind":"shell","command":"git push origin feature/login","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-git-push-lease-feature","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin feature/login","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"allow-git-push-checked-out-branch","tool":"Bash","kind":"shell","command":"git push origin feature/login","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-git-push-lease-checked-out-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin feature/login","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"escalate-git-push-delete-refspec","tool":"Bash","kind":"shell","command":"git push origin :old-branch","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-git-rebase","tool":"Bash","kind":"shell","command":"git rebase main","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-git-branch-delete","tool":"Bash","kind":"shell","command":"git branch -D old-topic","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
@@ -208,10 +208,10 @@
 {"id":"escalate-chmod-recursive","tool":"Bash","kind":"shell","command":"chmod -R 777 build","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-dd-inside","tool":"Bash","kind":"shell","command":"dd if=/dev/zero of=build/zero.bin bs=1M count=1","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-mkfs","tool":"Bash","kind":"shell","command":"mkfs.ext4 /dev/sdb1","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-nohup-rm-background","tool":"Bash","kind":"shell","command":"nohup rm -rf build &","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-find-delete","tool":"Bash","kind":"shell","command":"find build -name '*.o' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"allow-nohup-rm-build-output-background","tool":"Bash","kind":"shell","command":"nohup rm -rf build &","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-find-delete-in-build-output","tool":"Bash","kind":"shell","command":"find build -name '*.o' -delete","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"escalate-xargs-rm","tool":"Bash","kind":"shell","command":"git ls-files --others | xargs rm","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"escalate-function-body-rm","tool":"Bash","kind":"shell","command":"cleanup() { rm -rf build; }; cleanup","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-function-body-rm","tool":"Bash","kind":"shell","command":"cleanup() { rm -rf build; }; cleanup","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
 {"id":"escalate-curl-post","tool":"Bash","kind":"shell","command":"curl -X POST https://api.example.com/items -d '{\"name\":\"a\"}'","cwd":"{root}","expect":"escalate","ruleId":"risk.network_request"}
 {"id":"escalate-curl-delete","tool":"Bash","kind":"shell","command":"curl -sXDELETE https://api.example.com/items/1","cwd":"{root}","expect":"escalate","ruleId":"risk.network_request"}
 {"id":"escalate-wget-post-data","tool":"Bash","kind":"shell","command":"wget --post-data 'a=1' https://api.example.com/items","cwd":"{root}","expect":"escalate","ruleId":"risk.network_request"}
@@ -342,18 +342,18 @@
 {"id":"a13-cat-gcloud-adc","tool":"Bash","kind":"shell","command":"cat ~/.config/gcloud/application_default_credentials.json","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"a13-cat-vault-token","tool":"Bash","kind":"shell","command":"cat ~/.vault-token","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"a13-cat-shadow","tool":"Bash","kind":"shell","command":"cat /etc/shadow","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
-{"id":"a14-git-checkout-dash-dash-dot","tool":"Bash","kind":"shell","command":"git checkout -- .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"a14-git-checkout-dot","tool":"Bash","kind":"shell","command":"git checkout .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"a14-git-checkout-force","tool":"Bash","kind":"shell","command":"git checkout -f","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"a14-git-checkout-dash-dash-dot","tool":"Bash","kind":"shell","command":"git checkout -- .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
+{"id":"a14-git-checkout-dot","tool":"Bash","kind":"shell","command":"git checkout .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
+{"id":"a14-git-checkout-force","tool":"Bash","kind":"shell","command":"git checkout -f","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
 {"id":"a14-git-checkout-existing-file","tool":"Bash","kind":"shell","command":"git checkout src/app.ts","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"a14-git-checkout-new-branch-allowed","tool":"Bash","kind":"shell","command":"git checkout -b feature/next","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
-{"id":"a14-git-restore-dot","tool":"Bash","kind":"shell","command":"git restore .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"a14-git-restore-dot","tool":"Bash","kind":"shell","command":"git restore .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
 {"id":"a14-git-restore-staged-allowed","tool":"Bash","kind":"shell","command":"git restore --staged src/app.ts","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
-{"id":"a14-git-switch-discard-changes","tool":"Bash","kind":"shell","command":"git switch --discard-changes develop","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"a14-git-switch-discard-changes","tool":"Bash","kind":"shell","command":"git switch --discard-changes develop","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
 {"id":"a14-git-stash-drop","tool":"Bash","kind":"shell","command":"git stash drop","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"a14-git-stash-clear","tool":"Bash","kind":"shell","command":"git stash clear","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"a14-git-read-tree-reset","tool":"Bash","kind":"shell","command":"git read-tree -u --reset HEAD","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"a14-git-checkout-index-force-all","tool":"Bash","kind":"shell","command":"git checkout-index -f -a","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"a14-git-checkout-index-force-all","tool":"Bash","kind":"shell","command":"git checkout-index -f -a","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
 {"id":"a14-git-update-ref-delete","tool":"Bash","kind":"shell","command":"git update-ref -d refs/heads/topic","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"a14-git-reflog-expire","tool":"Bash","kind":"shell","command":"git reflog expire --expire=now --all","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"a14-git-gc-prune-now","tool":"Bash","kind":"shell","command":"git gc --prune=now","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
@@ -461,8 +461,8 @@
 {"id":"f1-write-env-example","tool":"Write","kind":"file_write","paths":[".env.example"],"cwd":"{root}","expect":"allow","ruleId":"allow.write_in_root"}
 {"id":"f1-write-env-sample-and-template","tool":"Write","kind":"file_write","paths":[".env.sample","config/.env.production.template","env.example"],"cwd":"{root}","expect":"allow","ruleId":"allow.write_in_root"}
 {"id":"f1-cp-example-onto-env-still-denied","tool":"Bash","kind":"shell","command":"cp .env.example .env","cwd":"{root}","expect":"deny","ruleId":"deny.secret_write"}
-{"id":"f3-lease-push-head-on-feature-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin HEAD","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"f3-lease-push-current-branch-substitution","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin \"$(git branch --show-current)\"","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"f3-lease-push-head-on-feature-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin HEAD","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"f3-lease-push-current-branch-substitution","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin \"$(git branch --show-current)\"","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
 {"id":"f3-lease-push-head-on-main","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin HEAD","cwd":"{root}/on-main","expect":"deny","ruleId":"deny.git_force_push_protected"}
 {"id":"f3-lease-push-bare-on-main","tool":"Bash","kind":"shell","command":"git push --force-with-lease","cwd":"{root}/on-main","expect":"deny","ruleId":"deny.git_force_push_protected"}
 {"id":"f3-lease-push-substitution-on-main","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin \"$(git branch --show-current)\"","cwd":"{root}/on-main","expect":"deny","ruleId":"deny.git_force_push_protected"}
@@ -476,9 +476,9 @@
 {"id":"f4-grep-e-pattern-then-env-file-denied","tool":"Bash","kind":"shell","command":"grep -e API .env","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"f4-git-grep-pattern-then-env-path-denied","tool":"Bash","kind":"shell","command":"git grep API -- .env","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"f5-find-filtered-delete","tool":"Bash","kind":"shell","command":"find . -name '*.pyc' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"f6-cd-subdir-rm-bare-glob","tool":"Bash","kind":"shell","command":"cd dist && rm -rf *","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"f6-cd-subdir-rm-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
-{"id":"f6-cd-subdir-rm-dot-slash-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r ./.","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"f6-cd-subdir-rm-bare-glob","tool":"Bash","kind":"shell","command":"cd dist && rm -rf *","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"f6-cd-subdir-rm-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r .","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"f6-cd-subdir-rm-dot-slash-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r ./.","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"f6-root-rm-dot-slash-dot","tool":"Bash","kind":"shell","command":"rm -r ./.","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
 {"id":"f6-cd-subdir-rm-dotdot-is-the-root","tool":"Bash","kind":"shell","command":"cd build && rm -rf ..","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
 {"id":"f7-cat-secrets-manager-source","tool":"Bash","kind":"shell","command":"cat src/secrets/manager.ts","cwd":"{root}","expect":"allow","ruleId":"allow.read_only"}
@@ -550,3 +550,19 @@
 {"id":"p2-unknown-tool-single-dash-output","tool":"Bash","kind":"shell","command":"sometool -output {outside}/result.json run","cwd":"{root}","expect":"deny","ruleId":"deny.path_outside_root"}
 {"id":"p2-unknown-tool-single-dash-output-attached","tool":"Bash","kind":"shell","command":"sometool -out={outside}/result.json run","cwd":"{root}","expect":"deny","ruleId":"deny.path_outside_root"}
 {"id":"escalate-shell-cwd-outside","tool":"Bash","kind":"shell","command":"make build","cwd":"{outside}","expect":"escalate","ruleId":"risk.cwd_outside_root"}
+{"id":"escalate-rm-file-in-sources","tool":"Bash","kind":"shell","command":"rm src/app.ts","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-rm-recursive-source-subdir","tool":"Bash","kind":"shell","command":"rm -rf src","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-rm-build-output-and-sources","tool":"Bash","kind":"shell","command":"rm -rf build src","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-find-delete-in-sources","tool":"Bash","kind":"shell","command":"find src -name '*.bak' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-cd-sources-rm-dot","tool":"Bash","kind":"shell","command":"cd src && rm -r .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"allow-rm-node-modules-cache","tool":"Bash","kind":"shell","command":"rm -rf node_modules/.cache","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-rm-dist-and-coverage","tool":"Bash","kind":"shell","command":"rm -rf dist coverage","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"allow-rm-pycache-nested","tool":"Bash","kind":"shell","command":"rm -rf src/__pycache__","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"escalate-git-push-other-branch","tool":"Bash","kind":"shell","command":"git push origin feature/another","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-git-push-lease-other-branch","tool":"Bash","kind":"shell","command":"git push --force-with-lease origin feature/another","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-git-push-checked-out-branch-to-url","tool":"Bash","kind":"shell","command":"git push https://github.com/someone/else.git HEAD","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-git-restore-one-file","tool":"Bash","kind":"shell","command":"git restore src/app.ts","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"escalate-git-restore-dot-in-subdir","tool":"Bash","kind":"shell","command":"cd src && git restore .","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"deny-git-checkout-head-dash-dash-dot","tool":"Bash","kind":"shell","command":"git checkout HEAD -- .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
+{"id":"deny-git-restore-worktree-staged-dot","tool":"Bash","kind":"shell","command":"git restore --worktree --staged .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}
+{"id":"deny-git-status-then-restore-dot","tool":"Bash","kind":"shell","command":"git status && git restore .","cwd":"{root}","expect":"deny","ruleId":"deny.git_discard_worktree"}

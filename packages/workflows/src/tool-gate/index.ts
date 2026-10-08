@@ -50,6 +50,8 @@ export type {
 export { ESCALATION_TEXT_CAP, PREVIEW_TEXT_CAP, redactInput, redactText } from './redact';
 export type { RedactOptions } from './redact';
 export { collectCredentialValues, redactCredentialValues } from './credential-values';
+export { ESCALATION_FACT_VALUES } from './escalation-facts';
+export type { EscalationFactName, EscalationFacts } from './escalation-facts';
 export { mergeToolGateConfig, parseToolGateConfig } from './config';
 export type { ToolGateConfig, ToolGateConfigInput } from './config';
 export {

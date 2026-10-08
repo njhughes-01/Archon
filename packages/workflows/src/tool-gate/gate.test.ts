@@ -130,6 +130,7 @@ describe('the escalation band', () => {
     await h.gate(shell(ESCALATED, h.root));
     expect(Object.keys(h.calls[0] ?? {}).sort()).toEqual([
       'command',
+      'facts',
       'kind',
       'repoRelative',
       'reversibleHint',
@@ -138,6 +139,8 @@ describe('the escalation band', () => {
       'tool',
     ]);
     expect(h.calls[0]).toMatchObject({ tool: 'Bash', kind: 'shell', command: ESCALATED });
+    // The facts are the rules' fixed words, never text from the request.
+    expect(h.calls[0]?.facts).toEqual({ githubAction: 'merge_or_close' });
   });
 
   test('the default score threshold sits between reversible and out_of_bounds', () => {
@@ -499,12 +502,12 @@ describe('repeated denials in one node', () => {
 describe('what the classifier is sent is bounded', () => {
   test('a call naming hundreds of targets sends a capped list and says how many were left out', async () => {
     const h = harness(CALM);
-    const paths = Array.from({ length: 400 }, (_, index) => `build/out-${String(index)}.tmp`);
+    const paths = Array.from({ length: 400 }, (_, index) => `src/gen/out-${String(index)}.tmp`);
     await h.gate(shell(`rm ${paths.join(' ')}`, h.root));
 
     const sent = h.calls[0]?.targets ?? [];
     expect(sent.length).toBeLessThanOrEqual(MAX_ESCALATION_TARGETS + 1);
-    expect(sent[0]).toBe('build/out-0.tmp');
+    expect(sent[0]).toBe('src/gen/out-0.tmp');
     expect(sent.at(-1)).toBe(`… [${String(400 - MAX_ESCALATION_TARGETS)} more targets]`);
     expect(sent.join('').length).toBeLessThanOrEqual(ESCALATION_TEXT_CAP + 40);
   });
@@ -513,7 +516,7 @@ describe('what the classifier is sent is bounded', () => {
     const h = harness(CALM);
     const long = Array.from(
       { length: 15 },
-      (_, index) => `build/${'d'.repeat(190)}-${String(index)}`
+      (_, index) => `src/${'d'.repeat(192)}-${String(index)}`
     );
     await h.gate(shell(`rm ${long.join(' ')}`, h.root));
 
@@ -525,8 +528,8 @@ describe('what the classifier is sent is bounded', () => {
 
   test('a short list is sent whole', async () => {
     const h = harness(CALM);
-    await h.gate(shell('rm build/a.tmp build/b.tmp', h.root));
-    expect(h.calls[0]?.targets).toEqual(['build/a.tmp', 'build/b.tmp']);
+    await h.gate(shell('rm src/a.tmp src/b.tmp', h.root));
+    expect(h.calls[0]?.targets).toEqual(['src/a.tmp', 'src/b.tmp']);
   });
 });
 

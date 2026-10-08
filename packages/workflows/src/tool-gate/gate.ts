@@ -19,6 +19,7 @@ import type {
   ToolActionKind,
   ToolActionRequest,
 } from '@archon/providers/types';
+import type { EscalationFacts } from './escalation-facts';
 import { isInside } from './path-resolution';
 import {
   ESCALATION_TEXT_CAP,
@@ -84,6 +85,8 @@ export interface ToolGateEscalationRequest {
   reversibleHint: ReversibleHint;
   /** Every risk signal that fired, strongest first. */
   signals: RiskRuleId[];
+  /** What the rules know for certain about the call beyond its text. Absent facts were not established. */
+  facts: EscalationFacts;
 }
 
 export interface ToolGateClassifierAnswer {
@@ -575,6 +578,7 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
       repoRelative: outcome.repoRelative,
       reversibleHint: outcome.reversibleHint,
       signals: outcome.signals,
+      facts: outcome.facts,
     };
     // The key covers the raw request and what the rules found on disk this time.
     const cacheKey = sha256(`${commandHash}\n${JSON.stringify(escalation)}`);

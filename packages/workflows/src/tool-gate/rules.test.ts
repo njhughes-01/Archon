@@ -4,7 +4,7 @@
  * decision. POSIX paths throughout, so the suite is skipped on Windows.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
@@ -63,14 +63,24 @@ const PUSH = 'git push --force-with-lease';
 
 posix('lease-protected push: which branch it targets', () => {
   test.each([
-    [`${PUSH}`, 'the bare form'],
-    [`${PUSH} origin`, 'a remote and no refspec'],
-    [`${PUSH} origin HEAD`, 'HEAD'],
-    [`${PUSH} origin @`, '@'],
-    [`${PUSH} origin "$(git branch --show-current)"`, 'the current-branch substitution'],
-    [`${PUSH} origin "$(git rev-parse --abbrev-ref HEAD)"`, 'the rev-parse spelling'],
-  ])('%s follows the checked-out branch (%s)', async command => {
-    expect(await ruleOf(command, makeTree('feature/login'))).toBe('risk.mutation_verb');
+    // A push of the checked-out, unprotected branch is the run's ordinary push: no signal.
+    [`${PUSH}`, 'the bare form', 'default.no_signal'],
+    [`${PUSH} origin`, 'a remote and no refspec', 'default.no_signal'],
+    [`${PUSH} origin HEAD`, 'HEAD', 'default.no_signal'],
+    [`${PUSH} origin @`, '@', 'default.no_signal'],
+    // The substitution is still text the reader cannot run, so it stays flagged.
+    [
+      `${PUSH} origin "$(git branch --show-current)"`,
+      'the current-branch substitution',
+      'risk.opaque_shell',
+    ],
+    [
+      `${PUSH} origin "$(git rev-parse --abbrev-ref HEAD)"`,
+      'the rev-parse spelling',
+      'risk.opaque_shell',
+    ],
+  ])('%s follows the checked-out branch (%s)', async (command, _name, onFeatureBranch) => {
+    expect(await ruleOf(command, makeTree('feature/login'))).toBe(onFeatureBranch);
     expect(await ruleOf(command, makeTree('main'))).toBe('deny.git_force_push_protected');
     expect(await ruleOf(command, makeTree('master'))).toBe('deny.git_force_push_protected');
   });
@@ -91,7 +101,7 @@ posix('lease-protected push: which branch it targets', () => {
     writeFileSync(join(worktree, '.git'), `gitdir: ${gitDir}\n`);
     expect(await ruleOf(PUSH, tree, worktree)).toBe('deny.git_force_push_protected');
     writeFileSync(join(gitDir, 'HEAD'), 'ref: refs/heads/topic\n');
-    expect(await ruleOf(PUSH, tree, worktree)).toBe('risk.mutation_verb');
+    expect(await ruleOf(PUSH, tree, worktree)).toBe('default.no_signal');
   });
 
   test('git -C reads the branch of the checkout it names', async () => {
@@ -117,7 +127,9 @@ posix('lease-protected push: which branch it targets', () => {
     ['origin "$BRANCH"', 'deny.git_force_push_protected'],
     ['origin topic*', 'deny.git_force_push_protected'],
     ['--all origin', 'deny.git_force_push_protected'],
-    ['origin topic', 'risk.mutation_verb'],
+    // `topic` is the branch checked out here: its own push, lease or not, raises nothing.
+    ['origin topic', 'default.no_signal'],
+    ['origin other-topic', 'risk.mutation_verb'],
     ['origin topic:topic', 'risk.mutation_verb'],
     ['origin main-backup', 'risk.mutation_verb'],
     ['origin feature/main', 'risk.mutation_verb'],
@@ -169,7 +181,10 @@ posix('find -delete: filtered or not', () => {
     ['find . -maxdepth 3 -delete', 'deny.rm_recursive_root'],
     ['find . -name "*.pyc" -delete', 'risk.mutation_verb'],
     ['find . -type f -mtime +7 -delete', 'risk.mutation_verb'],
-    ['find build -delete', 'risk.mutation_verb'],
+    ['find src -delete', 'risk.mutation_verb'],
+    // `build` holds what a build makes again: emptying it raises nothing.
+    ['find build -delete', 'default.no_signal'],
+    ['find build -name "*.o" -delete', 'default.no_signal'],
     ['find build src -name "*.tmp" -delete', 'risk.mutation_verb'],
     ['find . -name "*.pyc"', 'allow.read_only'],
   ])('%s → %s', async (command, expected) => {
@@ -192,14 +207,20 @@ posix('recursive removal: where the shell stands', () => {
     ['rm -rf *', 'deny.rm_recursive_root'],
     ['rm -rf .git', 'deny.rm_recursive_root'],
     ['rm -rf .git/refs', 'deny.rm_recursive_root'],
-    ['cd build && rm -rf .', 'risk.mutation_verb'],
-    ['cd build && rm -rf *', 'risk.mutation_verb'],
+    ['cd src && rm -rf .', 'risk.mutation_verb'],
+    ['cd src && rm -rf *', 'risk.mutation_verb'],
+    ['cd build && rm -rf .', 'default.no_signal'],
+    ['cd build && rm -rf *', 'default.no_signal'],
     ['cd build && rm -rf ..', 'deny.rm_recursive_root'],
     ['cd build && rm -rf ../*', 'deny.rm_recursive_root'],
     ['cd build && cd .. && rm -rf *', 'deny.rm_recursive_root'],
     ['cd "$SOMEWHERE" && rm -rf *', 'deny.rm_recursive_root'],
     ['cd "$SOMEWHERE" && rm -rf .', 'deny.rm_recursive_root'],
-    ['rm -r build', 'risk.mutation_verb'],
+    ['rm -r src', 'risk.mutation_verb'],
+    ['rm -r build', 'default.no_signal'],
+    ['rm -rf node_modules/.cache dist coverage', 'default.no_signal'],
+    ['rm -rf build src/generated', 'risk.mutation_verb'],
+    ['rm -rf "$OUT"/build', 'risk.mutation_verb'],
     ['rm .git/index.lock', 'risk.mutation_verb'],
   ])('%s → %s', async (command, expected) => {
     expect(await ruleOf(command, makeTree())).toBe(expected);
@@ -296,5 +317,108 @@ describe('request shapes', () => {
       tree.context
     );
     expect(outcome).toMatchObject({ outcome: 'deny', ruleId: 'deny.unreadable_request' });
+  });
+});
+
+posix('plain push: the checked-out branch or another', () => {
+  test.each([
+    ['git push', 'default.no_signal'],
+    ['git push origin HEAD', 'default.no_signal'],
+    ['git push -u origin feature/login', 'default.no_signal'],
+    ['git push origin feature/other', 'risk.mutation_verb'],
+    ['git push origin feature/login:feature/other', 'risk.mutation_verb'],
+    ['git push origin feature/login --tags', 'risk.mutation_verb'],
+    ['git push --all origin', 'risk.mutation_verb'],
+    ['git push origin --delete feature/login', 'risk.mutation_verb'],
+    ['git push https://github.com/someone/else.git HEAD', 'risk.mutation_verb'],
+    ['git push "$REMOTE" HEAD', 'risk.mutation_verb'],
+  ])('%s → %s', async (command, expected) => {
+    expect(await ruleOf(command, makeTree('feature/login'))).toBe(expected);
+  });
+
+  test('on a protected branch even the plain push stays flagged', async () => {
+    expect(await ruleOf('git push origin HEAD', makeTree('main'))).toBe('risk.mutation_verb');
+    expect(await ruleOf('git push', makeTree('main'))).toBe('risk.mutation_verb');
+  });
+
+  test('with no checkout to read, nothing is assumed', async () => {
+    const tree = makeTree();
+    rmSync(join(tree.root, '.git'), { recursive: true });
+    expect(await ruleOf('git push origin HEAD', tree)).toBe('risk.mutation_verb');
+  });
+});
+
+posix('discarding uncommitted work: the whole tree or named paths', () => {
+  test.each([
+    ['git checkout -- .', 'deny.git_discard_worktree'],
+    ['git checkout .', 'deny.git_discard_worktree'],
+    ['git checkout HEAD -- .', 'deny.git_discard_worktree'],
+    ['git checkout -f', 'deny.git_discard_worktree'],
+    ['git checkout -f main', 'deny.git_discard_worktree'],
+    ['git checkout -- :/', 'deny.git_discard_worktree'],
+    ["git checkout -- '*'", 'risk.mutation_verb'],
+    ['git checkout -- *', 'deny.git_discard_worktree'],
+    ['git restore .', 'deny.git_discard_worktree'],
+    ['git restore --worktree --staged .', 'deny.git_discard_worktree'],
+    ['git restore --source=HEAD~1 .', 'deny.git_discard_worktree'],
+    ['git switch --discard-changes main', 'deny.git_discard_worktree'],
+    ['git checkout-index -f -a', 'deny.git_discard_worktree'],
+    ['cd src && cd .. && git restore .', 'deny.git_discard_worktree'],
+    // One file or one sub-directory is a scoped discard: flagged, not denied.
+    ['git checkout -- src/app.ts', 'risk.mutation_verb'],
+    ['git restore src/app.ts', 'risk.mutation_verb'],
+    ['git restore src/', 'risk.mutation_verb'],
+    ['cd src && git restore .', 'risk.mutation_verb'],
+    ['git checkout-index -f src/app.ts', 'risk.mutation_verb'],
+    // Not a discard at all.
+    ['git restore --staged .', 'default.no_signal'],
+    ['git checkout -b feature/next', 'default.no_signal'],
+    ['git switch main', 'default.no_signal'],
+  ])('%s → %s', async (command, expected) => {
+    expect(await ruleOf(command, makeTree())).toBe(expected);
+  });
+});
+
+posix('facts stated with an escalation', () => {
+  async function factsOf(command: string, tree = makeTree()): Promise<unknown> {
+    const outcome = await judge(command, tree);
+    return outcome.outcome === 'escalate' ? outcome.facts : outcome.outcome;
+  }
+
+  test.each([
+    ['git push origin feature/other', { gitPushTarget: 'other_unprotected_branch' }],
+    ['git push origin main', { gitPushTarget: 'protected_branch' }],
+    ['git push origin HEAD:main', { gitPushTarget: 'protected_branch' }],
+    ['git push origin feature/login:feature/other', { gitPushTarget: 'other_unprotected_branch' }],
+    ['git push origin --delete feature/other', { gitPushTarget: 'deletes_remote_ref' }],
+    ['git push --tags', { gitPushTarget: 'several_or_all_refs' }],
+    ['git push origin "$BRANCH"', { gitPushTarget: 'unknown' }],
+    ['git restore src/app.ts', { uncommittedWork: 'discarded_in_named_paths' }],
+    ['git checkout -- "$FILE"', { uncommittedWork: 'unknown' }],
+    ['rm -rf src/generated', { removalTarget: 'other_repository_path' }],
+    ['rm -rf "$DIR"/out', { removalTarget: 'unknown' }],
+    ['find src -name "*.bak" -delete', { removalTarget: 'other_repository_path' }],
+    ['gh pr comment 31 --body ok', { githubAction: 'comment' }],
+    ['gh run rerun 7712 --failed', { githubAction: 'ci_run_control' }],
+    ['gh pr merge 5', { githubAction: 'merge_or_close' }],
+    ['gh secret set KEY_NAME --body x', { githubAction: 'settings_or_secrets' }],
+    ['gh label create triage', { githubAction: 'other' }],
+    ['psql -h localhost -d app_test -c "select 1"', { targetHost: 'loopback' }],
+    ['psql -d app_test -f migrations/001.sql', { targetHost: 'test_or_dev_named' }],
+    ['psql -h db.prod.internal -d orders -c "select 1"', { targetHost: 'production_named' }],
+    ['mysql -h db7.internal -e "show tables"', { targetHost: 'unknown' }],
+    ['psql "$DATABASE_URL" -c "select 1"', { targetHost: 'unknown' }],
+    ['psql -h localhost -d app_production -c "select 1"', { targetHost: 'production_named' }],
+    ['curl -X POST http://127.0.0.1:8080/v1/echo -d x', { targetHost: 'loopback' }],
+    ['ssh deploy@prod-1.example.com uptime', { targetHost: 'production_named' }],
+    ['docker ps', {}],
+  ])('%s → %p', async (command, facts) => {
+    expect(await factsOf(command)).toEqual(facts);
+  });
+
+  test('two statements of one fact keep the more concerning one', async () => {
+    expect(
+      await factsOf('git push origin feature/other && git push origin --delete feature/old')
+    ).toEqual({ gitPushTarget: 'deletes_remote_ref' });
   });
 });

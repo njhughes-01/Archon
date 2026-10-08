@@ -26,6 +26,13 @@ import {
   type OptionSpec,
   type ParsedOptions,
 } from './command-options';
+import {
+  githubAction,
+  isBuildOutputPath,
+  noteFact,
+  targetHost,
+  type EscalationFacts,
+} from './escalation-facts';
 import { isInside, resolveRealPath } from './path-resolution';
 import { isSecretPath } from './secret-paths';
 import {
@@ -92,6 +99,14 @@ export const DENY_RULES = {
     alternatives: [
       'Use git stash to set changes aside, or git restore <path> for one file.',
       'Use git reset --soft or --mixed to move the branch and keep the files.',
+    ],
+  },
+  'deny.git_discard_worktree': {
+    reason:
+      'It discards every uncommitted change in the working tree, with no way back: the same loss as a hard reset.',
+    alternatives: [
+      'Use git stash to set the changes aside, or git restore <path> for the one file you mean.',
+      'Commit the work you want to keep first, then discard only what is left by path.',
     ],
   },
   'deny.git_clean_force': {
@@ -177,6 +192,8 @@ export type RuleOutcome =
       /** True when the working directory and every known target are inside the root. */
       repoRelative: boolean;
       reversibleHint: ReversibleHint;
+      /** What the rules know for certain about the call beyond its text. */
+      facts: EscalationFacts;
     };
 
 export interface RuleContext {
@@ -367,6 +384,12 @@ const MUTATION_HEADS: Readonly<Record<string, ReversibleHint>> = {
   su: 'unlikely',
 };
 const PUBLISHERS: ReadonlySet<string> = new Set(['npm', 'pnpm', 'yarn', 'bun', 'cargo']);
+const DATABASE_CLIENTS: ReadonlySet<string> = new Set(['psql', 'mysql', 'mongosh', 'redis-cli']);
+/** Clients whose arguments name the host or database they act on. */
+const HOST_CLIENTS: ReadonlySet<string> = new Set([
+  ...DATABASE_CLIENTS,
+  ...['curl', 'wget', 'http', 'https', 'xh', 'ssh', 'scp', 'sftp', 'rsync'],
+]);
 
 /** `gh <group> <verb>` groups, each of which has verbs that change remote state. */
 const GH_GROUPS: ReadonlySet<string> = new Set([
@@ -496,6 +519,10 @@ interface Judgement {
   fetched: Set<string>;
   /** A target or working directory this gate could not place. */
   unplaced: boolean;
+  /** Certain facts about the call, for whoever judges it next. */
+  facts: EscalationFacts;
+  /** Commands whose own mutation verb is already settled: removing build output is not a risk. */
+  settled: Set<ShellCommand>;
 }
 
 function newJudgement(): Judgement {
@@ -506,6 +533,8 @@ function newJudgement(): Judgement {
     targets: new Set(),
     fetched: new Set(),
     unplaced: false,
+    facts: {},
+    settled: new Set(),
   };
 }
 
@@ -610,7 +639,12 @@ interface ShellScope {
 }
 
 /** Judges one path a call writes, moves or removes. */
-async function judgeWriteTarget(target: ResolvedWord, scope: ShellScope): Promise<void> {
+async function judgeWriteTarget(
+  target: ResolvedWord,
+  scope: ShellScope,
+  /** The caller has placed a glob's whole directory already, so what it matches does not matter. */
+  globPlaced = false
+): Promise<void> {
   const { context, judgement } = scope;
   if (isDeviceSink(target)) return;
   if (target.dynamic) {
@@ -624,7 +658,7 @@ async function judgeWriteTarget(target: ResolvedWord, scope: ShellScope): Promis
   let text = target.text;
   if (target.glob) {
     // What a glob matches is unknown; the directory it is anchored in is not.
-    signal(judgement, 'risk.opaque_shell');
+    if (!globPlaced) signal(judgement, 'risk.opaque_shell');
     if (isSecretPath(literalView(text, context))) deny(judgement, 'deny.secret_write');
     text = text.slice(0, text.search(/[*?[]/));
     text = text.slice(0, text.lastIndexOf('/') + 1) || '.';
@@ -888,6 +922,34 @@ async function judgeGitPush(
   if (deleted.some(refspec => !refspec.dynamic && isProtected(pushDestination(refspec.text)))) {
     deny(judgement, 'deny.git_force_push_protected');
   }
+
+  // Where the push lands, as far as the command and the checkout show it.
+  const checkedOut = await currentBranch(gitDirectory);
+  const pushed = refspecs.length === 0 ? [plainPath('HEAD')] : refspecs;
+  const landsOn = pushed.map(refspec => {
+    if (namesCurrentBranch(refspec)) return checkedOut;
+    return refspec.dynamic || refspec.glob ? undefined : pushDestination(refspec.text);
+  });
+  // `HEAD`, or the checked-out branch by its own name: nothing else is the run's own push.
+  const ownBranchOnly = pushed.every(
+    refspec => namesCurrentBranch(refspec) || (!refspec.dynamic && refspec.text === checkedOut)
+  );
+  let target: NonNullable<EscalationFacts['gitPushTarget']>;
+  if (deleted.length > 0) target = 'deletes_remote_ref';
+  else if (everything || hasOption(parsed, '--tags', '--follow-tags'))
+    target = 'several_or_all_refs';
+  else if (landsOn.includes(undefined)) target = 'unknown';
+  else if (landsOn.some(isProtected)) target = 'protected_branch';
+  else if (ownBranchOnly) target = 'checked_out_branch';
+  else target = 'other_unprotected_branch';
+  noteFact(judgement.facts, 'gitPushTarget', target);
+
+  // The ordinary push of a run: its own checked-out, unprotected branch, to a
+  // configured remote, without the force flag. Nothing about it is left to judge.
+  const [remote] = parsed.positionals;
+  const configuredRemote =
+    remote === undefined || (!remote.dynamic && /^[A-Za-z0-9_-]+$/.test(remote.text));
+  if (target === 'checked_out_branch' && configuredRemote && judgement.deny === undefined) return;
   signal(judgement, 'risk.mutation_verb', 'unlikely');
 }
 
@@ -925,6 +987,33 @@ function gitWriteTargets(subcommand: string, parsed: Options, context: RuleConte
   }
 }
 
+/**
+ * Whether one of a checkout's or restore's operands is the whole working tree:
+ * the repository root (or a directory holding it), git's `:/`, or a bare glob there.
+ */
+async function coversWholeTree(operands: readonly Arg[], scope: ShellScope): Promise<boolean> {
+  for (const operand of operands) {
+    if (operand.dynamic) continue;
+    if (operand.text === ':/' || operand.text.startsWith(':/*')) return true;
+    const text = operand.glob
+      ? /^[*?.[\]!^]+$/.test(operand.text)
+        ? '.'
+        : undefined
+      : operand.text;
+    if (text === undefined) continue;
+    const where = await locate(text, scope.cwd, scope.context);
+    if (where.kind === 'resolved' && isInside(where.real, scope.context.repoRoot)) return true;
+  }
+  return false;
+}
+
+/** How much a path-scoped checkout or restore throws away, as far as its operands show. */
+function discardScope(operands: readonly Arg[]): NonNullable<EscalationFacts['uncommittedWork']> {
+  return operands.some(operand => operand.dynamic || operand.glob)
+    ? 'unknown'
+    : 'discarded_in_named_paths';
+}
+
 /** Raises the signal for git commands that throw away work or history without a deny rule. */
 async function judgeGitDiscard(
   subcommand: string,
@@ -955,6 +1044,9 @@ async function judgeGitDiscard(
       hint = 'likely';
       break;
     case 'checkout': {
+      if (hasOption(parsed, '-f', '--force') || (await coversWholeTree(positionals, scope))) {
+        deny(judgement, 'deny.git_discard_worktree');
+      }
       // `git checkout <branch>` is ordinary; with a path it overwrites the file.
       const paths = await Promise.all(
         positionals.map(async arg => {
@@ -968,14 +1060,20 @@ async function judgeGitDiscard(
         hasOption(parsed, '-f', '--force', '-p', '--patch') ||
         raw.some(arg => arg.text === '--') ||
         paths.includes(true);
+      if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
       break;
     }
     case 'restore':
       // `--staged` alone only unstages; anything touching the worktree overwrites files.
       discards = !hasOption(parsed, '--staged', '-S') || hasOption(parsed, '--worktree', '-W');
+      if (discards && (await coversWholeTree(positionals, scope))) {
+        deny(judgement, 'deny.git_discard_worktree');
+      }
+      if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
       break;
     case 'switch':
       discards = hasOption(parsed, '--discard-changes', '-f', '--force');
+      if (discards) deny(judgement, 'deny.git_discard_worktree');
       break;
     case 'stash':
       discards = verb === 'drop' || verb === 'clear';
@@ -990,6 +1088,8 @@ async function judgeGitDiscard(
       break;
     case 'checkout-index':
       discards = hasOption(parsed, '-f', '--force');
+      if (discards && hasOption(parsed, '-a', '--all'))
+        deny(judgement, 'deny.git_discard_worktree');
       break;
     case 'rm':
       discards = !hasOption(parsed, '--cached');
@@ -1149,17 +1249,60 @@ async function isRootLikeRemoval(target: ResolvedWord, scope: ShellScope): Promi
   return isRootLikeDirectory(target.text.slice(0, lastSlash + 1) || '.', scope);
 }
 
+/**
+ * Whether everything a removal names lies in a build, install or cache
+ * directory of the repository: output a build makes again. A glob counts by
+ * the directory it is anchored in. States the fact either way.
+ */
+async function removesOnlyBuildOutput(
+  targets: readonly ResolvedWord[],
+  scope: ShellScope
+): Promise<boolean> {
+  const { context, judgement } = scope;
+  let placed = targets.length > 0;
+  let buildOutput = placed;
+  for (const target of targets) {
+    if (target.dynamic) {
+      placed = false;
+      break;
+    }
+    let text = target.text;
+    if (target.glob) {
+      // The directory the glob is anchored in, as `judgeWriteTarget` takes it.
+      text = text.slice(0, text.search(/[*?[]/));
+      text = text.slice(0, text.lastIndexOf('/') + 1) || '.';
+    }
+    const where = await locate(text, scope.cwd, context);
+    if (where.kind !== 'resolved' || !where.inside) {
+      placed = false;
+      break;
+    }
+    if (!isBuildOutputPath(relative(context.repoRoot, where.real))) buildOutput = false;
+  }
+  if (!placed) {
+    noteFact(judgement.facts, 'removalTarget', 'unknown');
+    return false;
+  }
+  noteFact(
+    judgement.facts,
+    'removalTarget',
+    buildOutput ? 'build_or_cache_output' : 'other_repository_path'
+  );
+  return buildOutput;
+}
+
 /** Judges paths a command removes; `recursive` adds the never-acceptable directories. */
 async function judgeRemoval(
   targets: readonly ResolvedWord[],
   recursive: boolean,
-  scope: ShellScope
+  scope: ShellScope,
+  buildOutput = false
 ): Promise<void> {
   for (const target of targets) {
     if (recursive && (await isRootLikeRemoval(target, scope))) {
       deny(scope.judgement, 'deny.rm_recursive_root');
     }
-    await judgeWriteTarget(target, scope);
+    await judgeWriteTarget(target, scope, buildOutput);
   }
 }
 
@@ -1170,7 +1313,10 @@ async function judgeRm(view: CommandView, scope: ShellScope): Promise<void> {
     view.command.head === 'rimraf' ||
     hasOption(parsed, '-r', '-R') ||
     hasAbbreviated(parsed, '--recursive', '--r');
-  await judgeRemoval(parsed.positionals, recursive, scope);
+  const buildOutput = await removesOnlyBuildOutput(parsed.positionals, scope);
+  // Removing what a build makes again is not a risk signal of its own.
+  if (buildOutput) scope.judgement.settled.add(view.command);
+  await judgeRemoval(parsed.positionals, recursive, scope, buildOutput);
 }
 
 /** find: the files its actions write, and what `-delete` removes. */
@@ -1190,8 +1336,10 @@ async function judgeFind(view: CommandView, scope: ShellScope): Promise<void> {
   const filtered = args
     .slice(expression === -1 ? args.length : expression)
     .some(arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text)));
-  await judgeRemoval(starts.length > 0 ? starts : [plainPath('.')], !filtered, scope);
-  signal(scope.judgement, 'risk.mutation_verb');
+  const removed = starts.length > 0 ? starts : [plainPath('.')];
+  const buildOutput = await removesOnlyBuildOutput(removed, scope);
+  await judgeRemoval(removed, !filtered, scope, buildOutput);
+  if (!buildOutput) signal(scope.judgement, 'risk.mutation_verb');
 }
 
 // --- write targets ---------------------------------------------------------
@@ -1436,7 +1584,16 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
   const hint = MUTATION_HEADS[head];
-  if (hint !== undefined) signal(judgement, 'risk.mutation_verb', hint);
+  if (hint !== undefined && !judgement.settled.has(command)) {
+    signal(judgement, 'risk.mutation_verb', hint);
+  }
+  if (HOST_CLIENTS.has(head)) {
+    // A database client always connects somewhere: one that names nothing says `unknown`.
+    const host =
+      targetHost(args.filter(arg => !arg.dynamic).map(arg => arg.text)) ??
+      (DATABASE_CLIENTS.has(head) ? 'unknown' : undefined);
+    if (host !== undefined) noteFact(judgement.facts, 'targetHost', host);
+  }
   if (head.startsWith('mkfs')) signal(judgement, 'risk.mutation_verb', 'unlikely');
 
   const recursive = hasOption(parsed, '-R') || hasAbbreviated(parsed, '--recursive', '--rec');
@@ -1452,7 +1609,10 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   if (head === 'gh') {
     const [group, verb] = positionals.map(arg => arg.text);
     if (group !== undefined && GH_GROUPS.has(group) && verb !== undefined) {
-      if (!GH_READ_VERBS.has(verb)) signal(judgement, 'risk.mutation_verb', 'unlikely');
+      if (!GH_READ_VERBS.has(verb)) {
+        signal(judgement, 'risk.mutation_verb', 'unlikely');
+        noteFact(judgement.facts, 'githubAction', githubAction(group, verb));
+      }
     }
   }
 }
@@ -2119,6 +2279,7 @@ function conclude(judgement: Judgement, allowRule: AllowRuleId, cwdInside: boole
     repoRelative:
       cwdInside && !judgement.unplaced && !judgement.signals.has('risk.cwd_outside_root'),
     reversibleHint: combineHints(judgement.hints),
+    facts: { ...judgement.facts },
   };
 }
 

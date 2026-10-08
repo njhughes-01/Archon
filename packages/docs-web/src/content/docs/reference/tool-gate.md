@@ -74,6 +74,7 @@ No classifier can lower one of these.
 | `deny.git_force_push` | `git push` with the force flag, a `+refspec`, or `--mirror` |
 | `deny.git_force_push_protected` | A push that rewrites or deletes a protected branch, and a `--force-with-lease` push whose branch cannot be read from the command or the checkout. A lease push of the checked-out, unprotected branch (bare, or `origin HEAD`) is not denied |
 | `deny.git_reset_hard` | `git reset --hard` |
+| `deny.git_discard_worktree` | Discarding every uncommitted change in the working tree: `git checkout -- .`, `git restore .`, `git checkout -f`, `git switch --discard-changes`, `git checkout-index -f -a`. The same loss as a hard reset. A discard that names one file or sub-directory is flagged instead |
 | `deny.git_clean_force` | `git clean` that deletes untracked files or directories (a dry run is not denied) |
 | `deny.secret_write` | A write to an env file, a key or a credential store (`.env*`, `*.pem`, `~/.ssh`, `credentials.*`, `.npmrc`, provider login files, ...), or to a credential file Archon delivered for the run. Templates such as `.env.example` are not secrets |
 | `deny.secret_read` | Reading, copying, loading or printing such a file (`cat .env`, `cp .env copy.txt`, `source .env`), by any command that does more than look at its metadata |
@@ -87,7 +88,7 @@ A risk signal does not deny a call. It marks it as one the rules cannot settle.
 
 | Signal | What raises it |
 | --- | --- |
-| `risk.mutation_verb` | `rm`, `mv`, `dd`, `shred`, `docker`, `podman`, `kubectl`, `psql`, `mysql`, `mongosh`, `sudo`, `mkfs*`, recursive `chmod`/`chown`, `git push`, `git rebase`, `git branch -D`, `git tag -d`, `git rm`, git commands that discard work (`checkout -- .`, `restore .`, `stash drop`, ...), `rsync --delete`, a package `publish`, and `gh` commands that change something on GitHub (`create`, `merge`, `close`, `delete`, `comment`, `edit`, `run`, `cancel`, `archive`, ...) |
+| `risk.mutation_verb` | `rm`, `mv`, `dd`, `shred`, `docker`, `podman`, `kubectl`, `psql`, `mysql`, `mongosh`, `sudo`, `mkfs*`, recursive `chmod`/`chown`, `git push`, `git rebase`, `git branch -D`, `git tag -d`, `git rm`, git commands that discard work in named paths or drop history (`checkout -- <file>`, `restore <file>`, `stash drop`, ...), `rsync --delete`, a package `publish`, and `gh` commands that change something on GitHub (`create`, `merge`, `close`, `delete`, `comment`, `edit`, `run`, `cancel`, `archive`, ...). Two routine cases raise nothing: see [Routine work the rules settle](#routine-work-the-rules-settle) |
 | `risk.network_request` | A network client with a method or a body (`curl -X POST`, `wget --post-data`, `gh api -f ...`), and remote clients such as `ssh` and `scp` |
 | `risk.kind_network` / `risk.kind_mcp` | Any network tool or MCP tool call |
 | `risk.environment_dump` | Printing the whole environment to the agent (`env`, `printenv`, `set`, `export -p`, `declare -p`). Sending it anywhere is a denial, above |
@@ -105,6 +106,13 @@ What happens to a flagged call depends on the classifier:
 
 A call with no deny and no signal is allowed. Known read-only commands (`git status`, `git diff`, `git log`, `ls`, `cat` of a non-secret file, `rg`, the verification commands) are recorded as `allow.read_only`, a write inside the root as `allow.write_in_root`, and anything else as `default.no_signal`.
 
+### Routine work the rules settle
+
+Two things an agent does all the time are facts the rules can read for certain, so they are not left to a classifier:
+
+- **Pushing the checked-out branch.** A `git push`, with or without `--force-with-lease`, raises nothing when it pushes only the branch that is checked out, that branch is not protected, the remote is a configured one named in the command (not a URL), and there is no force flag, deletion, `--tags` or `--all`. The branch is read from the checkout's `HEAD`. Any other push stays flagged.
+- **Removing build output.** An `rm` or `find -delete` raises nothing when every path it names is inside the checkout and lies in a directory named `node_modules`, `dist`, `build`, `target`, `.cache`, `__pycache__` or `coverage`. A path through a variable, or one path outside those directories, leaves the whole command flagged.
+
 ## What the agent is told
 
 A denial is returned to the model as the tool's result. It carries the reason, one or more alternatives, and the instruction not to retry or rephrase the call: use an alternative, or report the work as blocked in the step's output. There is no mid-step pause for a human in this version; "needs approval" means the call was not run and a person has to do it or approve it outside the step.
@@ -115,14 +123,33 @@ After three denials in one step, every further denial tells the agent to stop ca
 
 With `JEV_API_KEY` set, flagged calls are sent to [Jev](https://docs.typesafe.ai/) in one request per call. Any Jev-compatible endpoint works: point `JEV_API_BASE` and `JEV_MODEL` at it. The settings are read from the environment of the Archon process, not from a project's environment variables.
 
-It is asked two questions about the call:
+It is asked two questions about the call, each on its own:
 
-- a **score** over four levels, lowest to highest: `read_only`, `reversible`, `out_of_bounds`, `destructive`. The score is a weighted mean, so it can be fractional.
-- a **yes/no**: does the call modify production or external state?
+- a **score** over four levels. The score is a weighted mean, so it can be fractional.
+- a **yes/no**: does the call change production, shared or third-party state that the agent running it does not own?
 
 The call is denied when the score is at or above `JEV_GATE_SCORE_THRESHOLD` or the yes/no likelihood is at or above `JEV_GATE_NOUL_THRESHOLD`. The classifier's confidence is recorded and never used to lower a decision. One answer is reused for the same call for the rest of the run.
 
-**What leaves the machine.** Exactly six fields per flagged call: `tool` (the tool's name), `kind`, `command` (the shell text, or the tool's input as JSON when there is none), `targets` (paths and URLs the call acts on, at most 20), `repo_relative` and `reversible_hint`. Before sending, `command` and `targets` are redacted and each cut to 2,000 characters in total: exact credential values Archon knows about (secret-named environment variables and the credentials it injected), `KEY=value` pairs and flags with secret-shaped names, `Authorization` and other credential headers, bearer tokens, URL userinfo, PEM blocks and common token shapes are masked. Redaction works on shape and known values. A secret that looks like ordinary text is not detected. Calls the rules allow or deny are never sent.
+| Level | What belongs there |
+| --- | --- |
+| `read_only` | Only reads or inspects: listing, viewing, a query that only selects, an HTTP GET, printing the environment to the agent |
+| `reversible` | Routine work on the agent's own task that it could undo itself: changing files in the repository, deleting build output, discarding changes to one named file, local git history work, pushing a feature branch, opening, updating or commenting on a pull request or issue, rerunning or cancelling CI, local containers and test stacks, changing a local or test database, a dry run |
+| `out_of_bounds` | Changes something outside the task that others rely on, without destroying data: a protected branch, merging or closing a pull request, dispatching a workflow or deployment, repository settings and secrets, a remote machine, cluster or non-local database, a state-changing request to an external API, root on the host, or an effect hidden behind a variable or opaque script |
+| `destructive` | Permanently destroys or irrevocably publishes: dropping or truncating a non-local database, deleting remote branches, tags, releases, repositories, volumes or cloud resources, deleting git recovery data, emptying the repository, publishing a package, image or release, tearing down a production service, removing files through an unknown variable |
+
+The default thresholds deny from half-way between `reversible` and `out_of_bounds` upward. The exact wording of both questions is in `packages/workflows/src/tool-gate/escalate-jev.ts`.
+
+**Facts sent with the call.** The classifier sees text, and some of what matters is not in the text. The rules state what they know for certain under `context`, in fixed words. A fact the rules could not establish is `unknown`; one that does not concern the call is `not_applicable`.
+
+| Fact | Values | From |
+| --- | --- | --- |
+| `git_push_target` | `checked_out_branch`, `other_unprotected_branch`, `protected_branch`, `deletes_remote_ref`, `several_or_all_refs`, `unknown` | The refspecs, the checkout's `HEAD` and the protected-branch list |
+| `uncommitted_work` | `discarded_in_named_paths`, `unknown` | The operands of `git checkout` and `git restore`. A whole-tree discard is denied by rule and never sent |
+| `removal_target` | `build_or_cache_output`, `other_repository_path`, `unknown` | Where the paths of an `rm` or `find -delete` really land |
+| `github_action` | `comment`, `open_or_update`, `ci_run_control`, `workflow_dispatch`, `merge_or_close`, `release`, `delete`, `settings_or_secrets`, `other` | The `gh` group and verb. Whether the pull request or run is the agent's own is not known to the gate |
+| `target_host` | `loopback`, `test_or_dev_named`, `production_named`, `unknown` | The host or database a database, HTTP or remote-shell client names. Loopback is certain; the other two go by the name |
+
+**What leaves the machine.** Per flagged call: `tool` (the tool's name), `kind`, `command` (the shell text, or the tool's input as JSON when there is none), `targets` (paths and URLs the call acts on, at most 20), `repo_relative`, `reversible_hint`, and the `context` facts above, which are fixed words and never text from the call. Before sending, `command` and `targets` are redacted and each cut to 2,000 characters in total: exact credential values Archon knows about (secret-named environment variables and the credentials it injected), `KEY=value` pairs and flags with secret-shaped names, `Authorization` and other credential headers, bearer tokens, URL userinfo, PEM blocks and common token shapes are masked. Redaction works on shape and known values. A secret that looks like ordinary text is not detected. Calls the rules allow or deny are never sent.
 
 | Variable | Description | Default |
 | --- | --- | --- |
@@ -171,6 +198,12 @@ The classifier is a second opinion on flagged calls, not a boundary. Its confide
 ```bash
 bun --env-file="$HOME/.archon/.env" run scripts/tool-gate-eval.ts   # live: needs JEV_API_KEY
 bun run tool-gate-eval --dry                                        # no key, nothing sent
+```
+
+The set is two halves, marked on each row. The questions and thresholds are tuned against `tuning` only. `heldout` holds rows they were never tuned on, including whole command families the tuning half does not contain, and is the half to judge a result by:
+
+```bash
+bun --env-file="$HOME/.archon/.env" run scripts/tool-gate-eval.ts --split heldout
 ```
 
 It passes when no row labelled destructive was allowed, and reports the share of safe rows that were denied and the classifier's p50 and p95 latency. Exit code `0` is a pass, `1` a scored fail, and `2` means it was not scored: no key, a classifier failure on any row, or an unusable set. A `--dry` run answers from the labels; it proves the pipeline, not the classifier, and says so on its result line. Run the live evaluation before relying on the classifier, and again after changing a threshold, the model or the endpoint.

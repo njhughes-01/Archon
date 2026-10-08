@@ -45,6 +45,7 @@ const REQUEST: ToolGateEscalationRequest = {
   repoRelative: true,
   reversibleHint: 'unlikely',
   signals: ['risk.mutation_verb'],
+  facts: { githubAction: 'merge_or_close' },
 };
 
 interface Sent {
@@ -186,7 +187,7 @@ describe('readToolGateJevSettings', () => {
 });
 
 describe('createJevEscalator: the request', () => {
-  test('one POST carries both questions over the six state fields', async () => {
+  test('one POST carries both questions over the six state fields and the context facts', async () => {
     const { fetch, sent } = answering(jevAnswers(1, 0.1));
     await createJevEscalator(SETTINGS, { fetch })(REQUEST);
 
@@ -202,6 +203,14 @@ describe('createJevEscalator: the request', () => {
       targets: ['src/app.ts'],
       repo_relative: true,
       reversible_hint: 'unlikely',
+      // Every fact travels under a fixed name; the ones the rules did not state say so.
+      context: {
+        git_push_target: 'not_applicable',
+        uncommitted_work: 'not_applicable',
+        removal_target: 'not_applicable',
+        github_action: 'merge_or_close',
+        target_host: 'not_applicable',
+      },
     });
     expect(Object.keys(request?.body.questions ?? {}).sort()).toEqual(['external_state', 'risk']);
   });
@@ -216,18 +225,31 @@ describe('createJevEscalator: the request', () => {
     expect(criteria).toHaveLength(ESCALATION_LEVELS.length);
     expect(new Set(criteria).size).toBe(ESCALATION_LEVELS.length);
     for (const sentence of criteria) expect(sentence.length).toBeGreaterThan(40);
-    // The order is the scale: the lowest level only reads, the highest cannot be undone.
+    // The order is the scale: the lowest level only reads, the highest cannot be recovered.
     expect(criteria[ESCALATION_LEVELS.indexOf('read_only')]).toMatch(/only reads/i);
-    expect(criteria[ESCALATION_LEVELS.indexOf('destructive')]).toMatch(/cannot be undone/i);
+    expect(criteria[ESCALATION_LEVELS.indexOf('destructive')]).toMatch(/cannot be recovered/i);
+    // The two classes the owner named: one is routine, the other is never to be waved through.
+    expect(criteria[ESCALATION_LEVELS.indexOf('reversible')]).toMatch(
+      /build, cache or dependency output/
+    );
+    expect(criteria[ESCALATION_LEVELS.indexOf('destructive')]).toMatch(
+      /uncommitted work across the whole working tree/
+    );
+    // Every level says what does not belong to it.
+    for (const sentence of criteria) expect(sentence).toMatch(/do(es)? not belong here/);
   });
 
-  test('the yes/no question asks about production or external state and says what each answer means', async () => {
+  test('the yes/no question asks about production or shared state and says what each answer means', async () => {
     const { fetch, sent } = answering(jevAnswers(1, 0.1));
     await createJevEscalator(SETTINGS, { fetch })(REQUEST);
 
     const external = sent[0]?.body.questions.external_state;
     expect(external?.type).toBe('noul');
-    expect(external?.instructions).toContain('modifies production or external state');
+    expect(external?.instructions).toContain('production, shared or third-party state');
+    // Routine visible actions are named as not counting.
+    expect((external?.criteria as Record<string, string>).false).toContain(
+      'Commenting, opening or updating a pull request and rerunning CI do not count'
+    );
     expect(Object.keys(external?.criteria as Record<string, string>).sort()).toEqual([
       'false',
       'true',
