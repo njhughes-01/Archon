@@ -2617,7 +2617,19 @@ export async function handleMessage(
           { err, conversationId, provider: providerKey },
           'orchestrator.tool_gate_refused'
         );
-        await platform.sendMessage(conversationId, `⚠️ ${err.message}`);
+        const refusal = `⚠️ ${err.message}`;
+        await platform.sendMessage(conversationId, refusal);
+        // This refusal needs the provider, which is resolved after the user row
+        // was written, so it cannot sit above that write with the other guards.
+        // Storing it as the reply is what keeps that row from being left unanswered.
+        if (!isWebAdapter(platform)) {
+          messageDb.addMessage(conversation.id, 'assistant', refusal).catch((e: unknown) => {
+            getLog().warn(
+              { err: toError(e), conversationId },
+              'orchestrator.assistant_message_persist_failed'
+            );
+          });
+        }
         return;
       }
     }

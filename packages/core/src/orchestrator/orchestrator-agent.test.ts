@@ -7181,6 +7181,31 @@ describe('chat turn tool gate', () => {
     expect(sent[0]).toContain('/setproject');
   });
 
+  test('gate on: a refusal on a non-web surface is stored as the reply, so the user row is not left unanswered', async () => {
+    // The user row for a Telegram turn is written before the provider is known,
+    // so a refusal this late has to answer it.
+    unscoped();
+    mockAddMessage.mockClear();
+    const platform = makePlatform();
+    platform.getPlatformType.mockImplementation(() => 'telegram');
+    await handleMessage(platform, 'conv-1', 'Hello');
+
+    const refusal = messages(platform)[0] ?? '';
+    expect(refusal).toContain('tool gate is on');
+    const rows = mockAddMessage.mock.calls.map(call => [call[1], call[2]]);
+    expect(rows).toEqual([
+      ['user', 'Hello'],
+      ['assistant', refusal],
+    ]);
+  });
+
+  test('gate on: a refusal on the web surface stores nothing itself, the adapter does', async () => {
+    unscoped();
+    mockAddMessage.mockClear();
+    await turn();
+    expect(mockAddMessage).not.toHaveBeenCalled();
+  });
+
   test('gate on: an unusable classifier setting refuses the turn, naming the variable', async () => {
     process.env.JEV_API_KEY = 'test-key';
     process.env.JEV_GATE_NOUL_THRESHOLD = 'two';
