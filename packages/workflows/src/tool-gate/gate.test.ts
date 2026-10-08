@@ -3,7 +3,7 @@
  * so these run on any platform; the path rules are covered by the fixture table.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
@@ -15,6 +15,8 @@ import {
   DEFAULT_NOUL_THRESHOLD,
   DEFAULT_SCORE_THRESHOLD,
   ESCALATION_LEVELS,
+  ESCALATION_TEXT_CAP,
+  MAX_ESCALATION_TARGETS,
   NOUL_THRESHOLD_BOUNDS,
   REPEATED_DENIALS_RULE_ID,
   SCORE_THRESHOLD_BOUNDS,
@@ -26,6 +28,7 @@ import {
 } from './index';
 
 const trackTempRoot = trackTempRoots();
+const isWindows = process.platform === 'win32';
 
 function makeRoot(): string {
   return trackTempRoot(realpathSync(mkdtempSync(join(tmpdir(), 'tool-gate-'))));
@@ -225,6 +228,62 @@ describe('no usable classifier answer', () => {
       needsApproval: true,
     });
     expect(h.records[0]).toMatchObject({ decision: 'deny', source: 'fallback' });
+  });
+
+  test.each([
+    ['undefined', undefined],
+    ['null', null],
+    ['an empty object', {}],
+    ['a string', 'allow'],
+    ['ok: true with no numbers', { ok: true }],
+    ['ok: false with no reason', { ok: false }],
+    ['ok that is not a boolean', { ok: 'yes', score: 0, noul: 0, confidence: 1 }],
+  ])('an escalator that returns %s is a recorded denial, not a crash', async (_name, shapeless) => {
+    const h = harness(CALM, {
+      escalate: () => Promise.resolve(shapeless as unknown as ToolGateEscalationResult),
+    });
+    const decision = await h.gate(shell(ESCALATED, h.root));
+    expect(decision).toMatchObject({ action: 'deny', needsApproval: true });
+    expect(h.records).toHaveLength(1);
+    expect(h.records[0]).toMatchObject({
+      decision: 'deny',
+      source: 'fallback',
+      classifierFailure: 'malformed_escalation',
+    });
+  });
+
+  test('the agent is told a fixed sentence; the classifier failure text goes only into the record', async () => {
+    const leaky = 'connect ECONNREFUSED 10.1.2.3:8443 retry with header X-Internal: abc';
+    const texts: string[] = [];
+    for (const failure of [
+      { ok: false, reason: leaky } as const,
+      { ok: false, reason: 'timeout' } as const,
+      answer(99, 0),
+    ]) {
+      const h = harness(failure);
+      const decision = await h.gate(shell(ESCALATED, h.root));
+      if (decision.action !== 'deny') throw new Error('unreachable');
+      texts.push(decision.reason);
+      expect(decision.reason).not.toContain('ECONNREFUSED');
+      expect(decision.reason).not.toContain('timeout');
+    }
+    // One sentence whatever went wrong: nothing the classifier says reaches the agent.
+    expect(new Set(texts).size).toBe(1);
+
+    const h = harness({ ok: false, reason: leaky });
+    await h.gate(shell(ESCALATED, h.root));
+    expect(h.records[0]?.classifierFailure).toBe(leaky);
+  });
+
+  test('the recorded failure text is redacted and capped like every other recorded text', async () => {
+    const h = harness(
+      { ok: false, reason: `Authorization: Bearer abcdef0123456789abcdef ${'x'.repeat(500)}` },
+      { credentialValues: [] }
+    );
+    await h.gate(shell(ESCALATED, h.root));
+    const recorded = h.records[0]?.classifierFailure ?? '';
+    expect(recorded).not.toContain('abcdef0123456789abcdef');
+    expect(recorded.length).toBeLessThan(260);
   });
 
   test('with no classifier configured the call is allowed, logged as fallback, and nothing is asked', async () => {
@@ -437,6 +496,155 @@ describe('repeated denials in one node', () => {
   });
 });
 
+describe('what the classifier is sent is bounded', () => {
+  test('a call naming hundreds of targets sends a capped list and says how many were left out', async () => {
+    const h = harness(CALM);
+    const paths = Array.from({ length: 400 }, (_, index) => `build/out-${String(index)}.tmp`);
+    await h.gate(shell(`rm ${paths.join(' ')}`, h.root));
+
+    const sent = h.calls[0]?.targets ?? [];
+    expect(sent.length).toBeLessThanOrEqual(MAX_ESCALATION_TARGETS + 1);
+    expect(sent[0]).toBe('build/out-0.tmp');
+    expect(sent.at(-1)).toBe(`… [${String(400 - MAX_ESCALATION_TARGETS)} more targets]`);
+    expect(sent.join('').length).toBeLessThanOrEqual(ESCALATION_TEXT_CAP + 40);
+  });
+
+  test('a few very long targets are cut by total length, not only by count', async () => {
+    const h = harness(CALM);
+    const long = Array.from(
+      { length: 15 },
+      (_, index) => `build/${'d'.repeat(190)}-${String(index)}`
+    );
+    await h.gate(shell(`rm ${long.join(' ')}`, h.root));
+
+    const sent = h.calls[0]?.targets ?? [];
+    expect(sent.length).toBeLessThan(15);
+    expect(sent.at(-1)).toMatch(/^… \[\d+ more targets\]$/);
+    expect(sent.join('').length).toBeLessThanOrEqual(ESCALATION_TEXT_CAP + 40);
+  });
+
+  test('a short list is sent whole', async () => {
+    const h = harness(CALM);
+    await h.gate(shell('rm build/a.tmp build/b.tmp', h.root));
+    expect(h.calls[0]?.targets).toEqual(['build/a.tmp', 'build/b.tmp']);
+  });
+});
+
+describe('identical calls made at the same time', () => {
+  function slowEscalator(result: ToolGateEscalationResult): {
+    escalate: ToolGateOptions['escalate'];
+    asked: () => number;
+    release: () => void;
+  } {
+    let asked = 0;
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    return {
+      escalate: async () => {
+        asked++;
+        await gate;
+        return result;
+      },
+      asked: () => asked,
+      release: () => {
+        release();
+      },
+    };
+  }
+
+  test('share one evaluation, one classifier call and one record', async () => {
+    const slow = slowEscalator(answer(0, 0));
+    const h = harness(CALM, { escalate: slow.escalate });
+    const batch = Array.from({ length: 8 }, () => h.gate(shell(ESCALATED, h.root)));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    slow.release();
+
+    expect(await Promise.all(batch)).toEqual(
+      Array.from({ length: 8 }, () => ({ action: 'allow' }))
+    );
+    expect(slow.asked()).toBe(1);
+    expect(h.records).toHaveLength(1);
+  });
+
+  test('count once toward the repeated-denial guard: the batch itself never trips it', async () => {
+    const slow = slowEscalator(answer(3, 1));
+    const h = harness(CALM, { escalate: slow.escalate, maxDenialsPerNode: 2 });
+    const batch = Array.from({ length: 8 }, () => h.gate(shell(ESCALATED, h.root)));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    slow.release();
+
+    const decisions = await Promise.all(batch);
+    for (const decision of decisions) {
+      expect(decision).toMatchObject({ action: 'deny', ruleId: 'risk.mutation_verb' });
+    }
+    // One denial was counted, so one more ordinary denial fits before the guard speaks.
+    expect(await h.gate(shell(DENIED_BY_RULE, h.root))).toMatchObject({
+      ruleId: 'deny.git_reset_hard',
+    });
+    expect(await h.gate(shell(DENIED_BY_RULE, h.root))).toMatchObject({
+      ruleId: REPEATED_DENIALS_RULE_ID,
+    });
+  });
+
+  test('different calls made at the same time are judged separately', async () => {
+    const slow = slowEscalator(answer(0, 0));
+    const h = harness(CALM, { escalate: slow.escalate });
+    const batch = [h.gate(shell(ESCALATED, h.root)), h.gate(shell('gh pr merge 6', h.root))];
+    await new Promise(resolve => setTimeout(resolve, 5));
+    slow.release();
+    await Promise.all(batch);
+    expect(slow.asked()).toBe(2);
+    expect(h.records).toHaveLength(2);
+  });
+
+  test('the same call made again after the first finished is judged and recorded again', async () => {
+    const h = harness(CALM);
+    await h.gate(shell(DENIED_BY_RULE, h.root));
+    await h.gate(shell(DENIED_BY_RULE, h.root));
+    expect(h.records).toHaveLength(2);
+  });
+
+  test('a shared failure reaches every caller and is not kept for the next call', async () => {
+    let fail = true;
+    const h = harness(CALM, {
+      record: () => {
+        if (fail) throw new Error('store is down');
+      },
+    });
+    const batch = [h.gate(shell(ALLOWED, h.root)), h.gate(shell(ALLOWED, h.root))];
+    const settled = await Promise.allSettled(batch);
+    expect(settled.map(result => result.status)).toEqual(['rejected', 'rejected']);
+    fail = false;
+    expect(await h.gate(shell(ALLOWED, h.root))).toEqual({ action: 'allow' });
+  });
+});
+
+describe('a request the gate cannot read', () => {
+  test.each([['delete'], [undefined], [42]])(
+    'an unknown kind (%p) is denied and recorded, whatever else the request says',
+    async kind => {
+      const h = harness(answer(0, 0));
+      const request = { ...shell(ALLOWED, h.root), kind } as unknown as ToolActionRequest;
+      const decision = await h.gate(request);
+      expect(decision).toMatchObject({
+        action: 'deny',
+        needsApproval: false,
+        ruleId: 'deny.unreadable_request',
+      });
+      expect(h.calls).toHaveLength(0);
+      expect(h.records).toHaveLength(1);
+      expect(h.records[0]).toMatchObject({
+        decision: 'deny',
+        source: 'rule',
+        ruleId: 'deny.unreadable_request',
+        kind: 'other',
+      });
+    }
+  );
+});
+
 describe('records', () => {
   test('latency comes from the injected clock', async () => {
     const ticks = [1_000, 1_042];
@@ -472,6 +680,35 @@ describe('records', () => {
     });
     await expect(h.gate(shell(ALLOWED, h.root))).rejects.toThrow('store is down');
   });
+
+  test('an async record sink is waited for before the call is answered', async () => {
+    const order: string[] = [];
+    const h = harness(CALM, {
+      record: async () => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        order.push('recorded');
+      },
+    });
+    await h.gate(shell(ALLOWED, h.root));
+    order.push('answered');
+    expect(order).toEqual(['recorded', 'answered']);
+  });
+
+  test('an async record sink that rejects fails the call, like a throw: never an allow, never unhandled', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const h = harness(CALM, { record: () => Promise.reject(new Error('store is down')) });
+      await expect(h.gate(shell(ALLOWED, h.root))).rejects.toThrow('store is down');
+      await new Promise(resolve => setTimeout(resolve, 10));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
 });
 
 describe('building the gate', () => {
@@ -485,5 +722,169 @@ describe('building the gate', () => {
 
   test.each([0, -1, 1.5, Number.NaN])('a denial limit of %p is refused', limit => {
     expect(() => harness(CALM, { maxDenialsPerNode: limit })).toThrow(/maxDenialsPerNode/);
+  });
+
+  test('a relative extra write root is refused', () => {
+    expect(() => harness(CALM, { extraWriteRoots: ['artifacts'] })).toThrow(
+      /extraWriteRoots.*absolute/
+    );
+  });
+
+  test('a relative protected path is refused', () => {
+    expect(() => harness(CALM, { protectedPaths: ['codex-home'] })).toThrow(
+      /protectedPaths.*absolute/
+    );
+  });
+
+  test.skipIf(isWindows)(
+    'an extra write root that would open the home directory or the whole disk is refused',
+    () => {
+      const home = makeRoot();
+      for (const root of ['/', home, join(home, '..')]) {
+        expect(() => harness(CALM, { homeDir: home, extraWriteRoots: [root] })).toThrow(
+          /extraWriteRoots/
+        );
+      }
+    }
+  );
+});
+
+describe.skipIf(isWindows)('extra write roots', () => {
+  function write(path: string, cwd: string): ToolActionRequest {
+    return { toolName: 'Write', kind: 'file_write', cwd, paths: [path], input: {} };
+  }
+
+  test('without the option a write beside the repository is denied', async () => {
+    const artifacts = makeRoot();
+    const h = harness(CALM);
+    expect(await h.gate(write(join(artifacts, 'plan.md'), h.root))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.path_outside_root',
+    });
+  });
+
+  test('with the option the same write is allowed by rule, and nothing else outside is', async () => {
+    const artifacts = makeRoot();
+    const elsewhere = makeRoot();
+    const h = harness(CALM, { extraWriteRoots: [artifacts] });
+    expect(await h.gate(write(join(artifacts, 'plan.md'), h.root))).toEqual({ action: 'allow' });
+    expect(h.records[0]).toMatchObject({ source: 'rule', ruleId: 'allow.write_in_root' });
+    expect(await h.gate(write(join(elsewhere, 'plan.md'), h.root))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.path_outside_root',
+    });
+    expect(h.calls).toHaveLength(0);
+  });
+
+  test('the root is compared by where it really is, so a symlinked spelling still matches', async () => {
+    const base = makeRoot();
+    const real = join(base, 'real-artifacts');
+    mkdirSync(real);
+    symlinkSync(real, join(base, 'artifacts-link'));
+    const h = harness(CALM, { extraWriteRoots: [join(base, 'artifacts-link')] });
+    expect(await h.gate(write(join(real, 'a.md'), h.root))).toEqual({ action: 'allow' });
+    expect(await h.gate(write(join(base, 'artifacts-link', 'b.md'), h.root))).toEqual({
+      action: 'allow',
+    });
+  });
+
+  test('a root that does not exist yet is accepted and covers what is later written there', async () => {
+    const base = makeRoot();
+    const h = harness(CALM, { extraWriteRoots: [join(base, 'not-yet', 'artifacts')] });
+    expect(await h.gate(write(join(base, 'not-yet', 'artifacts', 'a.md'), h.root))).toEqual({
+      action: 'allow',
+    });
+    expect(await h.gate(write(join(base, 'not-yet', 'other.md'), h.root))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.path_outside_root',
+    });
+  });
+
+  test('a secret-shaped name in the path to the root does not make every write there a secret', async () => {
+    const base = makeRoot();
+    const artifacts = join(base, 'secrets', 'artifacts');
+    mkdirSync(artifacts, { recursive: true });
+    const h = harness(CALM, { extraWriteRoots: [artifacts] });
+    expect(await h.gate(write(join(artifacts, 'plan.md'), h.root))).toEqual({ action: 'allow' });
+    expect(await h.gate(write(join(artifacts, 'secrets', 'k.txt'), h.root))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.secret_write',
+    });
+  });
+
+  test.each([
+    ['a nested new directory', 'file_write', '{extra}/reports/2026/summary.json', 'allow'],
+    ['a shell redirect', 'shell', 'echo done > {extra}/notes.md', 'allow'],
+    ['a copy into the root', 'shell', 'cp README.md {extra}/', 'allow'],
+    [
+      'mkdir and touch',
+      'shell',
+      'mkdir -p {extra}/evidence && touch {extra}/evidence/run.log',
+      'allow',
+    ],
+    ['an env file', 'file_write', '{extra}/.env', 'deny.secret_write'],
+    ['a key file by redirect', 'shell', 'echo x > {extra}/deploy.pem', 'deny.secret_write'],
+    ['a .. escape', 'file_write', '{extra}/../outside/x.txt', 'deny.path_outside_root'],
+    ['a symlink escape', 'file_write', '{extra}/link-out/x.txt', 'deny.path_outside_root'],
+    [
+      'a sibling with the same prefix',
+      'file_write',
+      '{extra}-sibling/x.txt',
+      'deny.path_outside_root',
+    ],
+    ['removing the root itself', 'shell', 'rm -rf {extra}', 'deny.rm_recursive_root'],
+    ['removing everything in it', 'shell', 'rm -rf {extra}/*', 'deny.rm_recursive_root'],
+    [
+      'a protected credential file',
+      'file_write',
+      '{extra}/codex-home/auth.json',
+      'deny.secret_write',
+    ],
+    ['removing a protected directory', 'shell', 'rm -rf {extra}/codex-home', 'deny.secret_write'],
+    [
+      'moving a protected file out',
+      'shell',
+      'mv {extra}/codex-home/auth.json build/leak.json',
+      'deny.secret_write',
+    ],
+    ['removing a sub-directory', 'shell', 'rm -rf {extra}/tmp', 'risk.mutation_verb'],
+    ['a working directory there', 'shell', 'cd {extra} && ls', 'risk.cwd_outside_root'],
+  ] as const)('in an extra root, %s → %s', async (_name, kind, text, expected) => {
+    const base = makeRoot();
+    const extra = join(base, 'extra');
+    const outside = join(base, 'outside');
+    mkdirSync(join(extra, 'tmp'), { recursive: true });
+    mkdirSync(join(extra, 'codex-home'));
+    mkdirSync(outside);
+    symlinkSync('../outside', join(extra, 'link-out'));
+    const h = harness(CALM, {
+      classifierConfigured: false,
+      extraWriteRoots: [extra],
+      protectedPaths: [join(extra, 'codex-home')],
+    });
+    mkdirSync(join(h.root, 'build'));
+    const filled = text.replaceAll('{extra}', extra);
+    const decision = await h.gate(kind === 'shell' ? shell(filled, h.root) : write(filled, h.root));
+
+    if (expected === 'allow') {
+      expect(decision).toEqual({ action: 'allow' });
+      expect(h.records[0]?.source).toBe('rule');
+    } else if (expected.startsWith('risk.')) {
+      // Flagged, not settled: with no classifier it runs and the record says so.
+      expect(decision).toEqual({ action: 'allow' });
+      expect(h.records[0]).toMatchObject({ source: 'fallback', ruleId: expected });
+    } else {
+      expect(decision).toMatchObject({ action: 'deny', ruleId: expected });
+    }
+  });
+
+  test('a protected path is refused even inside the repository', async () => {
+    const root = makeRoot();
+    const h = harness(CALM, { repoRoot: root, protectedPaths: [join(root, 'managed')] });
+    expect(await h.gate(write('managed/token.txt', root))).toMatchObject({
+      action: 'deny',
+      ruleId: 'deny.secret_write',
+    });
+    expect(await h.gate(write('managed-notes.txt', root))).toEqual({ action: 'allow' });
   });
 });
