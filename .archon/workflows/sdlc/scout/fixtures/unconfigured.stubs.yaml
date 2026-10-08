@@ -1,0 +1,7 @@
+# Dry-run fixture: no classifier is configured. This is the path every install
+# without one takes, so it must COMPLETE having reached neither the agent that
+# writes the question nor the classifier.
+config: { available: false, reason: no_api_key }
+fixture:
+  expect: completed
+  reached: [config]
