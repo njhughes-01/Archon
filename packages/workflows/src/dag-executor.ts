@@ -11492,7 +11492,6 @@ export async function executeDagWorkflow(
     cwd,
     artifactsDir,
     stateDir,
-    logDir,
     baseBranch,
     inContainer: execContext.kind === 'container',
   });

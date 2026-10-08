@@ -43,13 +43,22 @@ A block Archon cannot read (a misspelled key, `enabled: "yes"`, a list that is n
 A gate that is on either judges every call or stops the work. It never stands down quietly.
 
 - **A provider that cannot ask the gate.** The node fails before its first turn, and a chat turn is refused, with a message naming the provider. Support per provider is the *Tool action gate* row of the [Provider Capability Matrix](/reference/provider-capabilities/). The ways out are a provider that supports the gate, or switching the gate off: there is no per-provider or per-run switch.
-- **A container run.** The run fails before any node starts. The gate resolves paths on the host, and a container's paths are not the host's.
-- **A chat that is not scoped to a project.** The turn is refused. Such a chat works in the workspaces directory that holds every project, so there is no single checkout to hold it to. Use `/setproject <name>` first.
+- **A container run.** The run fails before any node starts. The gate resolves each path a tool call names on the host, and a container's paths are not the host's, so it cannot judge them yet. Run the workflow on the host (without `--container` or `container.enabled`), or switch the gate off.
 - **An unusable classifier setting** (see [the classifier](#the-classifier-optional)). The run or turn stops and names the variable.
 
 ## What a tool call is judged against
 
-The root is the checkout the node or chat works in. Every path a call names is resolved to where it really lands, following symlinks and `..`, before it is compared with that root. A workflow node may also write into the directories the engine hands it through its environment: the run's `$ARTIFACTS_DIR`, the project's `$STATE_DIR` and the run's log directory (`LOG_DIR`). The secret-file rules apply there as they do in the checkout. A chat turn has no such directories. Everything else outside the checkout, `/tmp` included, is outside.
+The root is the checkout the node or chat works in. Every path a call names is resolved to where it really lands, following symlinks and `..`, before it is compared with that root. A workflow node may also write into its run's `$ARTIFACTS_DIR` and the project's `$STATE_DIR`, where the secret-file rules apply as they do in the checkout. A chat turn has no such directories. Everything else outside the checkout is outside: `/tmp`, and the project's log directory too, which holds the engine's transcripts of every run.
+
+### A chat with no project
+
+A chat that is not scoped to a project works in the workspaces directory, which holds every project with its artifacts and credential directories. The gate is not rooted there. It is rooted at an empty private directory instead, so:
+
+- every write is denied, anywhere, including into a project under the workspaces directory;
+- the fixed deny rules apply as usual;
+- every shell command is flagged (`risk.cwd_outside_root`), because none runs inside the root. With no classifier it runs and is recorded as `fallback`; with one, each distinct command is one classifier request per turn.
+
+Adding a project from such a chat (a `git clone` into the workspaces directory) is therefore not something to rely on while the gate is on: the clone is flagged at best and denied as a write at worst, and the denial tells the agent what to pass on. Clone the repository in a terminal and register it with `/register-project <name> <path>` or **Add Project** in the web console, or switch the gate off for the setup. Neither `/register-project` nor `/setproject` is a tool call, so the gate does not affect them.
 
 The rules run in a fixed order. A script is judged command by command and the worst verdict wins, so `git status && rm -rf /` is denied.
 
@@ -134,9 +143,9 @@ Every decision is recorded, allowed ones included.
 - **Workflow runs** write one `tool_gate_decision` event on the step whose tool call was judged. They are among the raw rows `archon workflow get <run-id> --json --verbose --events` returns.
 - **Chat turns** have no run, so each decision is one structured log line, `orchestrator.tool_gate_decision`, with the conversation id.
 
-Both carry the same fields: `tool`, `kind`, `decision`, `needsApproval`, `source` (`rule`, `jev` or `fallback`), `ruleId`, `latencyMs`, `commandHash` (SHA-256 of the raw call, so repeats can be matched) and `redactedPreview` (the redacted call, cut to 200 characters), plus `score`, `noul` and `confidence` when the classifier answered and `classifierFailure` when a configured classifier gave no usable answer. The raw command and tool input are never stored.
+Both carry the same fields: `tool`, `kind`, `decision`, `needsApproval`, `source` (`rule`, `jev` or `fallback`), `ruleId`, `count`, `latencyMs`, `commandHash` (SHA-256 of the raw call, so repeats can be matched) and `redactedPreview` (the redacted call, cut to 200 characters), plus `score`, `noul` and `confidence` when the classifier answered and `classifierFailure` when a configured classifier gave no usable answer. The raw command and tool input are never stored.
 
-Identical calls made at the same moment are judged once and produce one record. A call the gate cannot read at all (an unknown kind, no command text) is denied as `deny.unreadable_request` and recorded like any other.
+Identical calls made at the same moment are judged once and produce one record, whose `count` says how many calls it answered (`1` for a call made alone). A call the gate cannot read at all (an unknown kind, no command text) is denied as `deny.unreadable_request` and recorded like any other.
 
 ## What the gate cannot see
 

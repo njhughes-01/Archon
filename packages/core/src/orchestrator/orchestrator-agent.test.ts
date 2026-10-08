@@ -12,7 +12,7 @@
  * Mock setup MUST occur before any import of the module under test.
  */
 
-import { mock, describe, test, expect, beforeEach, afterEach } from 'bun:test';
+import { mock, describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import { mkdir, mkdtemp, realpath, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
@@ -611,6 +611,7 @@ import {
 } from '../services/run-follow-up';
 import { buildAiProfile } from '@archon/workflows/model-validation';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
+import { emptyToolGateRoot } from '@archon/workflows/tool-gate';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -7148,6 +7149,7 @@ describe('chat turn tool gate', () => {
       'noul',
       'confidence',
       'classifierFailure',
+      'count',
       'latencyMs',
       'commandHash',
       'redactedPreview',
@@ -7170,21 +7172,110 @@ describe('chat turn tool gate', () => {
     expect(sent[0]).toContain('toolActionGate');
   });
 
-  test('gate on: a chat with no project is refused, because there is no checkout to hold it to', async () => {
-    unscoped();
-    const { platform } = await turn();
+  describe('a chat with no project', () => {
+    const SETUP_ADVICE = '/register-project <name> <path>';
+    let workspaces: string;
 
-    expect(mockSendQuery).not.toHaveBeenCalled();
-    const sent = messages(platform);
-    expect(sent).toHaveLength(1);
-    expect(sent[0]).toContain('tool gate is on');
-    expect(sent[0]).toContain('/setproject');
+    beforeEach(async () => {
+      // The directory such a chat works in: it holds every project.
+      workspaces = await realpath(await mkdtemp(join(tmpdir(), 'chat-tool-gate-ws-')));
+      mockEnsureArchonWorkspacesPath.mockImplementation(() => Promise.resolve(workspaces));
+      unscoped();
+    });
+
+    afterEach(async () => {
+      mockEnsureArchonWorkspacesPath.mockImplementation(() =>
+        Promise.resolve('/home/test/.archon/workspaces')
+      );
+      await removeTempTree(workspaces);
+      await removeTempTree(await emptyToolGateRoot());
+    });
+
+    /** A fresh turn's gate, so one test's denials never reach the repeated-denial guard. */
+    async function gateOfTurn(): Promise<ToolGate> {
+      mockSendQuery.mockClear();
+      const { options } = await turn();
+      if (options?.toolGate === undefined) throw new Error('the chat was given no tool gate');
+      return options.toolGate;
+    }
+
+    const from = (request: GateRequest): GateRequest => ({ ...request, cwd: workspaces });
+
+    test('gate on: the turn runs, gated against an empty directory instead of the workspaces root', async () => {
+      const gate = await gateOfTurn();
+      expect(mockSendQuery).toHaveBeenCalledTimes(1);
+      expect(mockSendQuery.mock.calls[0]?.[1]).toBe(workspaces);
+
+      // Nothing under the directory that holds every project is writable: not a
+      // loose file, not a project's source, artifacts or credential directories.
+      for (const path of [
+        join(workspaces, 'notes.md'),
+        join(workspaces, 'owner', 'repo', 'source', 'src', 'app.ts'),
+        join(workspaces, 'owner', 'repo', 'artifacts', 'runs', 'r1', 'codex-home', 'auth.json'),
+        join(tmpdir(), 'chat-tool-gate-elsewhere.md'),
+      ]) {
+        const decision = await (await gateOfTurn())(from(write(path)));
+        expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.path_outside_root' });
+        if (decision.action !== 'deny') throw new Error('unreachable');
+        // The denial says how a project gets added while the gate is on.
+        expect(decision.reason).toContain(SETUP_ADVICE);
+        expect(decision.reason).toContain('switch the gate off');
+      }
+
+      expect(await gate(from(shell('git reset --hard')))).toMatchObject({
+        action: 'deny',
+        ruleId: 'deny.git_reset_hard',
+      });
+    });
+
+    test('gate on: a shell command is flagged, because it does not run inside the root', async () => {
+      const gate = await gateOfTurn();
+      mockLogger.info.mockClear();
+      expect(await gate(from(shell('git status')))).toEqual({ action: 'allow' });
+      // No classifier is configured here, so the flagged call runs and the record says who decided.
+      expect(decisionLogs()).toHaveLength(1);
+      expect(decisionLogs()[0]).toMatchObject({
+        decision: 'allow',
+        source: 'fallback',
+        ruleId: 'risk.cwd_outside_root',
+      });
+    });
+
+    test('gate on: a clone the gate does not let through is denied with the way to add a project', async () => {
+      // Whichever way it is stopped (the classifier here; a write rule would do the
+      // same), the agent is told what the user can do instead.
+      process.env.JEV_API_KEY = 'test-key';
+      const fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () =>
+        Response.json({
+          answers: {
+            risk: { type: 'score', score: 2.4, probabilities: { '0': 1 }, confidence: 0.9 },
+            external_state: { type: 'noul', noul: 0.2 },
+          },
+        })) as unknown as typeof fetch);
+      try {
+        const gate = await gateOfTurn();
+        const clone = `git clone https://github.com/acme/widgets ${join(workspaces, 'acme', 'widgets', 'source')}`;
+        const decision = await gate(from(shell(clone)));
+        expect(decision.action).toBe('deny');
+        if (decision.action !== 'deny') throw new Error('unreachable');
+        expect(decision.reason).toContain(SETUP_ADVICE);
+      } finally {
+        fetchSpy.mockRestore();
+      }
+    });
+  });
+
+  test('gate on: a project chat is not given the no-project advice', async () => {
+    const { options } = await turn();
+    const decision = await options?.toolGate?.(write(join(tmpdir(), 'chat-tool-gate-x.md')));
+    if (decision?.action !== 'deny') throw new Error('expected a denial');
+    expect(decision.reason).not.toContain('/register-project');
   });
 
   test('gate on: a refusal on a non-web surface is stored as the reply, so the user row is not left unanswered', async () => {
     // The user row for a Telegram turn is written before the provider is known,
     // so a refusal this late has to answer it.
-    unscoped();
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
     mockAddMessage.mockClear();
     const platform = makePlatform();
     platform.getPlatformType.mockImplementation(() => 'telegram');
@@ -7200,9 +7291,10 @@ describe('chat turn tool gate', () => {
   });
 
   test('gate on: a refusal on the web surface stores nothing itself, the adapter does', async () => {
-    unscoped();
+    capsMock.mockReturnValue({ ...DEFAULT_PROVIDER_CAPS });
     mockAddMessage.mockClear();
-    await turn();
+    const { platform } = await turn();
+    expect(messages(platform)[0]).toContain('tool gate is on');
     expect(mockAddMessage).not.toHaveBeenCalled();
   });
 

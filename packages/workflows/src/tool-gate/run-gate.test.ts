@@ -4,7 +4,7 @@
  * only `fetch` and the store are stand-ins.
  */
 import { describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, realpathSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { trackTempRoots } from '@archon/paths/test-utils';
@@ -16,6 +16,7 @@ import type { ToolGateDecisionEvent } from './gate';
 import {
   assertProviderHonoursToolGate,
   createRunToolGate,
+  emptyToolGateRoot,
   workflowToolGateRecorder,
   type RunToolGateInput,
 } from './run-gate';
@@ -114,8 +115,17 @@ describe('the switch', () => {
 });
 
 describe('what cannot be gated fails at the start', () => {
-  test('a container run is refused, because its paths are not the host paths', () => {
-    expect(() => createRunToolGate(harness({ inContainer: true }).input)).toThrow(/container/);
+  test('a container run is refused, saying why and both ways to proceed', () => {
+    let message = '';
+    try {
+      createRunToolGate(harness({ inContainer: true }).input);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain('runs in a container');
+    expect(message).toContain("a container's paths are not the host's");
+    expect(message).toContain('Run it on the host');
+    expect(message).toContain('toolGate.enabled: false');
   });
 
   test('an unusable classifier number is refused, naming the variable', () => {
@@ -301,6 +311,51 @@ describe('redaction', () => {
   });
 });
 
+describe('emptyToolGateRoot', () => {
+  test('is an existing, empty directory that stays the same for the process', async () => {
+    const root = await emptyToolGateRoot();
+    trackTempRoot(root);
+    expect(readdirSync(root)).toEqual([]);
+    expect(await emptyToolGateRoot()).toBe(root);
+  });
+
+  test.skipIf(isWindows)(
+    'rooted there, a gate has nowhere to write: every other path is outside',
+    async () => {
+      const root = await emptyToolGateRoot();
+      trackTempRoot(root);
+      const workspaces = makeRoot();
+      const h = harness({ repoRoot: root, outsideRootAdvice: 'Register a project first.' });
+      const gate = createRunToolGate(h.input)?.forStep('chat');
+      for (const path of [
+        join(workspaces, 'notes.md'),
+        join(workspaces, 'owner', 'repo', 'source', 'a.ts'),
+        join(workspaces, 'owner', 'repo', 'artifacts', 'runs', 'r1', 'plan.md'),
+      ]) {
+        const decision = await createRunToolGate(h.input)?.forStep('chat')(write(path, workspaces));
+        expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.path_outside_root' });
+        if (decision?.action !== 'deny') throw new Error('unreachable');
+        expect(decision.reason).toContain('Register a project first.');
+      }
+      // A read-only command from a directory outside the root is flagged, not settled.
+      expect(await gate?.(shell('ls', workspaces))).toEqual({ action: 'allow' });
+      expect(h.records.at(-1)?.event).toMatchObject({
+        source: 'fallback',
+        ruleId: 'risk.cwd_outside_root',
+      });
+    }
+  );
+
+  test('is created again if something removed it', async () => {
+    const root = await emptyToolGateRoot();
+    rmSync(root, { recursive: true, force: true });
+    const again = await emptyToolGateRoot();
+    trackTempRoot(again);
+    expect(again).not.toBe(root);
+    expect(readdirSync(again)).toEqual([]);
+  });
+});
+
 describe('assertProviderHonoursToolGate', () => {
   test('with the gate off every provider passes', () => {
     expect(() => {
@@ -351,6 +406,7 @@ describe('workflowToolGateRecorder', () => {
     score: 2.4,
     noul: 0.8,
     confidence: 0.7,
+    count: 1,
     latencyMs: 12,
     commandHash: 'a'.repeat(64),
     redactedPreview: 'gh pr merge 5',
@@ -416,6 +472,7 @@ describe('workflowToolGateRecorder', () => {
     expect(event?.event_type).toBe('tool_gate_decision');
     expect(Object.keys(event?.data ?? {}).sort()).toEqual([
       'commandHash',
+      'count',
       'decision',
       'kind',
       'latencyMs',

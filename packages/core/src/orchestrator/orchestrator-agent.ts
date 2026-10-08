@@ -62,6 +62,7 @@ import {
   assertProviderHonoursToolGate,
   collectCredentialValues,
   createRunToolGate,
+  emptyToolGateRoot,
 } from '@archon/workflows/tool-gate';
 import type { WorkflowResumeAdmission } from '@archon/workflows/engine-port';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
@@ -133,6 +134,18 @@ function getLog(): ReturnType<typeof createLogger> {
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
+
+/**
+ * Told to the agent when the Tool Action Gate denies a write, or a call that
+ * needs approval, in a chat with no project. Cloning a new project is the one
+ * change chat makes itself, and with the gate on it has nowhere to write, so
+ * the denial says how the user gets a project added anyway.
+ */
+const NO_PROJECT_GATE_ADVICE =
+  'This chat has no project, so with the tool gate on nothing can be written from it, a new ' +
+  'clone included. Tell the user: to add a project, clone it in a terminal and register it ' +
+  'with `/register-project <name> <path>` (or Add Project in the web console), or switch the ' +
+  'gate off for the setup (toolGate.enabled in ~/.archon/config.yaml).';
 
 /** Max assistant text chunks to keep in batch mode (oldest are dropped) */
 const MAX_BATCH_ASSISTANT_CHUNKS = 20;
@@ -2582,15 +2595,11 @@ export async function handleMessage(
     // like the missing-directory guards above: an ungated turn is not a fallback.
     if (config.toolGate?.enabled === true) {
       try {
-        if (scopedCodebase === undefined) {
-          // The fallback cwd is the workspaces root, which holds every project:
-          // rooting the gate there would call all of them "inside".
-          throw new Error(
-            'The tool gate is on, but this chat is not scoped to a project, so there is no ' +
-              'checkout to hold its tool calls to. Use `/setproject <name>` to scope it, or ' +
-              'switch the gate off (toolGate.enabled in ~/.archon/config.yaml).'
-          );
-        }
+        // A chat with no project works in the workspaces root, which holds every
+        // project with its artifacts and credential directories. Rooting the gate
+        // there would call all of that "inside", so it is rooted at an empty
+        // directory instead: every write is denied and each shell call is flagged.
+        const hasCheckout = scopedCodebase !== undefined;
         assertProviderHonoursToolGate(
           config.toolGate,
           providerKey,
@@ -2600,7 +2609,8 @@ export async function handleMessage(
         requestOptions.toolGate = createRunToolGate({
           config: config.toolGate,
           env: process.env,
-          repoRoot: cwd,
+          repoRoot: hasCheckout ? cwd : await emptyToolGateRoot(),
+          ...(!hasCheckout && { outsideRootAdvice: NO_PROJECT_GATE_ADVICE }),
           credentialValues: collectCredentialValues(
             { ...process.env, ...effectiveEnv },
             protectedEnvKeys,

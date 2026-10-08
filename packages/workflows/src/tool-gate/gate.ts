@@ -127,6 +127,11 @@ export interface ToolGateDecisionEvent {
    * Recorded here and never shown to the agent.
    */
   classifierFailure?: string;
+  /**
+   * How many calls this record answers. More than one when identical calls
+   * were made at the same time and judged once.
+   */
+  count: number;
   latencyMs: number;
   /** SHA-256 of the raw request, so repeats can be matched without storing it. */
   commandHash: string;
@@ -188,6 +193,12 @@ export interface ToolGateOptions {
   homeDir?: string;
   thresholds?: { score?: number; noul?: number };
   maxDenialsPerNode?: number;
+  /**
+   * One sentence added to what the agent is told when a call is denied for
+   * writing outside the root, or denied as needing approval. For a caller that
+   * knows why nothing is writable here and what the user can do about it.
+   */
+  outsideRootAdvice?: string;
   /** Share one cache across the gates of a run. Default: a cache private to this gate. */
   cache?: ToolGateCache;
   /** Clock for `latencyMs`. */
@@ -423,9 +434,25 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
     }
   };
 
+  // Identical calls still being judged share that one judgement: one pass over
+  // the rules, one classifier request, one record and one count toward the
+  // repeated-denial guard. A batch of the same call must not trip the guard by
+  // itself, and must not multiply classifier requests. The batch closes when
+  // its record is handed over, so the record's `count` is exact and the same
+  // call made from then on is judged afresh.
+  interface Batch {
+    callers: number;
+    decision: Promise<ToolActionDecision> | undefined;
+  }
+  const inFlight = new Map<string, Batch>();
+  const close = (commandHash: string, batch: Batch): void => {
+    if (inFlight.get(commandHash) === batch) inFlight.delete(commandHash);
+  };
+
   const decide = async (
     request: ToolActionRequest,
-    commandHash: string
+    commandHash: string,
+    batch: Batch
   ): Promise<ToolActionDecision> => {
     const started = now();
     const redactedPreview = previewOf(request, forPreview);
@@ -467,15 +494,20 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
             ruleId: REPEATED_DENIALS_RULE_ID,
           };
         } else {
+          const advised =
+            options.outsideRootAdvice !== undefined &&
+            (ruleId === 'deny.path_outside_root' || verdict.needsApproval);
+          const advice = advised ? ` ${String(options.outsideRootAdvice)}` : '';
           decision = {
             action: 'deny',
             needsApproval: verdict.needsApproval,
-            reason: `${verdict.reason} ${DENIAL_GUIDANCE}`,
+            reason: `${verdict.reason}${advice} ${DENIAL_GUIDANCE}`,
             alternatives: [...verdict.alternatives],
             ruleId,
           };
         }
       }
+      close(commandHash, batch);
       await options.record({
         tool: request.toolName,
         // The record's vocabulary is the contract's: a value outside it is not copied in.
@@ -490,6 +522,7 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
           confidence: answer.confidence,
         }),
         ...(classifierFailure !== undefined && { classifierFailure }),
+        count: batch.callers,
         latencyMs: now() - started,
         commandHash,
         redactedPreview,
@@ -584,21 +617,19 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
     return finish({ action: 'allow' }, 'jev', outcome.ruleId, answer);
   };
 
-  // Identical calls still being judged share that one judgement: one pass over
-  // the rules, one classifier request, one record and one count toward the
-  // repeated-denial guard. A batch of the same call must not trip the guard by
-  // itself, and must not multiply classifier requests. Once the judgement is
-  // done the entry is gone, so the same call made later is judged afresh.
-  const inFlight = new Map<string, Promise<ToolActionDecision>>();
-
   return async (request: ToolActionRequest): Promise<ToolActionDecision> => {
     const commandHash = hashRequest(request);
     const running = inFlight.get(commandHash);
-    if (running !== undefined) return running;
-    const decision = decide(request, commandHash).finally(() => {
-      inFlight.delete(commandHash);
+    if (running?.decision !== undefined) {
+      running.callers++;
+      return running.decision;
+    }
+    const batch: Batch = { callers: 1, decision: undefined };
+    // Registered before the judgement starts, which may reach its record at once.
+    inFlight.set(commandHash, batch);
+    batch.decision = decide(request, commandHash, batch).finally(() => {
+      close(commandHash, batch);
     });
-    inFlight.set(commandHash, decision);
-    return decision;
+    return batch.decision;
   };
 }

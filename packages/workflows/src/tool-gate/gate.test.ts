@@ -566,6 +566,37 @@ describe('identical calls made at the same time', () => {
     );
     expect(slow.asked()).toBe(1);
     expect(h.records).toHaveLength(1);
+    // The one record says how many calls it answered.
+    expect(h.records[0]?.count).toBe(8);
+  });
+
+  test('a call made alone is a record that covers one call', async () => {
+    const h = harness(CALM);
+    await h.gate(shell(ALLOWED, h.root));
+    await h.gate(shell(ESCALATED, h.root));
+    expect(h.records.map(record => record.count)).toEqual([1, 1]);
+  });
+
+  test('a call that arrives once the record is being written is judged and counted on its own', async () => {
+    // The count is final when the record is handed over, so a later caller cannot
+    // be answered by a record that does not count it.
+    const counts: number[] = [];
+    let release: () => void = () => {};
+    const writing = new Promise<void>(resolve => {
+      release = resolve;
+    });
+    const h = harness(CALM, {
+      record: async event => {
+        counts.push(event.count);
+        if (counts.length === 1) await writing;
+      },
+    });
+    const first = h.gate(shell(ALLOWED, h.root));
+    await new Promise(resolve => setTimeout(resolve, 5));
+    const late = h.gate(shell(ALLOWED, h.root));
+    release();
+    await Promise.all([first, late]);
+    expect(counts).toEqual([1, 1]);
   });
 
   test('count once toward the repeated-denial guard: the batch itself never trips it', async () => {
@@ -621,6 +652,48 @@ describe('identical calls made at the same time', () => {
   });
 });
 
+describe('advice for a gate with nothing writable', () => {
+  const ADVICE = 'This chat has no project. Register one first.';
+
+  function write(path: string, cwd: string): ToolActionRequest {
+    return { toolName: 'Write', kind: 'file_write', cwd, paths: [path], input: {} };
+  }
+
+  test('a write outside the root is told the advice along with the rule', async () => {
+    const h = harness(CALM, { outsideRootAdvice: ADVICE });
+    const decision = await h.gate(write(join(makeRoot(), 'x.md'), h.root));
+    if (decision.action !== 'deny') throw new Error('unreachable');
+    expect(decision.ruleId).toBe('deny.path_outside_root');
+    expect(decision.reason).toContain(ADVICE);
+    expect(decision.reason).toContain('do not retry');
+  });
+
+  test.each([
+    ['the classifier denies', answer(3, 1)],
+    ['the classifier gives no answer', FAILED],
+  ])('a flagged call is told it when %s', async (_name, result) => {
+    const h = harness(result, { outsideRootAdvice: ADVICE });
+    const decision = await h.gate(shell(ESCALATED, h.root));
+    if (decision.action !== 'deny') throw new Error('unreachable');
+    expect(decision.needsApproval).toBe(true);
+    expect(decision.reason).toContain(ADVICE);
+  });
+
+  test('other rule denials are not: the advice would not help with them', async () => {
+    const h = harness(CALM, { outsideRootAdvice: ADVICE });
+    const decision = await h.gate(shell(DENIED_BY_RULE, h.root));
+    if (decision.action !== 'deny') throw new Error('unreachable');
+    expect(decision.reason).not.toContain(ADVICE);
+  });
+
+  test('without the option nothing is added', async () => {
+    const h = harness(CALM);
+    const decision = await h.gate(write(join(makeRoot(), 'x.md'), h.root));
+    if (decision.action !== 'deny') throw new Error('unreachable');
+    expect(decision.reason).not.toContain('Register one first');
+  });
+});
+
 describe('a request the gate cannot read', () => {
   test.each([['delete'], [undefined], [42]])(
     'an unknown kind (%p) is denied and recorded, whatever else the request says',
@@ -659,6 +732,7 @@ describe('records', () => {
     expect(Object.keys(h.records[0] ?? {}).sort()).toEqual([
       'commandHash',
       'confidence',
+      'count',
       'decision',
       'kind',
       'latencyMs',

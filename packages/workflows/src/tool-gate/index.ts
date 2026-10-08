@@ -63,6 +63,7 @@ export {
   assertProviderHonoursToolGate,
   createRunToolGate,
   createWorkflowRunToolGate,
+  emptyToolGateRoot,
   workflowToolGateRecorder,
 } from './run-gate';
 export type { RunToolGate, RunToolGateInput, WorkflowRunToolGateInput } from './run-gate';

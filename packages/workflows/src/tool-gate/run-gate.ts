@@ -7,6 +7,8 @@
  * environment into the same gate. A run holds one classifier cache; a step
  * holds its own denial count.
  */
+import { access, chmod, mkdtemp, realpath } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createLogger } from '@archon/paths';
 import type { ProviderCapabilities } from '@archon/providers/types';
@@ -57,6 +59,8 @@ export interface RunToolGateInput {
   baseBranch?: string;
   /** Whether the steps' tools run inside a container instead of on this host. */
   inContainer?: boolean;
+  /** See `ToolGateOptions.outsideRootAdvice`. */
+  outsideRootAdvice?: string;
   /** Receives every decision with the step it was made for. A throw fails the tool call. */
   record: (event: ToolGateDecisionEvent, step: string) => void;
   /** Replaces the network for the classifier. Tests inject it. */
@@ -87,8 +91,10 @@ export function createRunToolGate(input: RunToolGateInput): RunToolGate | undefi
     // The gate resolves each path a call names on this host, and a container's
     // paths are not this host's: it would misplace every one of them.
     throw new Error(
-      'The tool gate is on, but this run executes in a container, where the gate cannot yet ' +
-        `resolve the paths a tool call names. Run without the container backend, or ${OFF_SWITCH}.`
+      'The tool gate is on, but this run runs in a container, and the gate resolves each path ' +
+        "a tool call names on the host: a container's paths are not the host's, so it cannot " +
+        'judge them yet. Run it on the host (without --container or container.enabled), or ' +
+        `${OFF_SWITCH}.`
     );
   }
 
@@ -128,6 +134,7 @@ export function createRunToolGate(input: RunToolGateInput): RunToolGate | undefi
       protectedBranches,
       verificationCommands,
       credentialValues: input.credentialValues,
+      outsideRootAdvice: input.outsideRootAdvice,
       ...(jev.status === 'on' && { thresholds: jev.settings.thresholds }),
       cache,
     });
@@ -136,6 +143,31 @@ export function createRunToolGate(input: RunToolGateInput): RunToolGate | undefi
   // the run here, before its first step, instead of at that step's first tool call.
   forStep('');
   return { forStep };
+}
+
+let emptyRoot: string | undefined;
+
+/**
+ * A private, empty, read-only directory to root a gate at when the work has no
+ * checkout of its own. Everything else is then outside the root: every write is
+ * denied by rule, and a shell call from any other directory is flagged.
+ *
+ * One per process, under the system temp directory and readable only by this
+ * user. Made again if something removed it.
+ */
+export async function emptyToolGateRoot(): Promise<string> {
+  if (emptyRoot !== undefined) {
+    try {
+      await access(emptyRoot);
+      return emptyRoot;
+    } catch {
+      // Removed since it was made (a temp cleaner, a reboot): make another.
+    }
+  }
+  const created = await realpath(await mkdtemp(join(tmpdir(), 'archon-tool-gate-empty-')));
+  await chmod(created, 0o500);
+  emptyRoot = created;
+  return created;
 }
 
 /**
@@ -198,8 +230,6 @@ export interface WorkflowRunToolGateInput {
   artifactsDir: string;
   /** `$STATE_DIR` of the project. */
   stateDir: string;
-  /** `LOG_DIR` of the run. */
-  logDir: string;
   baseBranch: string;
   inContainer: boolean;
   /** The engine's own environment. Default: `process.env`. */
@@ -209,11 +239,12 @@ export interface WorkflowRunToolGateInput {
 /**
  * The gate for one workflow run, or `undefined` when the gate is off.
  *
- * The directories the engine hands a node through its environment
- * (`ARTIFACTS_DIR`, `STATE_DIR`, `LOG_DIR`) are the only places outside the
- * checkout it may write. Everything else outside, `/tmp` included, stays
- * denied. The provider homes the engine delivers credentials into sit inside
- * the artifacts directory, so they are named as protected.
+ * The run's artifacts directory and the project's state directory are the only
+ * places outside the checkout a node may write. Everything else outside stays
+ * denied, `/tmp` included. So does the log directory: it is one directory for
+ * every run of the project and holds the engine's own transcripts of them. The
+ * provider homes the engine delivers credentials into sit inside the artifacts
+ * directory, so they are named as protected.
  */
 export function createWorkflowRunToolGate(
   input: WorkflowRunToolGateInput
@@ -224,7 +255,7 @@ export function createWorkflowRunToolGate(
     config: input.config.toolGate,
     env,
     repoRoot: input.cwd,
-    extraWriteRoots: [input.artifactsDir, input.stateDir, input.logDir],
+    extraWriteRoots: [input.artifactsDir, input.stateDir],
     protectedPaths: [
       ...new Set(
         MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS.map(path =>

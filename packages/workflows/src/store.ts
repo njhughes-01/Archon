@@ -194,7 +194,8 @@ export const WORKFLOW_EVENT_TYPES = [
   // `data` is the gate's `ToolGateDecisionEvent` as it stands: tool, kind, decision,
   // needsApproval, source (rule | jev | fallback), ruleId, latencyMs, commandHash and
   // redactedPreview, plus score, noul and confidence when the classifier answered and
-  // classifierFailure when a configured classifier gave no usable answer.
+  // classifierFailure when a configured classifier gave no usable answer. `count` is how
+  // many identical calls made at the same time the one decision answered.
   // It never holds the raw command or tool input. Absence means the gate was off for
   // the run, the tool was read-only, or the run predates this event type.
   'tool_gate_decision',

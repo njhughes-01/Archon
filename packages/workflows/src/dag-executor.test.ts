@@ -36733,23 +36733,31 @@ describe('executeDagWorkflow -- tool action gate', () => {
     ]);
   });
 
-  it('gate on: writes into the run artifacts, state and log directories are allowed, every other outside write is denied', async () => {
-    const outside = realpathSync(await mkdtemp(join(tmpdir(), 'dag-tool-gate-outside-')));
+  it('gate on: writes into the run artifacts and state directories are allowed, every other outside write is denied', async () => {
+    // The run's directories live beside the checkout, as they do under ~/.archon,
+    // so a write there is allowed only because the engine named it a write root.
+    const beside = realpathSync(await mkdtemp(join(tmpdir(), 'dag-tool-gate-beside-')));
+    const artifactsDir = join(beside, 'artifacts', 'runs', 'gate-run');
+    const stateDir = join(beside, 'state');
+    const logDir = join(beside, 'logs');
     try {
       const decisions = askDuringTurn(() => [
         write(join(testDir, 'src', 'app.ts')),
-        write(join(testDir, 'artifacts', 'plan.md')),
-        write(join(testDir, 'state', 'notes.json')),
-        write(join(testDir, 'logs', 'notes.jsonl')),
-        write(join(outside, 'plan.md')),
-        write(join(testDir, 'artifacts', 'codex-home', 'auth.json')),
-        write(join(testDir, 'artifacts', 'pi-home', 'auth.json')),
-        shell('git reset --hard'),
+        write(join(artifactsDir, 'plan.md')),
+        write(join(stateDir, 'notes.json')),
+        write(join(artifactsDir, 'codex-home', 'auth.json')),
+        write(join(artifactsDir, 'pi-home', 'auth.json')),
+        // The log directory holds every run's transcript: the engine's to write, not a node's.
+        write(join(logDir, 'gate-run.jsonl')),
+        write(join(beside, 'elsewhere.md')),
       ]);
-      const store = await run([agent('implement', GATED)], GATE_ON);
+      const store = await run([agent('implement', GATED)], GATE_ON, {
+        artifactsDir,
+        stateDir,
+        logDir,
+      });
 
       expect(decisions.map(decision => decision.action)).toEqual([
-        'allow',
         'allow',
         'allow',
         'allow',
@@ -36762,14 +36770,13 @@ describe('executeDagWorkflow -- tool action gate', () => {
         'allow.write_in_root',
         'allow.write_in_root',
         'allow.write_in_root',
-        'allow.write_in_root',
+        'deny.secret_write',
+        'deny.secret_write',
         'deny.path_outside_root',
-        'deny.secret_write',
-        'deny.secret_write',
         'guard.repeated_denials',
       ]);
     } finally {
-      await removeTempTree(outside);
+      await removeTempTree(beside);
     }
   });
 
@@ -36798,6 +36805,7 @@ describe('executeDagWorkflow -- tool action gate', () => {
       'noul',
       'confidence',
       'classifierFailure',
+      'count',
       'latencyMs',
       'commandHash',
       'redactedPreview',
