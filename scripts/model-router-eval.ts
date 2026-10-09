@@ -25,18 +25,27 @@
  *
  * Usage:
  *   bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large]
- *                                        [--split tuning|heldout] [--cases <file>]
+ *                                        [--split tuning|heldout|heldout2] [--cases <file>]
+ *                                        [--map <tier-map> [--steps a,b]]
+ *   bun run scripts/model-router-eval.ts --lowerable <tier-map> [--steps a,b]
  *
  * `--split` runs one half of the set. The questions and thresholds are tuned against the
  * `tuning` half only; a full run reports each half beside the whole, so a change that only
  * fits the cases it was tuned on shows up as a gap between them.
  *
- * `--map <tier-map>` changes what is measured. Without it every case is asked, on one
- * stand-in provider that can run anything: agreement with the labels. With it a case
- * stands for its command's real step in the pack, on real providers, and is asked only if
- * the router would ask about that step on that map; the report says which cases could be
- * lowered at all and why the others could not. `--lowerable <tier-map>` prints that for
- * every step of the pack and calls no classifier. Maps: see `model-router-lowerable.ts`.
+ * `--map <tier-map>` changes what is measured. Without it a case is a stand-in step on one
+ * provider that can run anything: agreement with the labels. A case whose command promises
+ * to leave the checkout alone is not asked there either, because the router never lowers
+ * such a step; it is reported as never asked and left out of the routine share, which
+ * measures the classifier. With a map a case's task
+ * is put to every step of the pack that runs the case's command and that the router would
+ * ask about on that map, on real providers. Each such step is classified with its own
+ * text: the command file for a step that names the command, and the compiled prompt for a
+ * step that was composed into another workflow, whose text differs because the including
+ * workflow's inputs are written into it. The report says which cases could be lowered at
+ * all and why the others could not. `--lowerable <tier-map>` prints that for every step of
+ * the pack and calls no classifier. `--steps a,b` is the operator's `modelRouter.steps`
+ * list for either. Maps: see `model-router-lowerable.ts`.
  *
  * `--ceiling` is the authored tier every case is given (default `large`, so all three
  * tiers are in play; `medium` mirrors the default `modelRouter.tiers`).
@@ -60,6 +69,7 @@ import {
   readRouterSettings,
   routeAgentNode,
   routerInactiveReason,
+  stepExclusion,
   type RouterThresholds,
   type RoutingCandidate,
 } from '../packages/workflows/src/jev/model-router';
@@ -69,6 +79,7 @@ import {
   isTierMapName,
   packInstances,
   type PackInstance,
+  type PackOptions,
   type TierMapName,
 } from './model-router-lowerable';
 import { dagNodeSchema } from '../packages/workflows/src/schemas/dag-node';
@@ -217,14 +228,20 @@ async function readCommandText(packRoot: string, node: string): Promise<string> 
 export interface CaseResult {
   id: string;
   node: string;
+  /**
+   * Only with a tier map: the step of the pack this row classified, as `workflow/node id`.
+   * One case gives one row for each step that runs its command and can be lowered.
+   */
+  instance?: string;
   kind: CaseKind;
   split: CaseSplit;
   /** The label, capped at the ceiling: no router can route above it. */
   label: TierName;
   routedTier: TierName;
   /**
-   * Only with a tier map: whether the router would ask about this step at all on that
-   * map, and why not. Absent in the plain agreement run, where every case is asked.
+   * Whether the router would ask about this step at all, and why not. With a tier map it
+   * is set on every row. In the agreement run only `false` is recorded, for a case the
+   * router's own rules keep on its authored tier whatever the classifier would say.
    */
   offered?: boolean;
   notOfferedReason?: string;
@@ -321,6 +338,11 @@ function limitFor(
   return values.length === 0 ? null : pick(values);
 }
 
+/** A row's name in a report: the case, and the step it was classified as when there is one. */
+function rowName(result: Pick<CaseResult, 'id' | 'instance'>): string {
+  return result.instance === undefined ? result.id : `${result.id} @ ${result.instance}`;
+}
+
 /** Compare routed tiers with labels. Pure: this is all of the arithmetic. */
 export function scoreResults(
   results: readonly CaseResult[],
@@ -332,9 +354,12 @@ export function scoreResults(
   ) as Confusion;
   for (const result of results) confusion[result.label][result.routedTier] += 1;
 
-  const underRouted = results.filter(result => result.underRouted).map(result => result.id);
-  const unanswered = results.filter(result => !result.answered).map(result => result.id);
-  const routine = results.filter(result => ROUTINE_KINDS.includes(result.kind));
+  const underRouted = results.filter(result => result.underRouted).map(rowName);
+  const unanswered = results.filter(result => !result.answered).map(rowName);
+  // The share measures the classifier, so a case it was never asked about is not in it.
+  const routine = results.filter(
+    result => ROUTINE_KINDS.includes(result.kind) && result.offered !== false
+  );
   const routineLowered = routine.filter(result => rank(result.routedTier) < rank(ceiling)).length;
   const routineLoweredShare = routine.length === 0 ? null : routineLowered / routine.length;
 
@@ -471,6 +496,8 @@ export interface RunEvalOptions {
    * measures agreement with the labels and nothing about which steps can move.
    */
   map?: TierMapName;
+  /** With `map`: the operator's `modelRouter.steps`, the only steps the router may lower. */
+  steps?: readonly string[];
 }
 
 /** A closed contract every provider enforces as written, so every case can be asked. */
@@ -484,6 +511,8 @@ const EVAL_CONTRACT = {
 function agreementCandidate(evalCase: EvalCase, ceiling: TierName): RoutingCandidate {
   // Production only classifies steps that declare an output contract, so the stand-in
   // always declares one. `features.has_output_format` says what the pack's own step does.
+  // A step that promises to leave the checkout alone keeps that promise here, and the
+  // router's rule then keeps it on the ceiling without asking.
   const node = dagNodeSchema.parse({
     id: evalCase.id,
     command: evalCase.node,
@@ -521,7 +550,6 @@ function agreementCandidate(evalCase: EvalCase, ceiling: TierName): RoutingCandi
       workflowFallbackModel: undefined,
       workflowSandbox: undefined,
       webSearchMode: undefined,
-      workflowBetas: undefined,
       hasEnvVars: false,
     },
   };
@@ -542,13 +570,10 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
     warn: (): void => undefined,
     debug: (): void => undefined,
   };
-  // With a map, a case stands for its command's own step in the workflow that declares
-  // it: the first one the pack lists, which for every command is its home workflow.
-  const instances = map === undefined ? [] : await packInstances(REPO_ROOT, packRoot, map);
-  const instanceOf = (command: string): PackInstance | undefined =>
-    instances.find(
-      instance => instance.command === command && instance.candidate.node.source.kind === 'command'
-    );
+  // With a map, a case's task is put to every step of the pack that runs its command.
+  const packOptions: PackOptions = options.steps !== undefined ? { steps: options.steps } : {};
+  const instances =
+    map === undefined ? [] : await packInstances(REPO_ROOT, packRoot, map, packOptions);
   // On a map the ceiling is each step's own authored tier, which the router's default
   // config only lowers from medium.
   const ceiling: TierName = map === undefined ? options.ceiling : 'medium';
@@ -563,13 +588,17 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
       split: evalCase.split,
       label,
     };
-    const instance = map === undefined ? undefined : instanceOf(evalCase.node);
-    if (map !== undefined && instance?.lowerable !== true) {
+    const steps = instances.filter(instance => instance.command === evalCase.node);
+    const lowerable = steps.filter(instance => instance.lowerable);
+    if (map !== undefined && lowerable.length === 0) {
+      // The reason of the step that names the command itself, when the pack has one: the
+      // composed copies can only add reasons to it.
+      const own = steps.find(instance => instance.candidate.node.source.kind === 'command');
       results.push({
         ...base,
         routedTier: ceiling,
         offered: false,
-        notOfferedReason: instance?.reason ?? 'no_single_shot_step_in_pack',
+        notOfferedReason: (own ?? steps[0])?.reason ?? 'no_single_shot_step_in_pack',
         // Nothing was asked, so there is no answer to wait for and nothing to score.
         answered: true,
         underRouted: false,
@@ -577,45 +606,71 @@ export async function runEval(options: RunEvalOptions): Promise<EvalReport> {
       });
       continue;
     }
-    const stepText = await readCommandText(packRoot, evalCase.node);
-    const routed = await routeAgentNode(
-      {
-        ...(instance?.candidate ?? agreementCandidate(evalCase, ceiling)),
-        loadStepText: () => Promise.resolve(stepText),
-        taskText: () => evalCase.task,
-        credentialValues: () => [],
-      },
-      {
-        env,
-        fetch: dry
-          ? (): Promise<Response> => Promise.resolve(labelAnswer(evalCase, ceiling))
-          : options.fetch,
-        ...(map === undefined
-          ? {
-              getCapabilities: (provider: string): ProviderCapabilities | undefined =>
-                provider === EVAL_PROVIDER ? EVAL_CAPABILITIES : undefined,
-            }
+    // The agreement run has one stand-in step per case. The router's own rules decide
+    // whether it would ask about it at all, exactly as they do for a real step.
+    const standIn = map === undefined ? agreementCandidate(evalCase, ceiling) : undefined;
+    const neverAsked =
+      standIn === undefined ? undefined : stepExclusion(standIn.node, standIn.config);
+    if (neverAsked !== undefined) {
+      results.push({
+        ...base,
+        routedTier: ceiling,
+        offered: false,
+        notOfferedReason: neverAsked,
+        answered: true,
+        underRouted: false,
+        source: 'not_offered',
+      });
+      continue;
+    }
+    // One row for each step that can be lowered, each asked with the text that step
+    // sends in production.
+    const asked: (PackInstance | undefined)[] = map === undefined ? [undefined] : lowerable;
+    for (const instance of asked) {
+      const source = instance?.candidate.node.source;
+      const stepText =
+        source?.kind === 'inline' ? source.prompt : await readCommandText(packRoot, evalCase.node);
+      const routed = await routeAgentNode(
+        {
+          ...(instance?.candidate ?? standIn ?? agreementCandidate(evalCase, ceiling)),
+          loadStepText: () => Promise.resolve(stepText),
+          taskText: () => evalCase.task,
+          credentialValues: () => [],
+        },
+        {
+          env,
+          fetch: dry
+            ? (): Promise<Response> => Promise.resolve(labelAnswer(evalCase, ceiling))
+            : options.fetch,
+          ...(map === undefined
+            ? {
+                getCapabilities: (provider: string): ProviderCapabilities | undefined =>
+                  provider === EVAL_PROVIDER ? EVAL_CAPABILITIES : undefined,
+              }
+            : {}),
+          log: quiet,
+        }
+      );
+      const route = routed?.route;
+      results.push({
+        ...base,
+        ...(instance !== undefined
+          ? { instance: `${instance.workflow}/${instance.nodeId}`, offered: true }
           : {}),
-        log: quiet,
-      }
-    );
-    const route = routed?.route;
-    results.push({
-      ...base,
-      ...(map !== undefined ? { offered: true } : {}),
-      routedTier: route?.routedTier ?? ceiling,
-      answered: route?.source === 'jev',
-      underRouted: route !== undefined && rank(route.routedTier) < rank(label),
-      // No route at all means the router is absent here: no key, or a switch is off.
-      source: route?.source ?? 'inactive',
-      ...(route === undefined ? { reason: inactive ?? 'not_routable' } : {}),
-      ...(route?.reason !== undefined ? { reason: route.reason } : {}),
-      ...(route?.chosenTier !== undefined ? { chosenTier: route.chosenTier } : {}),
-      ...(route?.probability !== undefined ? { probability: route.probability } : {}),
-      ...(route?.confidence !== undefined ? { confidence: route.confidence } : {}),
-      ...(route?.riskNoul !== undefined ? { riskNoul: route.riskNoul } : {}),
-      ...(route?.ambiguityNoul !== undefined ? { ambiguityNoul: route.ambiguityNoul } : {}),
-    });
+        routedTier: route?.routedTier ?? ceiling,
+        answered: route?.source === 'jev',
+        underRouted: route !== undefined && rank(route.routedTier) < rank(label),
+        // No route at all means the router is absent here: no key, or a switch is off.
+        source: route?.source ?? 'inactive',
+        ...(route === undefined ? { reason: inactive ?? 'not_routable' } : {}),
+        ...(route?.reason !== undefined ? { reason: route.reason } : {}),
+        ...(route?.chosenTier !== undefined ? { chosenTier: route.chosenTier } : {}),
+        ...(route?.probability !== undefined ? { probability: route.probability } : {}),
+        ...(route?.confidence !== undefined ? { confidence: route.confidence } : {}),
+        ...(route?.riskNoul !== undefined ? { riskNoul: route.riskNoul } : {}),
+        ...(route?.ambiguityNoul !== undefined ? { ambiguityNoul: route.ambiguityNoul } : {}),
+      });
+    }
   }
 
   return {
@@ -672,10 +727,14 @@ export function formatReport(report: EvalReport): string {
     `classifier: ${report.classifier}`,
     `ceiling:    ${report.ceiling}`,
     ...(report.map !== undefined
-      ? [`tier map:   ${report.map} (only steps the router would ask about on it are classified)`]
+      ? [
+          `tier map:   ${report.map} (each step the router would ask about on it is classified with its own text)`,
+        ]
       : []),
     `thresholds: risk>=${String(thresholds.riskThreshold)} ambiguity>=${String(thresholds.ambiguityThreshold)} keep the ceiling; probability>=${String(thresholds.minProbability)} confidence>=${String(thresholds.minConfidence)} needed to lower`,
-    `cases: ${String(report.results.length)}`,
+    report.map === undefined
+      ? `cases: ${String(report.results.length)}`
+      : `rows: ${String(report.results.length)} (${String(new Set(report.results.map(r => r.id)).size)} cases, one row for each step asked about)`,
     '',
     'label    routed   chosen   prob  conf  risk  ambig  kind            case',
   ];
@@ -690,7 +749,7 @@ export function formatReport(report: EvalReport): string {
         fixed(result.riskNoul),
         fixed(result.ambiguityNoul).padEnd(5),
         result.kind.padEnd(14),
-        `${result.id}${result.underRouted ? '  UNDER-ROUTED' : ''}${result.answered ? '' : `  no answer (${result.reason ?? result.source})`}${result.offered === false ? `  not offered (${result.notOfferedReason ?? ''})` : ''}`,
+        `${rowName(result)}${result.underRouted ? '  UNDER-ROUTED' : ''}${result.answered ? '' : `  no answer (${result.reason ?? result.source})`}${result.offered === false ? `  not offered (${result.notOfferedReason ?? ''})` : ''}`,
       ].join('  ')
     );
   }
@@ -744,8 +803,8 @@ export function formatReport(report: EvalReport): string {
     }
     lines.push(
       '',
-      `Can be lowered on this map: ${String(offered.length)} of ${String(report.results.length)} cases (${[...new Set(offered.map(r => r.node))].sort().join(', ') || 'no commands'})`,
-      `Routed below the ceiling: ${String(offered.filter(r => rank(r.routedTier) < rank(report.ceiling)).length)} of ${String(offered.length)} offered`,
+      `Can be lowered on this map: ${String(new Set(offered.map(r => r.id)).size)} of ${String(new Set(report.results.map(r => r.id)).size)} cases, as ${String(offered.length)} step instances (${[...new Set(offered.map(r => r.node))].sort().join(', ') || 'no commands'})`,
+      `Routed below the ceiling: ${String(offered.filter(r => rank(r.routedTier) < rank(report.ceiling)).length)} of ${String(offered.length)} step instances asked`,
       'Not offered, by reason:',
       ...[...notOffered]
         .sort((a, b) => b[1] - a[1])
@@ -753,16 +812,23 @@ export function formatReport(report: EvalReport): string {
     );
     if (!score.scored) {
       lines.push(
-        `${result} NOT SCORED. ${String(score.unanswered.length)} offered case(s) got no answer from the classifier.`
+        `${result} NOT SCORED. ${String(score.unanswered.length)} step instance(s) got no answer from the classifier.`
       );
     } else if (score.underRouted.length > 0) {
       lines.push(
-        `${result} FAIL. ${String(score.underRouted.length)} offered case(s) were routed below their label.`
+        `${result} FAIL. ${String(score.underRouted.length)} step instance(s) were routed below their label.`
       );
     } else {
-      lines.push(`${result} PASS. No offered case was routed below its label.`);
+      lines.push(`${result} PASS. No step instance was routed below its case's label.`);
     }
     return lines.join('\n');
+  }
+  const neverAsked = report.results.filter(r => r.offered === false);
+  if (neverAsked.length > 0) {
+    lines.push(
+      `Never asked, by the router's own rules (${[...new Set(neverAsked.map(r => r.notOfferedReason ?? 'unknown'))].join(', ')}): ` +
+        `${String(neverAsked.length)} of ${String(report.results.length)} cases. They stay on the ceiling and are not in the routine share.`
+    );
   }
   if (!score.scored) {
     const reasons = [
@@ -789,7 +855,7 @@ export function formatReport(report: EvalReport): string {
 }
 
 const USAGE =
-  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--split tuning|heldout|heldout2] [--map <tier-map>] [--cases <file>]\n       bun run scripts/model-router-eval.ts --lowerable <tier-map>';
+  'Usage: bun run scripts/model-router-eval.ts [--dry] [--json] [--ceiling small|medium|large] [--split tuning|heldout|heldout2] [--map <tier-map> [--steps a,b]] [--cases <file>]\n       bun run scripts/model-router-eval.ts --lowerable <tier-map> [--steps a,b]';
 
 /** The command. Returns the exit code; `write` receives each output line. */
 export async function main(
@@ -805,6 +871,7 @@ export async function main(
   let split: CaseSplit | undefined;
   let map: TierMapName | undefined;
   let lowerable: TierMapName | undefined;
+  let steps: string[] | undefined;
   for (let index = 0; index < argv.length; index++) {
     const argument = argv[index];
     const value = argv[index + 1];
@@ -819,6 +886,13 @@ export async function main(
     } else if (argument === '--lowerable' && isTierMapName(value)) {
       lowerable = value;
       index++;
+    } else if (argument === '--steps' && value !== undefined) {
+      // The operator's `modelRouter.steps`, comma-separated. `--steps ''` is the empty list.
+      steps = value
+        .split(',')
+        .map(step => step.trim())
+        .filter(step => step !== '');
+      index++;
     } else if (argument === '--cases' && value !== undefined) {
       casesPath = resolve(argv[++index]);
     } else {
@@ -828,10 +902,22 @@ export async function main(
     }
   }
 
+  if (steps !== undefined && map === undefined && lowerable === undefined) {
+    write('--steps needs --map or --lowerable: the agreement run asks every case.');
+    write(USAGE);
+    return 2;
+  }
+  const packOptions: PackOptions = steps !== undefined ? { steps } : {};
   if (lowerable !== undefined) {
     // A report about the pack and the providers. No classifier is called.
     try {
-      write(formatLowerability(await packInstances(REPO_ROOT, PACK_ROOT, lowerable), lowerable));
+      write(
+        formatLowerability(
+          await packInstances(REPO_ROOT, PACK_ROOT, lowerable, packOptions),
+          lowerable,
+          packOptions
+        )
+      );
       return 0;
     } catch (error) {
       write(`Cannot build the report: ${messageOf(error)}`);
@@ -850,6 +936,7 @@ export async function main(
       dry,
       fetch,
       ...(map !== undefined ? { map } : {}),
+      ...(steps !== undefined ? { steps } : {}),
     });
   } catch (error) {
     // Deliberately every error: exit 1 means "the classifier was measured and fell

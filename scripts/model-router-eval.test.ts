@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import type { Fetch } from '../packages/workflows/src/jev/jev-client';
 import { ROUTER_DEFAULTS } from '../packages/workflows/src/jev/model-router';
-import { packInstances } from './model-router-lowerable';
+import { packInstances, unmatchedSteps } from './model-router-lowerable';
 import {
   EVAL_CASES,
   MIN_ROUTINE_LOWERED_SHARE,
@@ -29,11 +29,17 @@ interface Reply {
 }
 
 /** A classifier that answers each request from its task text. */
-function classifier(reply: (task: string) => Reply | Response): { fetch: Fetch; tasks: string[] } {
+function classifier(reply: (task: string) => Reply | Response): {
+  fetch: Fetch;
+  tasks: string[];
+  steps: string[];
+} {
   const tasks: string[] = [];
+  const steps: string[] = [];
   const fetch: Fetch = (_input, init) => {
-    const body = JSON.parse(String(init?.body)) as { state: { task: string } };
+    const body = JSON.parse(String(init?.body)) as { state: { task: string; step: string } };
     tasks.push(body.state.task);
+    steps.push(body.state.step);
     const answer = reply(body.state.task);
     if (answer instanceof Response) return Promise.resolve(answer);
     return Promise.resolve(
@@ -54,7 +60,7 @@ function classifier(reply: (task: string) => Reply | Response): { fetch: Fetch; 
       )
     );
   };
-  return { fetch, tasks };
+  return { fetch, tasks, steps };
 }
 
 const features = {
@@ -416,7 +422,10 @@ describe('which pack steps can be lowered on a tier map', () => {
     // Every step without an output contract is refused for that reason and no other.
     for (const instance of instances) {
       if (instance.authoredTier !== 'medium') continue;
-      if (instance.candidate.node.output_format === undefined) {
+      if (
+        instance.candidate.node.output_format === undefined &&
+        instance.candidate.node.mutates_checkout !== false
+      ) {
         expect({ id: instance.nodeId, reason: instance.reason }).toEqual({
           id: instance.nodeId,
           reason: 'unverifiable',
@@ -425,23 +434,94 @@ describe('which pack steps can be lowered on a tier map', () => {
     }
   });
 
-  it('never moves a read-only step across providers, and still lowers it within one', async () => {
-    const readOnly = (instances: Awaited<ReturnType<typeof packInstances>>): typeof instances =>
-      instances.filter(
+  it('never lowers a read-only step, across providers or within one', async () => {
+    for (const map of ['codex-small', 'claude-only'] as const) {
+      const readOnly = (await packInstances(REPO_ROOT, PACK_ROOT, map)).filter(
         i => i.authoredTier === 'medium' && i.candidate.node.mutates_checkout === false
       );
-    const across = readOnly(await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small'));
-    expect(across.length).toBeGreaterThan(0);
-    expect(across.filter(i => i.lowerable)).toEqual([]);
-    const within = readOnly(await packInstances(REPO_ROOT, PACK_ROOT, 'claude-only'));
-    expect(within.filter(i => i.lowerable).length).toBe(within.length);
+      expect(readOnly.length).toBeGreaterThan(0);
+      expect(
+        readOnly.map(i => ({ id: i.nodeId, lowerable: i.lowerable, reason: i.reason }))
+      ).toEqual(readOnly.map(i => ({ id: i.nodeId, lowerable: false, reason: 'read_only_node' })));
+    }
   });
 
-  it('traces a composed step back to the command its own workflow names', async () => {
+  it('refuses review-scope on a strict provider: its contract has an object with no properties, which that provider closes and then rejects', async () => {
+    const scope = (
+      map: 'codex-small' | 'claude-only'
+    ): Promise<{ lowerable: boolean; reason?: string }[]> =>
+      packInstances(REPO_ROOT, PACK_ROOT, map).then(instances =>
+        instances
+          .filter(i => i.command === 'review-scope')
+          .map(i => ({
+            lowerable: i.lowerable,
+            ...(i.reason !== undefined ? { reason: i.reason } : {}),
+          }))
+      );
+    const across = await scope('codex-small');
+    expect(across.length).toBeGreaterThan(1);
+    expect(across).toEqual(across.map(() => ({ lowerable: false, reason: 'open_schema' })));
+    // The same contract on a provider that enforces it as written is no obstacle.
+    const within = await scope('claude-only');
+    expect(within).toEqual(within.map(() => ({ lowerable: true })));
+  });
+
+  it('names a composed step by the command its own workflow names', async () => {
     const instances = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small');
     const composed = instances.filter(i => i.candidate.node.source.kind === 'inline');
     expect(composed.length).toBeGreaterThan(0);
     expect(composed.filter(i => i.command === undefined)).toEqual([]);
+    expect(composed.filter(i => i.stepName !== i.command)).toEqual([]);
+    const names = (command: string): string[] =>
+      instances.filter(i => i.command === command).map(i => `${i.workflow}/${i.nodeId}`);
+    expect(names('discover-checks')).toEqual([
+      'archon-deliver/validate__discover',
+      'archon-ship/deliver__validate__discover',
+      'archon-upkeep/deliver__validate__discover',
+      'archon-validate/discover',
+    ]);
+  });
+
+  it("lowers only the operator's listed steps, standalone and composed, and says not_listed for the rest", async () => {
+    const steps = ['discover-checks', 'sync-pr-body'];
+    const all = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small');
+    const listed = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small', { steps });
+    const key = (i: { workflow: string; nodeId: string }): string => `${i.workflow}/${i.nodeId}`;
+    // Exactly the steps that were lowerable before and carry a listed name.
+    expect(listed.filter(i => i.lowerable).map(key)).toEqual(
+      all.filter(i => i.lowerable && steps.includes(i.stepName)).map(key)
+    );
+    expect(
+      listed.filter(i => i.lowerable).some(i => i.candidate.node.source.kind === 'inline')
+    ).toBe(true);
+    expect(
+      listed.filter(i => i.lowerable).some(i => i.candidate.node.source.kind === 'command')
+    ).toBe(true);
+    for (const instance of listed) {
+      if (instance.authoredTier !== 'medium' || steps.includes(instance.stepName)) continue;
+      expect({ id: key(instance), reason: instance.reason }).toEqual({
+        id: key(instance),
+        reason: 'not_listed',
+      });
+    }
+    // An empty list lowers nothing. A list can only take steps away.
+    const none = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small', { steps: [] });
+    expect(none.filter(i => i.lowerable)).toEqual([]);
+  });
+
+  it('reports a listed name that matches no step, as a warning and not a failure', async () => {
+    const steps = ['discover-checks', 'discover-cheks'];
+    const instances = await packInstances(REPO_ROOT, PACK_ROOT, 'codex-small', { steps });
+    expect(unmatchedSteps(instances, steps)).toEqual(['discover-cheks']);
+    expect(unmatchedSteps(instances, undefined)).toEqual([]);
+    const { code, text } = await capture(
+      ['--lowerable', 'codex-small', '--steps', steps.join(',')],
+      {}
+    );
+    expect(code).toBe(0);
+    expect(text).toContain('steps: discover-checks, discover-cheks');
+    expect(text).toContain('WARNING: no step in the pack is named discover-cheks.');
+    expect((await capture(['--lowerable', 'codex-small'], {})).text).toContain('steps: not set');
   });
 
   it('prints the report without calling a classifier', async () => {
@@ -456,14 +536,22 @@ describe('which pack steps can be lowered on a tier map', () => {
 });
 
 describe('main with a tier map', () => {
-  it('asks only about cases whose step the router would ask about, and says why not for the rest', async () => {
+  interface MapReport {
+    map: string;
+    ceiling: string;
+    results: {
+      id: string;
+      node: string;
+      instance?: string;
+      offered: boolean;
+      notOfferedReason?: string;
+    }[];
+  }
+
+  it("asks about every step that runs a case's command and can be lowered, and says why not for the rest", async () => {
     const { fetch, tasks } = classifier(() => ({ choice: 'small' }));
     const { code, text } = await capture(['--map', 'codex-small', '--json'], LIVE_ENV, fetch);
-    const report = JSON.parse(text) as {
-      map: string;
-      ceiling: string;
-      results: { id: string; node: string; offered: boolean; notOfferedReason?: string }[];
-    };
+    const report = JSON.parse(text) as MapReport;
     expect(report.map).toBe('codex-small');
     expect(report.ceiling).toBe('medium');
     const offered = report.results.filter(r => r.offered);
@@ -473,17 +561,80 @@ describe('main with a tier map', () => {
     expect(
       report.results.filter(r => !r.offered).every(r => typeof r.notOfferedReason === 'string')
     ).toBe(true);
+    // One row per lowerable step of the case's command: the standalone step and its
+    // composed copies, each named.
+    const lowerable = (await packInstances(join(PACK_ROOT, '../../..'), PACK_ROOT, 'codex-small'))
+      .filter(i => i.lowerable && i.command === 'discover-checks')
+      .map(i => `${i.workflow}/${i.nodeId}`);
+    expect(lowerable.length).toBeGreaterThan(1);
+    const [first] = offered.filter(r => r.node === 'discover-checks');
+    expect(offered.filter(r => r.id === first?.id).map(r => r.instance)).toEqual(lowerable);
     // A classifier that says "small" to everything under-routes the offered risky cases.
     expect(code).toBe(1);
+  });
+
+  it("classifies each step with its own text: a composed step's compiled prompt, not the command file", async () => {
+    const cases = (await readCases(EVAL_CASES))
+      .filter(c => c.node === 'discover-checks')
+      .slice(0, 1);
+    const { fetch, steps } = classifier(() => ({ choice: 'small' }));
+    const report = await runEval({
+      cases,
+      packRoot: PACK_ROOT,
+      ceiling: 'medium',
+      env: LIVE_ENV,
+      dry: false,
+      fetch,
+      map: 'codex-small',
+    });
+    const instances = (
+      await packInstances(join(PACK_ROOT, '../../..'), PACK_ROOT, 'codex-small')
+    ).filter(i => i.lowerable && i.command === 'discover-checks');
+    expect(report.results.map(r => r.instance)).toEqual(
+      instances.map(i => `${i.workflow}/${i.nodeId}`)
+    );
+    const file = await Bun.file(join(PACK_ROOT, 'validate/commands/discover-checks.md')).text();
+    const sent = new Map(report.results.map((r, index) => [r.instance, steps[index]]));
+    const head = (text: string): string => text.slice(0, 200);
+    // The standalone step sends the command file. Every composed step sends the prompt
+    // the loader compiled for it, which is the text that step runs.
+    expect(head(sent.get('archon-validate/discover') ?? '')).toBe(head(file));
+    for (const instance of instances) {
+      const { source } = instance.candidate.node;
+      if (source.kind !== 'inline') continue;
+      const own = sent.get(`${instance.workflow}/${instance.nodeId}`) ?? '';
+      expect(own.length).toBeGreaterThan(0);
+      expect(source.prompt.startsWith(own.slice(0, 200))).toBe(true);
+    }
+    expect(new Set(steps).size).toBeGreaterThan(1);
+  });
+
+  it("asks only about the operator's listed steps with --steps", async () => {
+    const { fetch, tasks } = classifier(() => ({ choice: 'small' }));
+    const { text } = await capture(
+      ['--map', 'codex-small', '--steps', 'sync-pr-body', '--json'],
+      LIVE_ENV,
+      fetch
+    );
+    const report = JSON.parse(text) as MapReport;
+    const offered = report.results.filter(r => r.offered);
+    expect(offered.length).toBeGreaterThan(0);
+    expect(tasks).toHaveLength(offered.length);
+    expect([...new Set(offered.map(r => r.node))]).toEqual(['sync-pr-body']);
+    expect(
+      report.results.filter(r => r.node === 'discover-checks').map(r => r.notOfferedReason)
+    ).toContain('not_listed');
+    // Without a map there is no pack step to list.
+    expect((await capture(['--steps', 'sync-pr-body', '--dry'], {})).code).toBe(2);
   });
 
   it('keeps the lowerable count apart from the agreement verdict', async () => {
     const { text, code } = await capture(['--map', 'codex-small', '--dry'], {});
     expect(code).toBe(0);
-    expect(text).toMatch(/Can be lowered on this map: \d+ of \d+ cases/);
+    expect(text).toMatch(/Can be lowered on this map: \d+ of \d+ cases, as \d+ step instances/);
     expect(text).toContain('Not offered, by reason:');
     expect(text.trim().split('\n').at(-1)).toMatch(
-      /PASS\. No offered case was routed below its label\.$/
+      /PASS\. No step instance was routed below its case's label\.$/
     );
     expect(text).not.toContain('too few routine cases');
   });

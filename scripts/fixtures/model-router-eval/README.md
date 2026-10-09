@@ -30,15 +30,25 @@ any case routed below its label, so a generous label is the safe mistake.
 
 ## Two questions, two runs
 
-The plain run asks about every case, on one stand-in provider that can run anything, and
+The plain run puts each case to a stand-in step on one provider that can run anything, and
 gives every stand-in step an output contract. It measures one thing: whether the classifier
-agrees with the labels. It says nothing about which steps can actually move.
+agrees with the labels. It says nothing about which steps can actually move. A case whose
+`features.mutates_checkout` is `false` is not asked: the router never lowers a step that
+promises to leave the checkout alone, on any provider. Such a case is reported as never
+asked, stays on the ceiling, and is left out of the routine share, which measures the
+classifier.
 
-`--map <tier-map>` asks the other question. Each case stands for its command's real step in
-the pack, on real providers, and is classified only if the router would ask about that step
-on that map. `--lowerable <tier-map>` lists every step of the pack with the reason it can
-or cannot be lowered, and calls no classifier. Keep the two results apart: a classifier
-that agrees with every label still saves nothing on a map where few steps can move.
+`--map <tier-map>` asks the other question. A case's task is put to every step of the pack
+that runs the case's command and that the router would ask about on that map, on real
+providers: one row per step, named `case @ workflow/node id`. Each step is classified with
+its own text. A step that names the command sends the command file; a step composed into
+another workflow through `include:` sends the prompt the loader compiled for it, which has
+the including workflow's inputs written in and so differs from the file. `--lowerable
+<tier-map>` lists every step of the pack with the reason it can or cannot be lowered, and
+calls no classifier. `--steps a,b` gives either the operator's `modelRouter.steps` list;
+`--lowerable` warns about a name that matches no step. Keep the two results apart: a
+classifier that agrees with every label still saves nothing on a map where few steps can
+move.
 
 ## Tuning and held-out halves
 
