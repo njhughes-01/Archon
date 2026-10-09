@@ -399,7 +399,7 @@ STUBBED   review__scope (prompt)
 
 The origin in parentheses is one of `node`, `model ref` (a tier keyword or `@alias`), `workflow`, `assistant config`, or `default assistant`. `[from <name>]` names the workflow file a composed node was authored in. A node whose declared `provider:` disagrees with the provider its `model:` ref resolves to also reports the warning a real run would emit. `--json` carries the same values under each trace entry's `resolution` object.
 
-A dry run never calls the [model router](/reference/configuration/#model-router)'s classifier, so the model it reports is always the unrouted one: the most the node can run on. When the router is configured, a node it may lower (an agent node on a routable tier that declares an `output_format`) carries one more line, and `resolution.modelRouter` (`mode`, `ceiling`) in `--json`. When the router has no key or a switch is off, the line says it is inactive instead, and `resolution.modelRouter.inactive` gives the reason:
+A dry run never calls the [model router](/reference/configuration/#model-router)'s classifier, so the model it reports is always the unrouted one: the most the node can run on. When the router is configured, a node it may lower (an agent node on a routable tier that declares an `output_format`, does not declare `mutates_checkout: false`, and is named in `modelRouter.steps` when that list is set) carries one more line, and `resolution.modelRouter` (`mode`, `ceiling`) in `--json`. When the router has no key or a switch is off, the line says it is inactive instead, and `resolution.modelRouter.inactive` gives the reason:
 
 ```text
   model router: apply mode may run this step below 'medium'; the model above is its ceiling
