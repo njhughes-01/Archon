@@ -54,6 +54,12 @@ import {
   rawAliasesConfigSchema,
   rawTiersConfigSchema,
 } from '@archon/workflows/schemas/model-binding';
+import {
+  modelRouterConfigInputSchema,
+  narrowModelRouterConfig,
+  resolveModelRouterConfig,
+  type ModelRouterConfigInput,
+} from '@archon/workflows/schemas/model-router';
 
 /**
  * A per-key patch for the `tiers:` config. Unlike `RawTiersConfig`, a tier value
@@ -311,6 +317,57 @@ function validateWorkflowContinuationConfig(parsed: unknown, configPath: string)
   config.workflows = result.data;
 }
 
+/**
+ * Validate a `modelRouter:` block. A mistyped key, tier or mode is refused with the key
+ * named: read leniently, it would either widen which steps may be lowered or leave the
+ * operator believing a setting is in force that is not. The settings write path throws
+ * this; the read paths go through `dropInvalidModelRouterConfig`.
+ */
+function validateModelRouterConfig(parsed: unknown, configPath: string): void {
+  if (typeof parsed !== 'object' || parsed === null || !('modelRouter' in parsed)) return;
+  const config = parsed as { modelRouter?: unknown };
+  if (config.modelRouter === undefined) return;
+  const result = modelRouterConfigInputSchema.safeParse(config.modelRouter);
+  if (!result.success) {
+    const issues = result.error.issues
+      .map(issue => `${issue.path.join('.') || '<root>'}: ${issue.message}`)
+      .join('; ');
+    throw new InvalidConfigError('Invalid modelRouter config', configPath, issues);
+  }
+  config.modelRouter = result.data;
+}
+
+/**
+ * Read-side handling of a `modelRouter:` block: an invalid one switches the router off
+ * and nothing else. The loaders degrade a file they reject to an empty config, which for
+ * most blocks is the safe reading. Here it is not: one mistyped router key would also
+ * throw away the operator's tiers and assistants. So the block alone is replaced, loudly,
+ * and the rest of the file stands.
+ *
+ * What "off" takes depends on the file. The install block is the opt-in, so dropping it
+ * leaves the router off. A repository block can only narrow the install's, so dropping it
+ * would do the opposite: a repository that wrote `mdoe: off` would run with the router
+ * on. An invalid repository block therefore becomes `mode: off`.
+ */
+function dropInvalidModelRouterConfig(
+  parsed: unknown,
+  configPath: string,
+  scope: 'install' | 'repo'
+): void {
+  try {
+    validateModelRouterConfig(parsed, configPath);
+  } catch (error) {
+    if (!(error instanceof InvalidConfigError)) throw error;
+    getLog().error(
+      { configPath, scope, detail: error.summary },
+      'config.model_router_invalid_router_disabled'
+    );
+    const config = parsed as { modelRouter?: ModelRouterConfigInput };
+    if (scope === 'repo') config.modelRouter = { mode: 'off' };
+    else delete config.modelRouter;
+  }
+}
+
 function isConfigRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -396,6 +453,7 @@ async function readGlobalConfigOrDegrade(configPath: string): Promise<GlobalConf
     const content = await readConfigFile(configPath);
     const parsed = parseYaml(content);
     validateWorkflowContinuationConfig(parsed, configPath);
+    dropInvalidModelRouterConfig(parsed, configPath, 'install');
     validateModelBindingConfig(parsed, configPath);
     return (parsed as GlobalConfig | null) ?? {};
   } catch (error) {
@@ -462,6 +520,7 @@ async function readRepoConfigOrDegrade(configPath: string): Promise<RepoConfig> 
     const content = await readConfigFile(configPath);
     const raw = parseYaml(content);
     validateWorkflowContinuationConfig(raw, configPath);
+    dropInvalidModelRouterConfig(raw, configPath, 'repo');
     validateModelBindingConfig(raw, configPath);
     const parsed = (raw as RepoConfig | null) ?? {};
     const recommendedWorkflows = sanitizeRecommendedWorkflows(
@@ -690,6 +749,11 @@ function mergeGlobalConfig(defaults: MergedConfig, global: GlobalConfig): Merged
     result.workflows = { ...result.workflows, ...global.workflows };
   }
 
+  // The block's presence is the opt-in, so defaults are applied only once one exists.
+  if (global.modelRouter) {
+    result.modelRouter = resolveModelRouterConfig(global.modelRouter);
+  }
+
   // Container backend defaults (folder projects)
   if (global.container) {
     result.container = { ...global.container };
@@ -726,6 +790,20 @@ function mergeRepoConfig(merged: MergedConfig, repo: RepoConfig): MergedConfig {
 
   if (repo.workflows) {
     result.workflows = { ...result.workflows, ...repo.workflows };
+  }
+
+  // The operator's install config owns the model router. A repository block narrows it and
+  // nothing else; one in a repository whose install has not opted in does nothing, and
+  // says so, because a silent no-op here would read as "the router is on".
+  if (repo.modelRouter) {
+    if (merged.modelRouter) {
+      result.modelRouter = narrowModelRouterConfig(merged.modelRouter, repo.modelRouter);
+    } else {
+      getLog().warn(
+        { requested: repo.modelRouter },
+        'config.model_router_repo_block_ignored_without_install_opt_in'
+      );
+    }
   }
 
   // Commands config
@@ -958,6 +1036,7 @@ export async function updateGlobalConfig(
     // degrade: a bad value from the settings UI would otherwise brick every later
     // config load, and a bad block already on disk must be repaired, not kept.
     validateWorkflowContinuationConfig(merged, configPath);
+    validateModelRouterConfig(merged, configPath);
     validateModelBindingConfig(merged, configPath);
     validateAssistantDefaults(merged, configPath);
 

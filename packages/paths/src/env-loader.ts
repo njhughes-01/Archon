@@ -25,7 +25,7 @@
  *     output.
  */
 import { config } from 'dotenv';
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { homedir } from 'os';
 import { join } from 'path';
 import { getArchonEnvPath, getArchonHome, getRepoArchonEnvPath } from './archon-paths';
@@ -78,6 +78,37 @@ const REPO_SCOPE_REFUSED_KEYS = [
 ];
 
 /**
+ * Key prefixes a repository's `.archon/.env` may not set. `JEV_*` connects and tunes the
+ * classifier behind the model router and the other Jev features: its endpoint, its key,
+ * its switches and its thresholds. A repository that could set them could send the
+ * operator's task text to an endpoint of its own choosing, or loosen the thresholds that
+ * keep a step on its authored model. The operator sets them in the environment or in the
+ * user-scope `~/.archon/.env`.
+ */
+const REPO_SCOPE_REFUSED_PREFIXES = ['JEV_'];
+
+function isRefusedInRepoScope(key: string): boolean {
+  // Windows env names are case-insensitive, so `Path=` there is PATH.
+  const name = process.platform === 'win32' ? key.toUpperCase() : key;
+  return (
+    REPO_SCOPE_REFUSED_KEYS.includes(name) ||
+    REPO_SCOPE_REFUSED_PREFIXES.some(prefix => name.startsWith(prefix))
+  );
+}
+
+/**
+ * Whether two existing paths are one file, through any symlinks. A path that cannot be
+ * resolved is treated as a different file, which leaves the repo-scope checks in force.
+ */
+function isSameFile(a: string, b: string): boolean {
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Load archon-owned env files. Call once, immediately after
  * `@archon/paths/strip-cwd-env-boot` at each entry point.
  *
@@ -85,8 +116,12 @@ const REPO_SCOPE_REFUSED_KEYS = [
  *   - `~/.archon/.env` wins over shell-inherited vars (archon intent wins).
  *   - `<cwd>/.archon/.env` wins over `~/.archon/.env` (repo scope wins).
  *
- * A repo-scope file that sets any of {@link REPO_SCOPE_REFUSED_KEYS} is refused before
- * any of its keys apply.
+ * A repo-scope file that sets any of {@link REPO_SCOPE_REFUSED_KEYS}, or a key under any of
+ * {@link REPO_SCOPE_REFUSED_PREFIXES}, is refused before any of its keys apply.
+ *
+ * Run from the directory that holds the Archon home (`cd ~ && archon ...`), the repo-scope
+ * path is the user-scope file itself. It is the operator's file and is already loaded, so
+ * it is not read a second time as a repository's and none of the refusals apply to it.
  *
  * A malformed env file is fatal — matches the pre-existing CLI behavior at
  * packages/cli/src/cli.ts:24-30.
@@ -112,7 +147,7 @@ export function loadArchonEnv(
   options.afterUserLoad?.();
 
   const repoPath = getRepoArchonEnvPath(cwd);
-  if (existsSync(repoPath)) {
+  if (existsSync(repoPath) && !isSameFile(repoPath, homePath)) {
     // Parse without applying, so a refused file changes nothing.
     const result = config({ path: repoPath, processEnv: {}, quiet: true });
     if (result.error) {
@@ -121,15 +156,13 @@ export function loadArchonEnv(
       process.exit(1);
     }
     const parsed = result.parsed ?? {};
-    // Windows env names are case-insensitive, so `Path=` there is PATH.
-    const refused = Object.keys(parsed).filter(key =>
-      REPO_SCOPE_REFUSED_KEYS.includes(process.platform === 'win32' ? key.toUpperCase() : key)
-    );
+    const refused = Object.keys(parsed).filter(isRefusedInRepoScope);
     if (refused.length > 0) {
       console.error(
         `${repoPath} sets ${refused.join(', ')}. A repository's .archon/.env cannot set ` +
-          `${REPO_SCOPE_REFUSED_KEYS.join(', ')}; set them in the environment or in ` +
-          `${displayPath(homePath)} instead.`
+          `${REPO_SCOPE_REFUSED_KEYS.join(', ')} or any ` +
+          `${REPO_SCOPE_REFUSED_PREFIXES.map(prefix => `${prefix}*`).join(', ')} key; set ` +
+          `them in the environment or in ${displayPath(homePath)} instead.`
       );
       process.exit(1);
     }

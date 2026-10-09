@@ -46,6 +46,7 @@
     "dev:docs": "bun --filter @archon/docs-web dev",
     "build:docs": "bun --filter @archon/docs-web build",
     "validate": "bun run scripts/validate.ts",
+    "router-eval": "bun run scripts/model-router-eval.ts",
     "prepare": "husky",
     "setup-auth": "bun --filter @archon/server setup-auth",
     "check:cli-import-boundary": "bun run scripts/check-cli-import-boundary.ts"

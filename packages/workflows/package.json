@@ -182,7 +182,11 @@
       "src/implement-guard-conformance.test.ts"
     ],
     [
-      "src/jev/"
+      "src/jev/",
+      "src/redaction.test.ts"
+    ],
+    [
+      "src/node-model-routing.test.ts"
     ]
   ]
 }

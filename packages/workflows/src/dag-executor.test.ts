@@ -2696,6 +2696,1016 @@ describe('executeDagWorkflow -- tool restrictions', () => {
   });
 });
 
+describe('executeDagWorkflow -- cost-aware model router', () => {
+  let testDir: string;
+  let fetchSpy: ReturnType<typeof spyOn<typeof globalThis, 'fetch'>>;
+  const ROUTER_ENV_KEYS = [
+    'JEV_API_KEY',
+    'JEV_ENABLED',
+    'JEV_ROUTER_ENABLED',
+    'JEV_API_BASE',
+    'JEV_MODEL',
+    'JEV_ROUTER_TIMEOUT_MS',
+    'JEV_ROUTER_MIN_PROB',
+    'JEV_ROUTER_MIN_CONFIDENCE',
+    'JEV_ROUTER_RISK_THRESHOLD',
+    'JEV_ROUTER_AMBIGUITY_THRESHOLD',
+    'JEV_ROUTER_MAX_STEP_CHARS',
+    'JEV_ROUTER_MAX_TASK_CHARS',
+  ] as const;
+  const savedEnv = new Map<string, string | undefined>();
+  const API_KEY = 'router-test-key-never-logged';
+  const TASK = 'Summarise the billing module for the release notes';
+  const COMMAND_TEXT = 'List the checks this repository runs. Task: $ARGUMENTS';
+
+  const tiers = {
+    small: { provider: 'claude', model: 'haiku', effort: 'low' },
+    medium: { provider: 'claude', model: 'sonnet' },
+    large: { provider: 'claude', model: 'opus' },
+  } as const;
+  const profile = (overrides: RawTiersConfig = {}): ReturnType<typeof buildAiProfile> =>
+    buildAiProfile('claude', { repoTiers: { ...tiers, ...overrides } });
+  const routerConfig = (mode: 'off' | 'shadow' | 'apply', routed = ['medium']): WorkflowConfig => ({
+    ...minimalConfig,
+    modelRouter: { tiers: routed as ('small' | 'medium' | 'large')[], mode },
+  });
+  /** A closed contract Claude and Codex both enforce as written. */
+  const CONTRACT = {
+    type: 'object',
+    properties: { ok: { type: 'boolean' } },
+    required: ['ok'],
+  };
+  // A node is only lowered when it declares a contract escalation can check, so the
+  // routable fixture declares one and the default provider answer satisfies it.
+  const mediumStep = (fields: Record<string, unknown> = {}): DagNode =>
+    ({
+      id: 'step1',
+      kind: 'agent',
+      source: { kind: 'inline', prompt: 'Summarise $ARGUMENTS' },
+      model: 'medium',
+      output_format: CONTRACT,
+      ...fields,
+    }) as DagNode;
+  const meetsContract = async function* (): AsyncGenerator<MessageChunk> {
+    yield { type: 'assistant', content: '{"ok":true}' };
+    yield { type: 'result', sessionId: 'dag-session-id', structuredOutput: { ok: true } };
+  };
+  /** No attempt of any node carried a route: the router never considered them. */
+  const noRouteRecorded = (deps: ReturnType<typeof createMockDeps>): boolean =>
+    !eventsOf(deps).some(event => 'route' in ((event.data?.binding as object | undefined) ?? {}));
+
+  interface RouterAnswer {
+    choice?: string;
+    risk?: number;
+  }
+  const jevAnswer = (answer: RouterAnswer = {}): Response =>
+    new Response(
+      JSON.stringify({
+        model: 'jev-1.13.0',
+        answers: {
+          tier: {
+            type: 'choice',
+            choice: answer.choice ?? 'small',
+            probabilities: { [answer.choice ?? 'small']: 0.96 },
+            confidence: 0.9,
+          },
+          high_risk: { type: 'noul', noul: answer.risk ?? 0.02 },
+          ambiguous_or_multi_step: { type: 'noul', noul: 0.04 },
+        },
+      }),
+      { status: 200 }
+    );
+
+  type PersistedEvent = { event_type: string; step_name?: string; data?: Record<string, unknown> };
+  const eventsOf = (deps: ReturnType<typeof createMockDeps>): PersistedEvent[] =>
+    (deps.store.createWorkflowEvent as ReturnType<typeof mock>).mock.calls.map(
+      (call: unknown[]) => call[0] as PersistedEvent
+    );
+  const bindingsOf = (
+    deps: ReturnType<typeof createMockDeps>,
+    eventType: string,
+    step = 'step1'
+  ): Record<string, unknown>[] =>
+    eventsOf(deps)
+      .filter(event => event.event_type === eventType && event.step_name === step)
+      .map(event => event.data?.binding as Record<string, unknown>);
+  const sentModels = (): unknown[] =>
+    mockSendQueryDag.mock.calls.map(call => (call[3] as { model?: string } | undefined)?.model);
+  const sentBody = (call = 0): { state: { step: string; task: string } } =>
+    JSON.parse(String(fetchSpy.mock.calls[call][1]?.body)) as {
+      state: { step: string; task: string };
+    };
+
+  async function run(
+    overrides: Partial<DagOptionsOverrides> & {
+      nodes?: readonly (DagNode | IncludeDirective)[];
+    } = {}
+  ): Promise<ReturnType<typeof createMockDeps>> {
+    const { nodes, ...rest } = overrides;
+    const deps = (rest.deps as ReturnType<typeof createMockDeps> | undefined) ?? createMockDeps();
+    await executeDagWorkflow(
+      dagOptions({
+        cwd: testDir,
+        workflow: { name: 'routed', nodes: nodes ?? [mediumStep()] },
+        workflowRun: makeWorkflowRun('router-run', { user_message: TASK }),
+        aiProfile: profile(),
+        config: routerConfig('apply'),
+        ...rest,
+        deps,
+      })
+    );
+    return deps;
+  }
+
+  beforeEach(async () => {
+    testDir = join(tmpdir(), `dag-router-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    await mkdir(join(testDir, '.archon', 'commands'), { recursive: true });
+    await writeFile(join(testDir, '.archon', 'commands', 'discover.md'), COMMAND_TEXT);
+    mockSendQueryDag.mockClear();
+    mockLogFn.mockClear();
+    mockSendQueryDag.mockImplementation(meetsContract);
+    // The seam reads the router's settings from the real environment and reaches the
+    // classifier through the real global fetch, so this suite — and only this suite —
+    // lifts the test-run switch and fakes that one HTTP boundary.
+    for (const key of ROUTER_ENV_KEYS) {
+      savedEnv.set(key, process.env[key]);
+      delete process.env[key];
+    }
+    process.env.JEV_API_KEY = API_KEY;
+    fetchSpy = spyOn(globalThis, 'fetch').mockImplementation((async () =>
+      jevAnswer()) as unknown as typeof fetch);
+  });
+
+  afterEach(async () => {
+    fetchSpy.mockRestore();
+    for (const key of ROUTER_ENV_KEYS) {
+      const saved = savedEnv.get(key);
+      if (saved === undefined) delete process.env[key];
+      else process.env[key] = saved;
+    }
+    await removeTempTree(testDir);
+  });
+
+  it('lowers a medium node in apply mode and records the route on its binding', async () => {
+    const deps = await run();
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(sentModels()).toEqual(['haiku']);
+    const [started] = bindingsOf(deps, 'node_started');
+    expect(started.tier).toBe('small');
+    expect(started.route).toEqual({
+      mode: 'apply',
+      source: 'jev',
+      authoredTier: 'medium',
+      routedTier: 'small',
+      applied: true,
+      chosenTier: 'small',
+      probability: 0.96,
+      confidence: 0.9,
+      riskNoul: 0.02,
+      ambiguityNoul: 0.04,
+    });
+    expect(bindingsOf(deps, 'node_completed')[0].route).toEqual(started.route);
+  });
+
+  it('resolves exactly as with no router in shadow mode, while recording the route', async () => {
+    const unrouted = await run({ config: minimalConfig });
+    const unroutedCall = mockSendQueryDag.mock.calls[0];
+    expect(fetchSpy).not.toHaveBeenCalled();
+    mockSendQueryDag.mockClear();
+
+    const shadow = await run({ config: routerConfig('shadow') });
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(mockSendQueryDag.mock.calls[0][0]).toEqual(unroutedCall[0]);
+    const { abortSignal: _a, ...shadowOptions } = mockSendQueryDag.mock.calls[0][3] as Record<
+      string,
+      unknown
+    >;
+    const { abortSignal: _b, ...unroutedOptions } = unroutedCall[3] as Record<string, unknown>;
+    expect(shadowOptions).toEqual(unroutedOptions);
+    const [shadowBinding] = bindingsOf(shadow, 'node_started');
+    const [unroutedBinding] = bindingsOf(unrouted, 'node_started');
+    const { route, ...rest } = shadowBinding;
+    expect(rest).toEqual(unroutedBinding);
+    // No router leaves no trace at all: not a null route, no key.
+    expect('route' in unroutedBinding).toBe(false);
+    expect(route).toMatchObject({ mode: 'shadow', routedTier: 'small', applied: false });
+  });
+
+  it.each([
+    ['no modelRouter block', minimalConfig, {}],
+    ['mode off', routerConfig('off'), {}],
+  ] as [string, WorkflowConfig, Record<string, string>][])(
+    'never calls the classifier and records nothing with %s',
+    async (_label, config) => {
+      const deps = await run({ config });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet']);
+      expect('route' in bindingsOf(deps, 'node_started')[0]).toBe(false);
+    }
+  );
+
+  it.each([
+    ['no key', (): void => void delete process.env.JEV_API_KEY],
+    ['the Jev master switch off', (): void => void (process.env.JEV_ENABLED = '0')],
+    ['the router switch off', (): void => void (process.env.JEV_ROUTER_ENABLED = 'off')],
+  ] as [string, () => void][])(
+    'runs on the authored tier and records nothing with %s, block or no block',
+    async (_label, arrange) => {
+      arrange();
+      const deps = await run();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet']);
+      expect(noRouteRecorded(deps)).toBe(true);
+    }
+  );
+
+  it('never lowers a node that promises to leave the checkout alone, on any provider', async () => {
+    for (const aiProfile of [
+      profile(),
+      profile({ small: { provider: 'codex', model: 'gpt-mini' } }),
+    ]) {
+      mockSendQueryDag.mockClear();
+      const deps = await run({ aiProfile, nodes: [mediumStep({ mutates_checkout: false })] });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet']);
+      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+        source: 'disabled',
+        routedTier: 'medium',
+        applied: false,
+        reason: 'read_only_node',
+      });
+    }
+  });
+
+  describe('with an operator list of steps', () => {
+    const listed = (steps: string[], mode: 'shadow' | 'apply' = 'apply'): WorkflowConfig => ({
+      ...minimalConfig,
+      modelRouter: { tiers: ['medium'], mode, steps },
+    });
+    const commandStep = (id: string): DagNode =>
+      ({
+        id,
+        kind: 'agent',
+        source: { kind: 'command', name: 'discover' },
+        model: 'medium',
+        output_format: CONTRACT,
+      }) as DagNode;
+
+    it('lowers a listed command and nothing else', async () => {
+      const deps = await run({
+        config: listed(['discover']),
+        nodes: [commandStep('listed'), mediumStep({ id: 'other', depends_on: ['listed'] })],
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      expect(bindingsOf(deps, 'node_started', 'listed')[0].route).toMatchObject({ applied: true });
+    });
+
+    it.each(['shadow', 'apply'] as const)(
+      'records a step that is not listed as not_listed in %s mode, without asking',
+      async mode => {
+        const deps = await run({ config: listed(['discover'], mode) });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(sentModels()).toEqual(['sonnet']);
+        expect(bindingsOf(deps, 'node_started')[0].route).toEqual({
+          mode,
+          source: 'disabled',
+          authoredTier: 'medium',
+          routedTier: 'medium',
+          applied: false,
+          reason: 'not_listed',
+        });
+      }
+    );
+
+    it('names an inline prompt step by its node id', async () => {
+      await run({ config: listed(['step1']) });
+      expect(sentModels()).toEqual(['haiku']);
+    });
+
+    it('matches a composed step by the command its own workflow names', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'inner.yaml'),
+        `
+name: inner
+description: one command step
+model: medium
+nodes:
+  - id: find
+    command: discover
+    output_format:
+      type: object
+      properties: { ok: { type: boolean } }
+      required: [ok]
+`
+      );
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'outer.yaml'),
+        `
+name: outer
+description: composes inner
+nodes:
+  - id: block
+    include: inner
+`
+      );
+      const discovered = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(discovered.errors).toEqual([]);
+      const outer = discovered.workflows.find(w => w.workflow.name === 'outer');
+      if (!outer) throw new Error('outer was not discovered');
+      const runOuter = async (steps: string[]): Promise<unknown[]> => {
+        mockSendQueryDag.mockClear();
+        await executeDagWorkflow({
+          ...dagOptions({
+            deps: createMockDeps(),
+            cwd: testDir,
+            workflow: { name: 'placeholder', nodes: [] },
+            workflowRun: makeWorkflowRun('router-composed', { user_message: TASK }),
+            aiProfile: profile(),
+            config: listed(steps),
+          }),
+          workflow: outer.workflow,
+        });
+        return sentModels();
+      };
+      // The composed node is an inline prompt called `block__find`; the operator still
+      // names it by its command.
+      expect(await runOuter(['discover'])).toEqual(['haiku']);
+      expect(await runOuter(['block__find'])).toEqual(['sonnet']);
+    });
+  });
+
+  it('never lowers a node with no output contract, and records it as unverifiable', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'prose' };
+      yield { type: 'result', sessionId: 'sid' };
+    });
+    const deps = await run({ nodes: [mediumStep({ output_format: undefined })] });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(sentModels()).toEqual(['sonnet']);
+    expect(bindingsOf(deps, 'node_started')[0].route).toEqual({
+      mode: 'apply',
+      source: 'disabled',
+      authoredTier: 'medium',
+      routedTier: 'medium',
+      applied: false,
+      reason: 'unverifiable',
+    });
+  });
+
+  it('runs on the authored tier, without failing, when the classifier fails', async () => {
+    fetchSpy.mockImplementation(
+      (async () => new Response('{}', { status: 500 })) as unknown as typeof fetch
+    );
+    const deps = await run();
+    expect(sentModels()).toEqual(['sonnet']);
+    expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+      source: 'fallback',
+      routedTier: 'medium',
+      applied: false,
+      reason: 'http_error',
+    });
+    expect(bindingsOf(deps, 'node_completed')).toHaveLength(1);
+  });
+
+  it('sends the authored prompt and the redacted task, never the substituted prompt', async () => {
+    process.env.ROUTER_TEST_TOKEN = 'exact-env-credential-value';
+    try {
+      await run({
+        workflowRun: makeWorkflowRun('router-run', {
+          user_message: `${TASK} using exact-env-credential-value and DEPLOY_PASSWORD=planted-shape-secret`,
+          metadata: { inputs: { target: 'https://bot:planted-url-secret@git.example.com/x' } },
+        }),
+      });
+    } finally {
+      delete process.env.ROUTER_TEST_TOKEN;
+    }
+    const raw = String(fetchSpy.mock.calls[0][1]?.body);
+    for (const secret of [
+      'exact-env-credential-value',
+      'planted-shape-secret',
+      'planted-url-secret',
+    ]) {
+      expect(raw).not.toContain(secret);
+    }
+    expect(raw).not.toContain(API_KEY);
+    expect(sentBody().state.step).toBe('Summarise $ARGUMENTS');
+    expect(sentBody().state.task).toContain(TASK);
+    expect(sentBody().state.task).toContain('target: https://[REDACTED]@git.example.com/x');
+    // The agent itself still gets the real, unredacted task.
+    expect(mockSendQueryDag.mock.calls[0][0]).toContain('planted-shape-secret');
+  });
+
+  it('routes a command node on its command text, which its first attempt then reuses', async () => {
+    const commandFile = join(testDir, '.archon', 'commands', 'discover.md');
+    // The classifier is asked after the router has read the command. Rewriting the file
+    // at that moment shows which read each attempt used.
+    fetchSpy.mockImplementation((async () => {
+      await writeFile(commandFile, 'Rewritten after routing. Task: $ARGUMENTS');
+      return jevAnswer();
+    }) as unknown as typeof fetch);
+    let attempts = 0;
+    mockSendQueryDag.mockImplementation(async function* () {
+      attempts++;
+      if (attempts === 1) throw new Error('Claude Code crash: process exited with code 1');
+      yield* meetsContract();
+    });
+
+    await run({
+      nodes: [
+        {
+          id: 'step1',
+          kind: 'agent',
+          source: { kind: 'command', name: 'discover' },
+          model: 'medium',
+          output_format: CONTRACT,
+          retry: { max_attempts: 1, delay_ms: 1 },
+        },
+      ],
+    });
+
+    expect(sentBody().state.step).toBe(COMMAND_TEXT);
+    expect(sentModels()).toEqual(['haiku', 'haiku']);
+    // The first attempt ran the text the router read; the retry read the file again.
+    expect(mockSendQueryDag.mock.calls.map(call => call[0])).toEqual([
+      `List the checks this repository runs. Task: ${TASK}`,
+      `Rewritten after routing. Task: ${TASK}`,
+    ]);
+  });
+
+  it('sends nothing from a captured command that was changed, and the node fails as it always has', async () => {
+    const captureRoot = join(testDir, 'capture');
+    const capture = await captureWorkflowSource({ sourceRoot: testDir, captureRoot });
+    await writeFile(
+      join(captureRoot, 'project', '.archon', 'commands', 'discover.md'),
+      'tampered after capture'
+    );
+    const deps = await run({
+      workflowSourceRoots: capturedSourceRoots(capture.anchor),
+      nodes: [
+        {
+          id: 'step1',
+          kind: 'agent',
+          source: { kind: 'command', name: 'discover' },
+          model: 'medium',
+          output_format: CONTRACT,
+        },
+      ],
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(mockSendQueryDag).not.toHaveBeenCalled();
+    const failed = eventsOf(deps).find(event => event.event_type === 'node_failed');
+    expect(String(failed?.data?.error)).toContain('captured source has changed');
+    expect((failed?.data?.binding as Record<string, unknown>).route).toMatchObject({
+      source: 'fallback',
+      reason: 'step_text_unavailable',
+    });
+  });
+
+  it('leaves a missing command to fail the node as it always has', async () => {
+    const deps = await run({
+      nodes: [
+        {
+          id: 'step1',
+          kind: 'agent',
+          source: { kind: 'command', name: 'absent' },
+          model: 'medium',
+          output_format: CONTRACT,
+        },
+      ],
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    const failed = eventsOf(deps).find(event => event.event_type === 'node_failed');
+    expect(failed?.data?.failure_kind).toBe('config');
+    expect((failed?.data?.binding as Record<string, unknown>).route).toMatchObject({
+      source: 'fallback',
+      reason: 'step_text_unavailable',
+      applied: false,
+    });
+  });
+
+  it.each([
+    ['a literal model', { model: 'sonnet' }],
+    ['an @alias', { model: '@fast' }],
+    ['a tier the operator did not name', { model: 'large' }],
+    ['a named session resume', { context: { resume: 'earlier' }, depends_on: ['earlier'] }],
+    ['a session persisted across runs', { persist_session: true }],
+  ] as [string, Record<string, unknown>][])('never routes a node on %s', async (_label, fields) => {
+    const earlier = {
+      id: 'earlier',
+      kind: 'agent',
+      source: { kind: 'inline', prompt: 'first' },
+      model: 'large',
+    };
+    const needsEarlier = 'depends_on' in fields;
+    const deps = await run({
+      nodes: [...(needsEarlier ? [earlier as DagNode] : []), mediumStep(fields)],
+      aiProfile: buildAiProfile('claude', {
+        repoTiers: tiers,
+        repoAliases: { '@fast': { provider: 'claude', model: 'sonnet' } },
+      }),
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect('route' in bindingsOf(deps, 'node_started')[0]).toBe(false);
+  });
+
+  it('never routes a node another node resumes from', async () => {
+    const deps = await run({
+      nodes: [
+        mediumStep(),
+        {
+          id: 'follow',
+          kind: 'agent',
+          source: { kind: 'inline', prompt: 'continue' },
+          model: 'large',
+          depends_on: ['step1'],
+          context: { resume: 'step1' },
+        } as DagNode,
+      ],
+    });
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect('route' in bindingsOf(deps, 'node_started')[0]).toBe(false);
+  });
+
+  it('never routes a loop node, a loop_group body or an approval rework prompt', async () => {
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield { type: 'assistant', content: 'COMPLETE' };
+      yield { type: 'result', sessionId: 'dag-session-id' };
+    });
+    await run({
+      nodes: [
+        {
+          id: 'looped',
+          kind: 'loop',
+          model: 'medium',
+          loop: { prompt: 'iterate', until: 'COMPLETE', max_iterations: 1, fresh_context: true },
+        } as DagNode,
+        dagNodeSchema.parse({
+          id: 'group',
+          depends_on: ['looped'],
+          loop_group: {
+            until_bash: 'exit 0',
+            max_iterations: 1,
+            nodes: [{ id: 'body', prompt: 'Improve this', model: 'medium' }],
+          },
+        }),
+      ],
+    });
+    expect(mockSendQueryDag.mock.calls.length).toBe(2);
+
+    await run({
+      conversationId: 'conv-approval',
+      nodes: [
+        {
+          id: 'review',
+          kind: 'gate',
+          model: 'medium',
+          message: 'Approve this plan?',
+          decisions: [
+            { id: 'approve' },
+            { id: 'reject', rework: { prompt: 'Fix based on: $REJECTION_REASON', maxAttempts: 3 } },
+          ],
+          captureResponse: true,
+          decisionsAuthored: false,
+        } as DagNode,
+      ],
+      workflowRun: makeWorkflowRun('reject-resume-run', {
+        user_message: TASK,
+        metadata: {
+          approval: {
+            type: 'approval',
+            nodeId: 'review',
+            message: 'Approve this plan?',
+            onRejectPrompt: 'Fix based on: $REJECTION_REASON',
+            onRejectMaxAttempts: 3,
+          },
+          rejection_reason: 'Missing edge case handling',
+          rejection_count: 1,
+        },
+      }),
+    });
+    expect(mockSendQueryDag.mock.calls.length).toBe(3);
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it('never routes a composed fan-out instance', async () => {
+    await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'unit-block.yaml'),
+      `
+name: unit-block
+description: one agent turn per unit
+model: medium
+inputs:
+  unit:
+    required: true
+returns: check
+nodes:
+  - id: check
+    prompt: "check $INPUTS.unit"
+`
+    );
+    await writeFile(
+      join(testDir, '.archon', 'workflows', 'fan-parent.yaml'),
+      `
+name: fan-parent
+description: fans an agent body out over a list
+nodes:
+  - id: seed
+    bash: "echo '{\\"units\\":[\\"a\\",\\"b\\"]}'"
+    output_format:
+      type: object
+      properties:
+        units: { type: array, items: { type: string } }
+      required: [units]
+  - id: work
+    include: unit-block
+    depends_on: [seed]
+    fan_out:
+      items: "$seed.output.units"
+      as: unit
+      max_parallel: 1
+      join: all_success
+`
+    );
+    const discovered = await discoverWorkflows(testDir, { loadDefaults: false });
+    expect(discovered.errors).toEqual([]);
+    const parent = discovered.workflows.find(w => w.workflow.name === 'fan-parent');
+    if (!parent) throw new Error('fan-parent was not discovered');
+    const fanDeps = createMockDeps();
+    await executeDagWorkflow({
+      ...dagOptions({
+        deps: fanDeps,
+        cwd: testDir,
+        workflow: { name: 'placeholder', nodes: [] },
+        workflowRun: makeWorkflowRun('router-fan-out', { user_message: TASK }),
+        aiProfile: profile(),
+        config: routerConfig('apply'),
+      }),
+      workflow: parent.workflow,
+    });
+    expect(sentModels()).toEqual(['sonnet', 'sonnet']);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(noRouteRecorded(fanDeps)).toBe(true);
+  });
+
+  describe('a tier on another provider', () => {
+    const crossProvider = (): ReturnType<typeof buildAiProfile> =>
+      profile({ small: { provider: 'codex', model: 'gpt-mini' } });
+    const sentProviders = (): unknown[] => mockGetAgentProviderDag.mock.calls.map(call => call[0]);
+
+    beforeEach(() => {
+      mockGetAgentProviderDag.mockClear();
+    });
+
+    const follower = (dependsOn: string, fields: Record<string, unknown> = {}): DagNode =>
+      ({
+        id: 'follow',
+        kind: 'agent',
+        source: { kind: 'inline', prompt: 'continue' },
+        model: 'large',
+        depends_on: [dependsOn],
+        ...fields,
+      }) as DagNode;
+
+    it.each([
+      ['the next node', (): DagNode[] => [mediumStep(), follower('step1')]],
+      [
+        'the next agent node, across a script',
+        (): DagNode[] => [
+          mediumStep(),
+          dagNodeSchema.parse({ id: 'publish', bash: 'true', depends_on: ['step1'] }) as DagNode,
+          follower('publish'),
+        ],
+      ],
+    ] as [string, () => DagNode[]][])(
+      'is not offered to a node whose session %s may continue',
+      async (_label, nodes) => {
+        const deps = await run({ aiProfile: crossProvider(), nodes: nodes() });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(sentModels()).toEqual(['sonnet', 'opus']);
+        expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+          source: 'disabled',
+          reason: 'no_lower_tier',
+        });
+        // The follower did continue the session the unrouted node created.
+        expect(mockSendQueryDag.mock.calls[1][2]).toBe('dag-session-id');
+      }
+    );
+
+    it.each([
+      ['runs alone', (): DagNode[] => [mediumStep()]],
+      [
+        'is followed only by a script',
+        (): DagNode[] => [
+          mediumStep(),
+          dagNodeSchema.parse({ id: 'publish', bash: 'true', depends_on: ['step1'] }) as DagNode,
+        ],
+      ],
+    ] as [string, () => DagNode[]][])(
+      'is offered to a sequential node that %s, since no session can cross it',
+      async (_label, nodes) => {
+        const deps = await run({ aiProfile: crossProvider(), nodes: nodes() });
+        expect(fetchSpy).toHaveBeenCalledTimes(1);
+        expect(sentModels()).toEqual(['gpt-mini']);
+        expect(bindingsOf(deps, 'node_started')[0].provider).toBe('codex');
+      }
+    );
+
+    it('is offered to a node in a parallel layer, where no session crosses the node', async () => {
+      const deps = await run({
+        aiProfile: crossProvider(),
+        nodes: [mediumStep(), mediumStep({ id: 'step2' })],
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      expect(sentModels()).toEqual(['gpt-mini', 'gpt-mini']);
+      expect(new Set(sentProviders())).toEqual(new Set(['codex']));
+      expect(bindingsOf(deps, 'node_started')[0].provider).toBe('codex');
+    });
+
+    it('is not offered in a container run it cannot execute in', async () => {
+      const execSpy = stubMissingContainer();
+      try {
+        const deps = await run({
+          aiProfile: crossProvider(),
+          nodes: [mediumStep(), mediumStep({ id: 'step2' })],
+          execContext: { kind: 'container', containerId: 'router-container' },
+        });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(sentModels()).toEqual(['sonnet', 'sonnet']);
+        expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+          source: 'disabled',
+          reason: 'no_lower_tier',
+        });
+      } finally {
+        execSpy.mockRestore();
+      }
+    });
+
+    it('is not offered when it would ignore hooks the authored provider runs', async () => {
+      const deps = await run({
+        aiProfile: crossProvider(),
+        nodes: [
+          mediumStep({ hooks: { PreToolUse: [{ response: {} }] } }),
+          mediumStep({ id: 'step2', hooks: { PreToolUse: [{ response: {} }] } }),
+        ],
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet', 'sonnet']);
+      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({ reason: 'no_lower_tier' });
+    });
+
+    it('is not offered a schema its strict mode would reject at the first turn', async () => {
+      const output_format = {
+        type: 'object',
+        properties: { ok: { type: 'boolean' }, note: { type: 'string' } },
+        required: ['ok'],
+      };
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: '{"ok":true}' };
+        yield { type: 'result', sessionId: 'sid', structuredOutput: { ok: true } };
+      });
+      await run({
+        aiProfile: crossProvider(),
+        nodes: [mediumStep({ output_format }), mediumStep({ id: 'step2', output_format })],
+      });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet', 'sonnet']);
+    });
+  });
+
+  describe('escalation of a down-routed node', () => {
+    const output_format = {
+      type: 'object',
+      properties: { ok: { type: 'boolean' } },
+      required: ['ok'],
+    };
+    const contractNode = (fields: Record<string, unknown> = {}): DagNode =>
+      mediumStep({ output_format, retry: { max_attempts: 0 }, ...fields });
+    /** The lower tier answers in prose; the authored tier meets the node's contract. */
+    const cheapFailsContract = (): void => {
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+        if ((options as { model?: string } | undefined)?.model === 'haiku') {
+          yield { type: 'assistant', content: 'I think it is fine.' };
+          yield { type: 'result', sessionId: 'cheap-session', cost: 0.01 };
+          return;
+        }
+        yield { type: 'assistant', content: '{"ok":true}' };
+        yield {
+          type: 'result',
+          sessionId: 'ceiling-session',
+          structuredOutput: { ok: true },
+          cost: 0.2,
+        };
+      });
+    };
+    const resumeArgs = (): unknown[] => mockSendQueryDag.mock.calls.map(call => call[2]);
+
+    it('runs once more on the authored tier, in a fresh session, when the output contract fails', async () => {
+      cheapFailsContract();
+      const store = createMockStore();
+      const deps = await run({ deps: createMockDeps(store), nodes: [contractNode()] });
+
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      // The escalation never continues the failed attempt's session.
+      expect(resumeArgs()).toEqual([undefined, undefined]);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+
+      const failed = bindingsOf(deps, 'node_failed');
+      expect(failed).toHaveLength(1);
+      expect(failed[0].tier).toBe('small');
+      expect(failed[0].route).toMatchObject({ routedTier: 'small', applied: true });
+      expect((failed[0].route as Record<string, unknown>).escalatedFrom).toBeUndefined();
+
+      const [completed] = bindingsOf(deps, 'node_completed');
+      expect(completed.tier).toBe('medium');
+      expect(completed.route).toEqual({
+        mode: 'apply',
+        source: 'jev',
+        authoredTier: 'medium',
+        routedTier: 'medium',
+        applied: false,
+        chosenTier: 'small',
+        probability: 0.96,
+        confidence: 0.9,
+        riskNoul: 0.02,
+        ambiguityNoul: 0.04,
+        escalatedFrom: 'small',
+        escalationReason: 'output_contract',
+      });
+      // Both attempts were paid for.
+      expect(runUsageWrites(store).at(-1)?.total_cost_usd).toBeCloseTo(0.21, 10);
+    });
+
+    it('costs one attempt per tier under the default retry policy: a contract failure is not retried', async () => {
+      cheapFailsContract();
+      await run({ nodes: [mediumStep({ output_format })] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+    });
+
+    it('escalates once only: a failure on the authored tier fails the node', async () => {
+      mockSendQueryDag.mockImplementation(async function* () {
+        yield { type: 'assistant', content: 'still prose' };
+        yield { type: 'result', sessionId: 'sid' };
+      });
+      const deps = await run({ nodes: [contractNode()] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
+      expect(failed.map(event => event.data?.failure_kind)).toEqual([
+        'output_contract',
+        'output_contract',
+      ]);
+      expect(bindingsOf(deps, 'node_completed')).toEqual([]);
+    });
+
+    it('escalates when the lower tier fails with a provider error', async () => {
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+        if ((options as { model?: string } | undefined)?.model === 'haiku') {
+          yield {
+            type: 'result',
+            isError: true,
+            errors: ['Invalid API key'],
+            errorSubtype: 'error_during_execution',
+          };
+          return;
+        }
+        yield* meetsContract();
+      });
+      const deps = await run({ nodes: [mediumStep({ retry: { max_attempts: 0 } })] });
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      // The reason is the failure kind the engine recorded for the failed attempt,
+      // never a reading of its error text.
+      const failureKind = eventsOf(deps).find(event => event.event_type === 'node_failed')?.data
+        ?.failure_kind;
+      expect(typeof failureKind).toBe('string');
+      expect(bindingsOf(deps, 'node_completed')[0].route).toMatchObject({
+        routedTier: 'medium',
+        escalatedFrom: 'small',
+        escalationReason: failureKind,
+      });
+    });
+
+    it.each([
+      ['shadow mode, which never lowered it', routerConfig('shadow'), {}],
+      [
+        'a classifier answer that kept the authored tier',
+        routerConfig('apply'),
+        { choice: 'medium' },
+      ],
+    ] as [string, WorkflowConfig, RouterAnswer][])(
+      'does not run a node again under %s',
+      async (_label, config, answer) => {
+        fetchSpy.mockImplementation((async () => jevAnswer(answer)) as unknown as typeof fetch);
+        mockSendQueryDag.mockImplementation(async function* () {
+          yield { type: 'assistant', content: 'prose' };
+          yield { type: 'result', sessionId: 'sid' };
+        });
+        const deps = await run({ config, nodes: [contractNode()] });
+        expect(sentModels()).toEqual(['sonnet']);
+        expect(eventsOf(deps).filter(event => event.event_type === 'node_failed')).toHaveLength(1);
+      }
+    );
+
+    it('keeps the inherited session input for the escalation, never the failed attempt session', async () => {
+      const seen: { model: unknown; resume: unknown }[] = [];
+      mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, resume, options) {
+        const model = (options as { model?: string } | undefined)?.model;
+        seen.push({ model, resume });
+        if (model === 'opus') {
+          yield { type: 'assistant', content: 'first' };
+          yield { type: 'result', sessionId: 'first-session' };
+          return;
+        }
+        if (model === 'haiku') {
+          yield { type: 'assistant', content: 'prose' };
+          yield { type: 'result', sessionId: 'cheap-session' };
+          return;
+        }
+        yield { type: 'assistant', content: '{"ok":true}' };
+        yield { type: 'result', sessionId: 'ceiling-session', structuredOutput: { ok: true } };
+      });
+      await run({
+        nodes: [
+          {
+            id: 'first',
+            kind: 'agent',
+            source: { kind: 'inline', prompt: 'begin' },
+            model: 'large',
+          } as DagNode,
+          contractNode({ depends_on: ['first'] }),
+        ],
+      });
+      expect(seen).toEqual([
+        { model: 'opus', resume: undefined },
+        { model: 'haiku', resume: 'first-session' },
+        { model: 'sonnet', resume: 'first-session' },
+      ]);
+    });
+  });
+
+  it('reuses the route a failed pass recorded when the run is resumed, without classifying again', async () => {
+    const store = createMockStore();
+    const deps = createMockDeps(store);
+    const workflowRun = makeWorkflowRun('router-resume', { user_message: TASK });
+    const nodes = [mediumStep({ retry: { max_attempts: 0 } })];
+    mockSendQueryDag.mockImplementation(async function* () {
+      yield {
+        type: 'result',
+        isError: true,
+        errors: ['cancelled by test'],
+        errorSubtype: 'error_during_execution',
+      };
+    });
+    process.env.JEV_ROUTER_ENABLED = '1';
+    await run({ deps, nodes, workflowRun });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    const failedRow = store.persistWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .filter(event => event.event_type === 'node_failed')
+      .at(-1);
+    const original =
+      failedRow && readNodeRecordEvent({ ...failedRow, data: failedRow.data })?.metadata;
+    if (original === undefined) throw new Error('Expected a typed failed execution');
+    store.getDagResumeSnapshot.mockResolvedValue({
+      completedNodeOutputs: new Map(),
+      fanOutSnapshots: new Map(),
+      unresolvedNodeStarts: new Set(),
+      costUsd: 0,
+      unfinishedInvocations: new Map([[nodeInvocationKey('step1', []), original]]),
+    });
+    fetchSpy.mockClear();
+    mockSendQueryDag.mockClear();
+    mockSendQueryDag.mockImplementation(meetsContract);
+
+    await run({ deps, nodes, workflowRun, priorCompletedNodes: new Map() });
+
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(original.binding.route).toBeDefined();
+    const completed = store.persistWorkflowEvent.mock.calls
+      .map(([event]) => event)
+      .find(event => event.event_type === 'node_completed');
+    expect((completed?.data?.binding as Record<string, unknown>).route).toEqual(
+      original.binding.route
+    );
+  });
+
+  it('logs one router event for the node, with no prompt, task or key in any log line', async () => {
+    await run();
+    const routerEvents = mockLogFn.mock.calls.filter(([, message]) =>
+      String(message).startsWith('model_router.')
+    );
+    expect(routerEvents).toHaveLength(1);
+    expect(routerEvents[0][1]).toBe('model_router.decision');
+    const everything = JSON.stringify(mockLogFn.mock.calls);
+    expect(everything).not.toContain(TASK);
+    expect(everything).not.toContain('Summarise $ARGUMENTS');
+    expect(everything).not.toContain(API_KEY);
+  });
+});
+
 describe('executeDagWorkflow -- AI node prompt substitution failure', () => {
   let testDir: string;
 

@@ -112,6 +112,12 @@ workflows:
   quotaMaxAttempts: 1
   quotaDeadlineMs: 86400000
 
+# Model router — optional. Writing this block opts in; see "Model router" below.
+# modelRouter:
+#   tiers: [medium]   # authored tiers the router may lower
+#   mode: shadow      # off | shadow (record only) | apply
+#   steps: [discover-checks, sync-pr-body]   # optional: the only steps it may lower
+
 # Model tiers — optional cross-provider presets used by bundled workflows,
 # custom workflows, direct chat (`chatTier`, default `large`), and title
 # generation (`small`).
@@ -184,6 +190,7 @@ Run config accepts settings whose consumers still execute after the run is dispa
 - `worktree` and `container` already affected isolation.
 - `botName`, `chatTier`, `streaming`, `paths`, and `concurrency` are process-scoped or have no per-run consumer.
 - `recommendedWorkflows` is listing-only.
+- `modelRouter` is an operator opt-in in the install config, which a repository's config can only narrow, and one run cannot opt itself in.
 - `assistants.pi.env` and `assistants.pi.maxConcurrent` mutate process-lifetime Pi state rather than one request.
 
 Unknown keys, unregistered providers, invalid effort values, and alias names without `@` also fail instead of being ignored. CLI accepts a local path; the HTTP run API accepts inline validated content and never a caller-selected server path.
@@ -676,6 +683,27 @@ A name counts as secret when one of its parts is `PASSWORD`, `SECRET`, `TOKEN`, 
 
 Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it, and has not been measured. No agent that edits code reads the opinion itself. Its effect reaches an edit only through the cause and summary the classifying agent writes: the summary states the class the classifier chose and whether the log bore it out, and `archon-deliver` hands that summary to its CI correction step as context. The SDLC pack's README describes the paired runs that would measure it.
 
+### Model router (optional)
+
+Connection and thresholds for the [model router](#model-router). None of these turn it on: that takes a `modelRouter:` block in the config.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `JEV_API_KEY` | API key for the classifier, sent as a Bearer token. Without it the router classifies nothing and every step runs on its authored tier. | -- |
+| `JEV_ENABLED` | Set to `0` to turn the router off along with every other Jev-backed feature. The router reads it strictly: see [the switches](#model-router). | on |
+| `JEV_ROUTER_ENABLED` | Set to `0` to turn only the model router off. On when unset or empty, or at `1`, `true`, `on` or `yes` in any letter case; any other value is off. | on |
+| `JEV_API_BASE` | Base URL of the classifier. Any Jev-compatible endpoint works. | `https://api.typesafe.ai` |
+| `JEV_MODEL` | Model id sent with each request | `jev-1.13.0` |
+| `JEV_ROUTER_TIMEOUT_MS` | Longest a step waits for a route before it runs on its authored tier | `3000` |
+| `JEV_ROUTER_MIN_PROB` | The chosen tier needs at least this probability (0--1) | `0.75` |
+| `JEV_ROUTER_MIN_CONFIDENCE` | The choice needs at least this confidence (0--1) | `0.5` |
+| `JEV_ROUTER_RISK_THRESHOLD` | A "high-risk" answer at or above this keeps the authored tier (0--1) | `0.3` |
+| `JEV_ROUTER_AMBIGUITY_THRESHOLD` | An "ambiguous or multi-step" answer at or above this keeps the authored tier (0--1) | `0.5` |
+| `JEV_ROUTER_MAX_STEP_CHARS` | Most characters of the step's authored text sent per request: its opening, which says what the step is for and what it must get right, not the whole procedure | `3200` |
+| `JEV_ROUTER_MAX_TASK_CHARS` | Most characters of the run's task text sent per request | `4000` |
+
+A value that is not a usable number turns the router off rather than falling back to a default, and every route record then says which variable (`invalid_setting:<NAME>`).
+
 ### Telemetry
 
 Archon sends a few anonymous events — `archon_started` (once per CLI invocation or server boot), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals, counted as failed when the provider errors mid-turn; never message content), `workflow_invoked` (workflow start or resumed segment), `workflow_completed`/`workflow_failed`/`workflow_cancelled` (sent once when the run's final status is saved), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape (`nodes_<type>` counts, `graph_depth`, `max_fan_out`, `command_refs`, `prompt_chars_bucket`) and feature flags, `derived_from`/`derived_similarity` naming the bundled workflow a custom one was copied from (never the copy's own name), outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class and exit/cancel reason (never error text), a `run_ref` hash that joins one run's events without sending its id, deployment shape (adapter/db/auth booleans), OS/arch/version, install channel (`binary`/`docker`/`source`) and build commit, a `schema_version`, and a random install UUID stored at `$ARCHON_HOME/telemetry-id`. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.
@@ -704,7 +732,7 @@ Archon keys env loading on **directory ownership, not filename**. `.archon/` (at
 2. Load `~/.archon/.env` with `override: true` (archon config wins over shell-inherited vars).
 3. Load `<cwd>/.archon/.env` with `override: true` (repo scope wins over user scope).
 
-A repository's `<cwd>/.archon/.env` cannot set `ARCHON_HOME`, `HOME`, `USERPROFILE`, `ARCHON_DOCKER`, `WORKSPACE_PATH` or `PATH`. If it does, Archon refuses to start and names the file and the key. Those keys decide which Archon home and which executables Archon uses, so a repository could otherwise choose which plugins run. Set them in your shell, your scheduler or `~/.archon/.env` instead.
+A repository's `<cwd>/.archon/.env` cannot set `ARCHON_HOME`, `HOME`, `USERPROFILE`, `ARCHON_DOCKER`, `WORKSPACE_PATH` or `PATH`, or any key that starts with `JEV_`. If it does, Archon refuses to start and names the file and the key. The first six decide which Archon home and which executables Archon uses, so a repository could otherwise choose which plugins run. The `JEV_*` keys connect and tune the classifier behind the [model router](#model-router) and the other Jev-backed features: a repository that could set them could send your task text to an endpoint of its choosing, or loosen the thresholds that keep a step on its authored model. Set all of them in your shell, your scheduler or `~/.archon/.env` instead. The file in your Archon home is never read as a repository's, including when you run Archon from the directory that holds it.
 
 **Operator log lines** (stderr, emitted only when there is something to report):
 
@@ -722,7 +750,7 @@ The `[archon] loaded N keys from …` lines are suppressed by default (they woul
 **Which file should I use?**
 
 - **`~/.archon/.env`** — user-wide defaults (your personal `SLACK_WEBHOOK`, `DATABASE_URL`, etc.). Applies to every project.
-- **`<cwd>/.archon/.env`** — per-project overrides. Different webhook per repo, different DB per environment, etc. It cannot set `ARCHON_HOME`, `HOME`, `USERPROFILE`, `ARCHON_DOCKER`, `WORKSPACE_PATH` or `PATH`.
+- **`<cwd>/.archon/.env`** — per-project overrides. Different webhook per repo, different DB per environment, etc. It cannot set `ARCHON_HOME`, `HOME`, `USERPROFILE`, `ARCHON_DOCKER`, `WORKSPACE_PATH`, `PATH` or any `JEV_*` key.
 - **`<cwd>/.env`** — **your app's** env file. Archon does not read this file; it strips the keys at boot so they do not leak into Archon's process.
 
 ```bash
@@ -871,6 +899,140 @@ DISCORD_STREAMING_MODE=batch
 This policy is separate from per-node `retry:`. Quota exhaustion is terminal for the current attempt because retrying in the same provider window only repeats the failure. When enabled, Archon leaves the run `failed`, records the scheduled time in run metadata, and the server claims and resumes it when due. The claim is durable and bounded, so two server scans cannot launch the same attempt and an early resume failure does not create a rapid retry loop.
 
 Provider errors that include an unambiguous epoch or relative reset duration use it. Errors such as MiniMax plan exhaustion code `2056` often omit a reset time; those resume only when you configure `quotaFallbackDelayMs`. The server must be running at the due time, or it resumes the run on the first later scan.
+
+## Model router
+
+The model router decides, one workflow step at a time, whether the step can run on a cheaper [model tier](#global-configuration) than its author declared. It asks a small classifier (a Jev-compatible service) about the step and the task, and only lowers a step when the answer is confident, low-risk and unambiguous. It is optional and off until you configure it.
+
+```yaml
+# ~/.archon/config.yaml
+modelRouter:
+  tiers: [medium]
+  mode: shadow
+  steps: [discover-checks, sync-pr-body]   # optional
+```
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `tiers` | `[medium]` | The authored tiers the router may lower. A step on any other tier is never routed. |
+| `mode` | `shadow` | `off`: nothing is classified or recorded. `shadow`: each route is recorded and the step runs exactly as it would with no router. `apply`: the step runs on the routed tier. |
+| `steps` | not set | The only steps the router may lower, by [step name](#the-steps-list). Not set: every step the rules below allow. `[]`: none. |
+
+The block accepts these three keys and no others. A misspelt key (`teirs`, `mdoe`) or a value of the wrong kind is an error that names the key. In a config file that error switches the router off and is logged as `config.model_router_invalid_router_disabled`; the rest of the file (tiers, assistants, everything else) still applies. That holds for a repository's file too: an invalid block there turns the router off for that repository instead of leaving the install's setting un-narrowed. A config update through the API is rejected instead.
+
+**The install config decides.** The block in `~/.archon/config.yaml` is the operator's opt-in. A repository's `.archon/config.yaml` may carry a `modelRouter:` block too, but it can only narrow the install's: lower the mode (`apply` to `shadow` or `off`, `shadow` to `off`), remove tiers, and remove steps. It cannot switch the router on, raise the mode, add a tier, add a step, or override an install-level `mode: off`; a repository block with no install opt-in is ignored and logged. The block is not accepted in [run-scoped configuration](#run-scoped-configuration). The classifier connection and thresholds are [environment variables](#model-router-optional), and a repository's `.archon/.env` [cannot set them](#env-file-locations).
+
+With no `modelRouter:` block in the install config, with `mode: off`, with no `JEV_API_KEY`, or with a switch off, every step resolves exactly as it does without the router and no route is recorded.
+
+**The switches.** `JEV_ENABLED` and `JEV_ROUTER_ENABLED` are on when unset or empty, and at `1`, `true`, `on` or `yes` in any letter case. Any other value is off, so a typo turns the router off and never on. The context scout and the second opinion read `JEV_ENABLED` and their own switches differently: they are off only at `0` or `false`. `JEV_ENABLED=disabled` therefore turns the router off and leaves those two on. Use `0` to turn every Jev-backed feature off.
+
+### The steps list
+
+`steps` names the steps the router may lower. When it is set, every other step on a routable tier keeps its authored tier, in shadow and in apply, and its route record says `not_listed`; the classifier is not asked about it. The list only takes steps away: a listed step still has to pass every rule below.
+
+- A step that runs a command (`command: discover-checks`) is named by the command, as it is written in the workflow. One entry covers that command wherever it runs: as a step of its own workflow, and in every workflow that brings that workflow in through `include:`.
+- A step with an inline `prompt:` has no command and is named by its node id as it appears in the run. For a step brought in through `include:` that is the prefixed id, for example `deliver__validate__summary`. `archon workflow run <name> --dry-run` prints the ids.
+
+A repository's list can only remove entries. With an install list, the effective list is the entries both name; with no install list, the repository's list applies as it is. A name that matches no step is not an error and lowers nothing: `archon validate workflows` warns about it and suggests the nearest step names, and `bun run scripts/model-router-eval.ts --lowerable <tier-map> --steps a,b` shows what a list leaves lowerable in the bundled pack.
+
+**The authored tier is the ceiling.** The router keeps a step's authored tier or goes below it, never above. A step that names a literal model or an `@alias` is never routed: its author pinned one exact model. There is no workflow field for the router and no `model: auto`.
+
+### Which steps are routed
+
+Only single-shot agent steps (`prompt:` or `command:`) at the top level of a workflow, including steps a workflow brings in through `include:`. These are never routed, and get no route record:
+
+- `loop:` steps, anything inside a `loop_group:`, composed fan-out instances, and the rework prompt of an approval step;
+- a step with `context: { resume: ... }`, a step another step resumes from, and a step with `persist_session` (their provider session outlives the attempt);
+- a step whose authored tier is not listed in `tiers`.
+
+**A step is lowered only where a bad result would be caught.** Three rules hold on every provider, and the classifier is not asked about a step they exclude. The route record gives the first that applies:
+
+- `not_listed`: `steps` is set and does not name the step.
+- `read_only_node`: the step declares `mutates_checkout: false`. A lower tier that writes to such a checkout fails a run that would have succeeded, and no second attempt can undo the write.
+- `unverifiable`: the step has no `output_format`. Escalation can see one thing, a failed output contract, so without one a weak answer from a lower tier would pass unseen.
+
+In the bundled SDLC pack, the default `tiers: [medium]` puts these commands on a routable tier wherever a workflow runs them as a top-level step: `discover-checks` and `classify-red` (validate), `pr`, `sync-pr-body`, `triage`, `investigate`, `assess`, and the eight review commands. `plan` (large), `implement` (a loop) and `classify-review-scope` (already small) are not. Of those, `triage`, `investigate` and `assess` are read-only and the six review lenses declare no output contract, so none of them is ever lowered. That leaves `discover-checks`, `classify-red`, `pr`, `sync-pr-body`, `review-scope` and `review-synthesize`. Which of them can move to **another provider** depends on the rules below; `bun run scripts/model-router-eval.ts --lowerable <tier-map>` prints the answer for every step of the pack on a named tier map.
+
+### What is offered
+
+A lower tier is offered only when it has a preset of its own, differs from the authored tier's preset, and names a provider that:
+
+- is registered and usable in this run;
+- enforces the step's `output_format` as written: constrained decoding (not best effort), every property listed in `required` where the provider demands that, no open `additionalProperties` that a strict provider would silently close, and no object without `properties` (`pr: { type: object }`), which such a provider closes and then rejects. The record says `open_schema` for the last two; in the bundled pack that keeps `review-scope` off a strict provider.
+
+A tier on a **different provider** must also pass all of these:
+
+- the provider can run inside the container when the run uses one;
+- the provider honours every field the authored provider honours: `allowed_tools`/`denied_tools`, `hooks`, `mcp`, `skills`, `agents`, `effort`, `maxBudgetUsd`, `fallbackModel`, `sandbox`, `settingSources`, `betas`, injected env, and `webSearchMode`. A routed step never loses a tool restriction, a sandbox or a spend limit;
+- the step does not name another `provider:` itself;
+- no provider session can cross the step. A session only resumes on the provider that created it, so moving a step that inherits a session, or whose session a later step inherits, would silently change what that step knows. The engine reads this off the workflow's plan: a step in a parallel layer never inherits and is never inherited from; a parallel layer clears the thread; a `bash:` or `script:` step between two agent steps does **not** separate them; a `context: fresh` step does not inherit, but because it may be skipped it does not shield the steps after it. Where it cannot be shown that no session crosses a step, the step stays on its provider.
+
+If no lower tier can be offered, the classifier is not called.
+
+### What is sent off the machine
+
+One request per routed step, to `JEV_API_BASE`:
+
+- the run's task input: the message that started the run and its named inputs, up to `JEV_ROUTER_MAX_TASK_CHARS`;
+- the opening of the step's **authored** command or prompt text, before any run-time variable or upstream output is substituted into it, up to `JEV_ROUTER_MAX_STEP_CHARS`. For a step brought in through `include:` this is the prompt the loader compiled for it, in which the including workflow's `with:` inputs are already written. So the same command can send different text in two workflows: each step sends the text it runs;
+- facts computed in code: whether the step declares tool restrictions, MCP servers or skills, a `read_only_enforced` flag that is always `false` (a step that declares `mutates_checkout: false` is never asked about), and the size of the two texts. The step's id and name are not sent, and these facts are the same wherever a command runs. The authored tier is not sent either: telling the classifier which tier the author picked pulls its answer toward that tier.
+
+Before either text is sent, exact values of credentials Archon injected or holds under secret-named environment variables are removed, and text shaped like a credential is masked: `NAME=value`, `NAME: value`, JSON (plain or escaped) and `os.environ["NAME"] = "..."` forms under a secret-like name; URL query values such as `sig=`, `auth=` and `code=`; `Authorization` and bearer values; `user:password@` in URLs; PEM blocks; cookies; CLI secrets (`--password`, `curl -u user:pass`, `sshpass -p`); JWTs; webhook URLs; and common token prefixes (GitHub, GitLab, npm, Slack, Stripe, Google, SendGrid, Telegram and others). Ordinary words the risk question needs are left alone: `key: rotate the signing key`, `Session: expired`, and option names such as `-path` or `-print` are not masked. Masking runs over a bounded window of each text, so its cost does not grow with the size of a task message. If that cut leaves nothing of the task to send, the step keeps its authored tier with reason `no_task_text` instead of being classified on an empty task. Shape masking is defence in depth, not a guarantee: do not put secrets in a task message. Upstream step outputs, node-local `with:` bindings, file contents and the key are never sent, and no log line contains the step text, the task text or the key.
+
+### How a route is decided
+
+The classifier answers three questions in that one request:
+
+1. **Tier.** The smallest tier, among those offered, that can do this step well for this task. It is told to judge the thinking the step needs, not the length of its instructions. Small is collecting, listing, sorting or restating existing facts by fixed instructions; medium is engineering judgement on a clearly stated task within one part of a system; large is hard or consequential reasoning.
+2. **High-risk.** Whether the subject of the task is a sensitive area: authentication or authorization, credentials or secrets, database schemas or migrations, deleting data or files, money or billing, or a change made directly to production. A step that only reviews or describes such a change still counts. Pushing a work-in-progress branch or writing a pull-request description does not make an ordinary task sensitive.
+3. **Ambiguous or open-ended.** Whether the task leaves open what should be done: under-specified, open to more than one reading, or leaving a design decision across several parts of a system. A step whose fixed instructions list several things to do is not ambiguous for that reason.
+
+Deterministic floors then apply, risk first: either yes/no answer at or above its threshold, or a choice below the probability or confidence minimum, keeps the authored tier. So does a timeout, an HTTP error, an unreadable or out-of-range answer, and a choice that was not offered. Routing never fails or blocks a step: an error anywhere inside it leaves the step on its authored tier. The longest wait it adds is the classifier request, bounded by `JEV_ROUTER_TIMEOUT_MS`, plus a few milliseconds of local work (reading a command file once and redacting two bounded texts).
+
+### Escalation
+
+In `apply` mode, a step that ran on a lower tier and failed runs once more on its authored tier, under its own `retry:` policy. The trigger is the failure kind the engine recorded, not error text: a failed output contract (`output_contract`), or a provider error (`fatal`, `rate_limited`, `transient`, `unknown`, `timeout`). A cancelled step and a configuration fault are not escalated. Usage from both rounds is counted.
+
+The escalation attempt starts from the session the step would have started from without the router: none, or the one it inherits. It is never handed the failed attempt's own new session. On a provider that can fork a session the inherited one is untouched by the failed attempt. A provider that can only resume in place may have appended the failed attempt's turns to the inherited session, as it would for any retry.
+
+### The record
+
+Each attempt of a routed step carries a `route` object on its execution binding, in the run's node events and API:
+
+| Field | Meaning |
+| --- | --- |
+| `mode` | `shadow` or `apply` |
+| `source` | `jev` (its answer decided), `fallback` (a call was needed but gave nothing usable), `disabled` (no call was made) |
+| `authoredTier`, `routedTier` | The ceiling, and the decision |
+| `applied` | Whether this attempt actually ran on a lower tier |
+| `chosenTier`, `probability`, `confidence`, `riskNoul`, `ambiguityNoul` | The classifier's answers, kept even when a floor overrode the choice |
+| `reason` | Why the decision is the ceiling, e.g. `high_risk`, `low_confidence`, `timeout`, `no_lower_tier`, `not_listed`, `read_only_node`, `unverifiable`, `no_task_text`, `router_error` |
+| `escalatedFrom`, `escalationReason` | Set on the escalation attempt |
+
+The step's own status and failure kind are the result. A resumed or restarted run reuses the route it recorded for a step instead of classifying it again, and a step that escalated stays on its authored tier. `archon workflow run --dry-run` makes no classifier call: it reports the unrouted resolution and marks the steps the router may lower (on a routable tier, in `steps` when that is set, not read-only, and with an output contract), or says the router is inactive when it has no key or a switch is off.
+
+### Rolling it out
+
+1. Add the block with `mode: shadow` and set `JEV_API_KEY`. Runs behave as before; route records accumulate.
+2. Read the records. Look for steps routed below a tier you would not accept, and at the answers behind them; tune the thresholds.
+3. See what can move at all on your tiers: `bun run scripts/model-router-eval.ts --lowerable <tier-map>`, with `--steps a,b` to try a list. Then run the labelled evaluation: `bun --env-file="$HOME/.archon/.env" run scripts/model-router-eval.ts`, with `--map <tier-map>` to ask about every step of the pack that can move, each with the text that step sends. It must report zero under-routing.
+4. Name the steps you have read enough records for in `steps`, and switch to `mode: apply`. Widen the list as the records support it.
+
+The evaluation compares the router with hand-written labels, so a pass is a proxy for "no quality regression", not a measurement of it. The shadow records are the evidence from real workloads; a true measurement needs paired runs of the same step on both tiers.
+
+### Known limits
+
+- The default `tiers: [medium]` puts every medium single-shot step on a routable tier (see the list above). Read-only steps and steps with no output contract are recorded as `read_only_node` or `unverifiable` and never lowered; for the rest, whether one is lowered is the classifier's call on each run unless `steps` leaves it out.
+- **An output contract can be a formality.** A step is lowered when it declares a contract the provider enforces, but the contract may not be what decides whether the step did its job. In the bundled pack `pr` and `sync-pr-body` return a small status object and write an intent file that the **next** step, a script, validates. A lower tier can satisfy the status object and write a poor intent file; that fails the next step, not this one, and a failure in another step does not escalate this one. Treat such steps as verifiable in form only, and decide from shadow records whether to list them.
+- The classifier's answers vary a little between identical requests. A case that sits on a threshold can land on either side, so read thresholds from many shadow records, not from one run.
+- A lower-tier attempt that completes with a worse answer that still satisfies the step's contract is not detected. Escalation catches failures, not quality.
+- **A step moved to another provider leaves the first provider's own hooks behind.** Hooks, permission rules and guard scripts that live in a provider's user or project settings (for example a Claude Code `PreToolUse` guard in `~/.claude/settings.json`) apply to that provider's sessions only. Archon's capability checks cannot see them, so a step lowered from Claude to another provider runs without them. If you rely on such a guard, keep every tier on that provider or leave the router in shadow mode.
+- Expect modest savings. With the small tier on another provider, only a minority of the bundled pack's medium steps can be lowered at all (`--lowerable` prints the current list), and on the labelled evaluation the classifier reliably lowers only the simplest of them.
+- Escalation runs the step again, as a retry does, so a step with side effects may repeat them.
+- Escalation is a second round of attempts. A failed output contract costs one attempt on each tier. A provider error is retried under the step's `retry:` policy on the lower tier first (by default up to 3 attempts, or 6 when rate-limited) and then again on the authored tier, so in the worst case a routed step uses twice the attempts of an unrouted one.
+- When the lower tier and the authored tier share a provider, a provider-wide failure (quota, authentication) fails on both; escalation costs one more failed attempt.
+- A step is classified once per run. Changing thresholds does not re-route a run that is resumed.
+- Shadow mode still makes the classifier request, so it adds up to `JEV_ROUTER_TIMEOUT_MS` to each routed step and sends the texts described above.
 
 ## Concurrency Settings
 

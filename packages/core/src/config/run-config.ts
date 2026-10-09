@@ -74,6 +74,11 @@ const keyClassifications = {
     kind: 'unavailable',
     reason: 'recommended workflows are listing-only and have no run consumer',
   },
+  modelRouter: {
+    kind: 'unavailable',
+    reason:
+      'the model router is an operator opt-in in the install config, which a repo config can only narrow, and one run cannot opt itself in',
+  },
 } as const satisfies Record<ConfigKey, KeyClassification>;
 
 function isRecord(value: unknown): value is Record<string, unknown> {

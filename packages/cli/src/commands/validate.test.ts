@@ -21,6 +21,7 @@ const mockLoadConfig = mock(() =>
     tiers: {},
     assistants: { claude: {} },
     envVars: undefined as Record<string, string> | undefined,
+    modelRouter: undefined as { tiers: 'medium'[]; mode: 'shadow'; steps?: string[] } | undefined,
   })
 );
 
@@ -54,6 +55,7 @@ describe('validateWorkflowsCommand', () => {
       tiers: {},
       assistants: { claude: {} },
       envVars: undefined,
+      modelRouter: undefined,
     });
   });
 
@@ -68,6 +70,7 @@ describe('validateWorkflowsCommand', () => {
       tiers: {},
       assistants: { claude: { settingSources: ['user'] } },
       envVars: { CLAUDE_CONFIG_DIR: configDir },
+      modelRouter: undefined,
     });
     mockDiscoverWorkflowsWithConfig.mockResolvedValue({
       workflows: [
@@ -100,6 +103,7 @@ describe('validateWorkflowsCommand', () => {
       tiers: {},
       assistants: { claude: { settingSources: ['project'] } },
       envVars: { CLAUDE_CONFIG_DIR: configDir },
+      modelRouter: undefined,
     });
     mockDiscoverWorkflowsWithConfig.mockResolvedValue({
       workflows: [
@@ -142,6 +146,66 @@ describe('validateWorkflowsCommand', () => {
 
     expect(exitCode).toBe(1);
     expect(JSON.stringify(mockConsoleLog.mock.calls)).toContain('@custom');
+  });
+
+  test('warns about a modelRouter.steps name that matches no step, without failing validation', async () => {
+    mockLoadConfig.mockResolvedValue({
+      assistant: 'claude',
+      aliases: {},
+      tiers: {},
+      assistants: { claude: {} },
+      envVars: undefined,
+      modelRouter: { tiers: ['medium'], mode: 'shadow', steps: ['summarise', 'sumarise'] },
+    });
+    mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+      workflows: [
+        makeTestWorkflowWithSource(
+          {
+            name: 'listed-steps',
+            provider: 'claude',
+            nodes: [{ id: 'summarise', prompt: 'hello' }],
+          },
+          'project'
+        ),
+      ],
+      errors: [],
+    });
+
+    const exitCode = await validateWorkflowsCommand(validationCwd);
+
+    expect(exitCode).toBe(0);
+    const printed = JSON.stringify(mockConsoleLog.mock.calls);
+    expect(printed).toContain('WARNING [modelRouter.steps]');
+    expect(printed).toContain("is named 'sumarise'");
+    expect(printed).toContain("Did you mean: 'summarise'?");
+    expect(printed).not.toContain("is named 'summarise'");
+  });
+
+  test('says nothing about modelRouter.steps when every name matches or no list is set', async () => {
+    mockDiscoverWorkflowsWithConfig.mockResolvedValue({
+      workflows: [
+        makeTestWorkflowWithSource(
+          {
+            name: 'listed-steps',
+            provider: 'claude',
+            nodes: [{ id: 'summarise', prompt: 'hello' }],
+          },
+          'project'
+        ),
+      ],
+      errors: [],
+    });
+    expect(await validateWorkflowsCommand(validationCwd)).toBe(0);
+    mockLoadConfig.mockResolvedValue({
+      assistant: 'claude',
+      aliases: {},
+      tiers: {},
+      assistants: { claude: {} },
+      envVars: undefined,
+      modelRouter: { tiers: ['medium'], mode: 'shadow', steps: ['summarise'] },
+    });
+    expect(await validateWorkflowsCommand(validationCwd)).toBe(0);
+    expect(JSON.stringify(mockConsoleLog.mock.calls)).not.toContain('modelRouter.steps');
   });
 
   afterEach(async () => {

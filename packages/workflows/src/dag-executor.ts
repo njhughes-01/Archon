@@ -169,6 +169,11 @@ import {
   type IncludeCommandContent,
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
+import { providerReadsWebSearchMode, unsupportedNodeFields } from './node-capability-checks';
+import { collectCredentialValues, redactCredentialValues } from './redaction';
+import { escalateRoute, escalationReason } from './jev/model-router';
+import { executorModelScope, routeNodeModel } from './node-model-routing';
+import type { ModelRouterConfig, NodeRoute } from './schemas/model-router';
 import {
   logNodeComplete,
   logAssistant,
@@ -1136,6 +1141,26 @@ async function runNodeRetryLoop(
 }
 
 /**
+ * Add the usage of an earlier, separate round of attempts to a later round's result. Each
+ * {@link runNodeRetryLoop} call totals only its own attempts, so a node that ran two rounds
+ * (a lower model tier, then its authored one) would otherwise report only the second.
+ */
+function addEarlierUsage(
+  output: NodeExecutionResult,
+  earlier: NodeExecutionResult,
+  nodeId: string
+): NodeExecutionResult {
+  if (earlier.costUsd !== undefined) output.costUsd = (output.costUsd ?? 0) + earlier.costUsd;
+  if (earlier.tokens !== undefined) {
+    output.tokens = sumTokenUsage(
+      [earlier.tokens, ...(output.tokens !== undefined ? [output.tokens] : [])],
+      { nodeId }
+    );
+  }
+  return output;
+}
+
+/**
  * Run a deterministic (bash/script) node with opt-in retry.
  *
  * Deterministic nodes get exactly one attempt unless they declare an explicit
@@ -1638,15 +1663,7 @@ async function resolveNodeProviderAndModel(
   // do: warn the user, throw, and build provider options.
   const resolution = resolveNodeModel(
     node,
-    {
-      provider: workflowProvider,
-      model: workflowModel,
-      preset: workflowPreset,
-      tier: workflowLevelOptions.workflowTier,
-      effort: workflowLevelOptions.effort,
-      // Only used to LABEL an inherited provider in a dry run; the executor discards it.
-      providerOrigin: 'workflow',
-    },
+    executorModelScope(workflowProvider, workflowModel, workflowPreset, workflowLevelOptions),
     assistantModelDefaults(config),
     aiProfile
   );
@@ -1691,15 +1708,10 @@ async function resolveNodeProviderAndModel(
   // Get provider capabilities for capability warnings (static lookup, no instantiation)
   const caps = getProviderCapabilities(provider);
 
-  // `webSearchMode:` is Codex's alone — no other provider reads it, and #2556
-  // decided it keeps no node-level form, making it the single workflow-level
-  // field with no per-node counterpart. There is deliberately no
-  // ProviderCapabilities axis for one provider's one field.
-  //
-  // Reasoning depth is NOT in this category any more: the loader translates the
-  // deprecated `modelReasoningEffort:` into `effort:`, so the executor sees one
-  // provider-agnostic field and needs no Codex branch for it.
-  const isCodex = provider === 'codex';
+  // Reasoning depth needs no provider branch: the loader translates the deprecated
+  // `modelReasoningEffort:` into `effort:`, so the executor sees one provider-agnostic
+  // field. `webSearchMode:` is the one field that still does.
+  const readsWebSearchMode = providerReadsWebSearchMode(provider);
 
   // The one reasoning depth this node will run at, before any preset fallback.
   const declaredEffort = resolution.declaredEffort;
@@ -1716,43 +1728,15 @@ async function resolveNodeProviderAndModel(
     );
   }
 
-  // Capability warnings — inform users when features are unsupported
-  const capChecks: [string, keyof ProviderCapabilities, boolean][] = [
-    [
-      'allowed_tools/denied_tools',
-      'toolRestrictions',
-      node.allowed_tools !== undefined || node.denied_tools !== undefined,
-    ],
-    ['hooks', 'hooks', node.hooks !== undefined],
-    ['mcp', 'mcp', node.mcp !== undefined],
-    ['skills', 'skills', node.skills !== undefined && node.skills.length > 0],
-    ['agents', 'agents', node.agents !== undefined],
-    ['effort', 'effortControl', declaredEffort !== undefined],
-    ['maxBudgetUsd', 'costControl', node.maxBudgetUsd !== undefined],
-    [
-      'fallbackModel',
-      'fallbackModel',
-      (node.fallbackModel ?? workflowLevelOptions.fallbackModel) !== undefined,
-    ],
-    ['sandbox', 'sandbox', (node.sandbox ?? workflowLevelOptions.sandbox) !== undefined],
-    ['settingSources', 'settingSources', node.settingSources !== undefined],
-    ['env', 'envInjection', (config.envVars && Object.keys(config.envVars).length > 0) === true],
-  ];
-
-  const unsupported: string[] = [];
-  for (const [field, cap, isSet] of capChecks) {
-    if (isSet && !caps[cap]) {
-      unsupported.push(field);
-    }
-  }
-
-  // `webSearchMode` has no ProviderCapabilities axis, so capChecks above cannot
-  // see it. Surfacing it here reuses the existing loud-mismatch path so a
-  // workflow that declares it on a node that cannot read it gets the same
-  // warning every other capability mismatch produces, instead of a silent no-op.
-  if (!isCodex && workflowLevelOptions.webSearchMode !== undefined) {
-    unsupported.push('webSearchMode');
-  }
+  // Capability warnings — inform users when features are unsupported. The list lives in
+  // node-capability-checks.ts, which the model router also reads.
+  const unsupported = unsupportedNodeFields(node, provider, caps, {
+    declaredEffort,
+    workflowFallbackModel: workflowLevelOptions.fallbackModel,
+    workflowSandbox: workflowLevelOptions.sandbox,
+    webSearchMode: workflowLevelOptions.webSearchMode,
+    hasEnvVars: (config.envVars && Object.keys(config.envVars).length > 0) === true,
+  });
 
   if (unsupported.length > 0) {
     getLog().warn({ nodeId: node.id, provider, unsupported }, 'dag.unsupported_capabilities');
@@ -1839,7 +1823,7 @@ async function resolveNodeProviderAndModel(
   applyPresetOptions(provider, effectivePreset, node, declaredEffort, nodeConfig);
   // `webSearchMode:` has no node-level form and no other consumer, so the
   // workflow-level value is the only value — written only where it is read.
-  if (isCodex && workflowLevelOptions.webSearchMode !== undefined) {
+  if (readsWebSearchMode && workflowLevelOptions.webSearchMode !== undefined) {
     assistantConfig.webSearchMode = workflowLevelOptions.webSearchMode;
   }
 
@@ -2047,6 +2031,7 @@ function beginExecution(
     path: ctx.stepNamePrefix + node.id,
     node,
     invocation,
+    ...(ctx.nodeRoute !== undefined ? { route: ctx.nodeRoute } : {}),
     ...options,
   });
   ctx.currentExecution = execution;
@@ -2173,13 +2158,20 @@ async function executeNodeInternal(
   let rawPrompt: string;
   if (commandName !== undefined) {
     await assertWorkflowSourceIntegrity(workflowSourceRoots);
-    const promptResult = await loadCommandPrompt(
-      deps,
-      cwd,
-      commandName,
-      configuredCommandFolder,
-      workflowSourceRoots
-    );
+    // The model router loaded this text moments ago to classify the node. The first
+    // attempt takes that copy rather than reading the file again; a later attempt reloads.
+    const routedCommandText = ctx.routedCommandText;
+    ctx.routedCommandText = undefined;
+    const promptResult =
+      routedCommandText !== undefined
+        ? { success: true as const, content: routedCommandText }
+        : await loadCommandPrompt(
+            deps,
+            cwd,
+            commandName,
+            configuredCommandFolder,
+            workflowSourceRoots
+          );
     if (!promptResult.success) {
       const errMsg = promptResult.message;
       getLog().error({ nodeId: node.id, error: errMsg }, 'dag_node_command_load_failed');
@@ -3300,36 +3292,6 @@ function isSubprocessTimeout(error: RawSubprocessRejection): boolean {
   return error.killed === true && error.code === null;
 }
 
-const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
-const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
-
-function collectSubprocessCredentialValues(
-  env: NodeJS.ProcessEnv,
-  protectedEnvKeys: readonly string[] | undefined,
-  protectedCredentialValues: readonly string[] | undefined
-): string[] {
-  const explicitlyProtected = new Set(protectedEnvKeys);
-  const values = Object.entries(env).flatMap(([key, value]) =>
-    value &&
-    (explicitlyProtected.has(key) ||
-      CREDENTIAL_ENV_KEYS.has(key) ||
-      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
-      ? [value]
-      : []
-  );
-  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
-    .filter(value => value.length > 0)
-    .sort((a, b) => b.length - a.length);
-}
-
-function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
-  let result = input;
-  for (const value of credentialValues) {
-    result = result.replaceAll(value, '[REDACTED]');
-  }
-  return result;
-}
-
 /**
  * Scrub credentials from every subprocess rejection field that can carry
  * subprocess text. The exact values come from the engine's injected-credential
@@ -3409,7 +3371,7 @@ async function runSubprocess(
   // Both outcomes redact against the same values, so the credential set is resolved
   // once here rather than separately per path — a success path that redacted less than
   // the failure path would be the security hole, not a style difference.
-  const credentialValues = collectSubprocessCredentialValues(
+  const credentialValues = collectCredentialValues(
     subprocessEnv,
     options.protectedEnvKeys,
     options.protectedCredentialValues
@@ -9590,6 +9552,16 @@ interface RunDerived {
 interface RunLayersContext extends RunInputs, RunDerived {
   /** One node dispatch, shared by its inner retry attempts. Never mutate the parent context. */
   nodeInvocation?: NodeInvocation;
+  /** The model router's decision for this dispatch; stamped on every attempt it starts. */
+  nodeRoute?: NodeRoute;
+  /** Command text the model router loaded for this dispatch, taken by its first attempt. */
+  routedCommandText?: string;
+  /**
+   * The operator's model-router opt-in. Set only by the top-level DAG: a loop_group body
+   * and a composed fan-out instance build their contexts field by field without it, so a
+   * context kind added later routes nothing until it opts in.
+   */
+  modelRouter?: ModelRouterConfig;
   /** Last captured attempt for this isolated dispatch; unexpected failures retain its attribution. */
   currentExecution?: NodeExecutionRecord;
   unfinishedInvocations?: DagResumeSnapshot['unfinishedInvocations'];
@@ -9841,13 +9813,14 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
     const nodeThunks = layer.map(
       (node): (() => Promise<LayerNodeResult>) =>
         async (): Promise<LayerNodeResult> => {
+          const unfinishedAttempt = parentCtx.unfinishedInvocations?.get(
+            nodeInvocationKey(parentCtx.stepNamePrefix + node.id, parentCtx.loopGroupPath)
+          );
           const ctx: RunLayersContext = {
             ...parentCtx,
             currentExecution: undefined,
             nodeInvocation:
-              parentCtx.unfinishedInvocations?.get(
-                nodeInvocationKey(parentCtx.stepNamePrefix + node.id, parentCtx.loopGroupPath)
-              )?.invocation ?? newNodeInvocation(parentCtx.loopGroupPath),
+              unfinishedAttempt?.invocation ?? newNodeInvocation(parentCtx.loopGroupPath),
           };
           try {
             const checkpointSessionForProvider = (
@@ -10396,28 +10369,58 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
               ctx.artifactsDir,
               ctx.workflowRun.id
             );
-            const {
-              provider,
-              model: resolvedNodeModel,
-              options: nodeOptions,
-              tier: resolvedTier,
-              effort: resolvedEffort,
-            } = await resolveNodeProviderAndModel(
-              node,
-              ctx.workflowProvider,
-              ctx.workflowModel,
-              ctx.config,
-              ctx.platform,
-              ctx.conversationId,
-              ctx.workflowRun.id,
-              ctx.cwd,
-              ctx.workflowLevelOptions,
-              ctx.aiProfile,
-              ctx.workflowPreset,
-              resolveAiConfigText,
-              ctx.warnedProviderConflicts,
-              ctx.execContext
-            );
+            // A resumed or restarted run reuses the route its earlier pass recorded for
+            // this node: the unfinished attempt's, or the completion's when the node is
+            // being run again.
+            let routed: Awaited<ReturnType<typeof routeNodeModel>>;
+            try {
+              routed =
+                ctx.modelRouter !== undefined
+                  ? await routeNodeModel(ctx, node, ctx.modelRouter, {
+                      layerIndex: layerIdx,
+                      usesPersistedScope: nodeUsesPersistedScope(node, ctx.workflowPersistSessions),
+                      runInputs: resolveRunInputs(ctx.workflowRun),
+                      recorded:
+                        unfinishedAttempt?.binding.route ??
+                        ctx.priorCompletedNodes?.get(node.id)?.execution?.binding.route,
+                    })
+                  : undefined;
+            } catch (error) {
+              // Routing is advice and must never be why a node fails. The router records
+              // its own failures as a fallback route; anything that escapes it leaves the
+              // node unrouted, exactly as with no router.
+              getLog().warn(
+                { nodeId: node.id, errorName: error instanceof Error ? error.name : 'unknown' },
+                'model_router.failed_unrouted'
+              );
+              routed = undefined;
+            }
+            ctx.nodeRoute = routed?.route;
+            ctx.routedCommandText = node.source.kind === 'command' ? routed?.stepText : undefined;
+            // An applied route resolves exactly as if the author had written the lower tier.
+            const routedNode: AgentNode =
+              routed?.route.applied === true ? { ...node, model: routed.route.routedTier } : node;
+            const resolveBinding = (
+              target: AgentNode
+            ): ReturnType<typeof resolveNodeProviderAndModel> =>
+              resolveNodeProviderAndModel(
+                target,
+                ctx.workflowProvider,
+                ctx.workflowModel,
+                ctx.config,
+                ctx.platform,
+                ctx.conversationId,
+                ctx.workflowRun.id,
+                ctx.cwd,
+                ctx.workflowLevelOptions,
+                ctx.aiProfile,
+                ctx.workflowPreset,
+                resolveAiConfigText,
+                ctx.warnedProviderConflicts,
+                ctx.execContext
+              );
+            const binding = await resolveBinding(routedNode);
+            const { provider } = binding;
 
             // 5. Determine session. An explicit named ancestor has first priority and
             // is independent of the ambient sequential cursor and parallel-layer reset.
@@ -10578,40 +10581,90 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
               node.mutates_checkout === false
                 ? await snapshotCheckout(ctx.cwd, checkoutExcludes)
                 : undefined;
-            const retriedOutput = await runNodeRetryLoop(
-              node,
-              ctx.platform,
-              ctx.conversationId,
-              ctx.workflowRun,
-              getEffectiveNodeRetryConfig(node),
-              async () => {
-                // Fresh per attempt: an attempt after a transient failure observes
-                // artifacts published in the interval, and never reuses the
-                // listing handed to AI-configuration substitution above.
-                const attemptTypedArtifactsFile = await writeNodeArtifactsListing(
-                  ctx.artifactsDir,
-                  ctx.workflowRun.id
-                );
-                return executeNodeInternal(
-                  ctx,
-                  node,
-                  provider,
-                  nodeOptions,
-                  // Always pass the prior session ID. executeNodeInternal requests a fork,
-                  // but legacy resume-only providers may continue in place; named resume
-                  // separately capability-gates and verifies an exact fork.
-                  resumeSessionId,
-                  resolvedNodeModel,
-                  resolvedTier,
-                  resolvedEffort,
-                  ctx.stepNamePrefix,
-                  iteration,
-                  checkpointSessionForProvider(provider),
-                  attemptTypedArtifactsFile
-                );
-              },
-              { state: 'failed', output: '', error: 'Node did not execute' } as NodeExecutionResult
-            );
+            const runOnBinding = (
+              attemptBinding: typeof binding,
+              attemptResumeSessionId: string | undefined
+            ): Promise<NodeExecutionResult> =>
+              runNodeRetryLoop(
+                node,
+                ctx.platform,
+                ctx.conversationId,
+                ctx.workflowRun,
+                getEffectiveNodeRetryConfig(node),
+                async () => {
+                  // Fresh per attempt: an attempt after a transient failure observes
+                  // artifacts published in the interval, and never reuses the
+                  // listing handed to AI-configuration substitution above.
+                  const attemptTypedArtifactsFile = await writeNodeArtifactsListing(
+                    ctx.artifactsDir,
+                    ctx.workflowRun.id
+                  );
+                  return executeNodeInternal(
+                    ctx,
+                    node,
+                    attemptBinding.provider,
+                    attemptBinding.options,
+                    // Always pass the prior session ID. executeNodeInternal requests a fork,
+                    // but legacy resume-only providers may continue in place; named resume
+                    // separately capability-gates and verifies an exact fork.
+                    attemptResumeSessionId,
+                    attemptBinding.model,
+                    attemptBinding.tier,
+                    attemptBinding.effort,
+                    ctx.stepNamePrefix,
+                    iteration,
+                    checkpointSessionForProvider(attemptBinding.provider),
+                    attemptTypedArtifactsFile
+                  );
+                },
+                {
+                  state: 'failed',
+                  output: '',
+                  error: 'Node did not execute',
+                } as NodeExecutionResult
+              );
+            let retriedOutput = await runOnBinding(binding, resumeSessionId);
+            // The provider whose session this node hands on: the one that ran last.
+            let sessionProvider = provider;
+
+            // Model-router escalation. A node the router ran on a lower tier, whose
+            // attempts there ended in a failure of a kind `escalationReason` names, runs
+            // once more exactly as it would have with no router: the authored tier, its
+            // own retry policy, and the session input the node started from, never the
+            // failed attempt's own new session. The `mutates_checkout` assertion below is
+            // never about a lower tier: a node that declares it is never lowered.
+            const lowerTierRoute = ctx.nodeRoute;
+            const escalation = escalationReason(lowerTierRoute, retriedOutput);
+            if (lowerTierRoute !== undefined && escalation !== undefined) {
+              const lowerTierOutput = retriedOutput;
+              ctx.nodeRoute = escalateRoute(lowerTierRoute, escalation);
+              getLog().warn(
+                {
+                  nodeId: node.id,
+                  escalatedFrom: lowerTierRoute.routedTier,
+                  authoredTier: lowerTierRoute.authoredTier,
+                  escalationReason: escalation,
+                },
+                'model_router.escalated'
+              );
+              await safeSendMessage(
+                ctx.platform,
+                ctx.conversationId,
+                `⚠️ Node \`${node.id}\` failed on the \`${lowerTierRoute.routedTier}\` tier (${escalation}). Running it once more on its authored \`${lowerTierRoute.authoredTier}\` tier.`,
+                { workflowId: ctx.workflowRun.id, nodeName: node.id }
+              );
+              const ceilingBinding = await resolveBinding(node);
+              sessionProvider = ceilingBinding.provider;
+              retriedOutput = addEarlierUsage(
+                await runOnBinding(
+                  ceilingBinding,
+                  // A session resumes only on the provider that created it.
+                  ceilingBinding.provider === provider ? resumeSessionId : undefined
+                ),
+                lowerTierOutput,
+                node.id
+              );
+            }
             const output = await assertCheckoutUntouched(
               node,
               ctx.cwd,
@@ -10718,7 +10771,7 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
               }
             }
 
-            return { nodeId: node.id, output, sessionProvider: provider };
+            return { nodeId: node.id, output, sessionProvider };
           } catch (error) {
             // This dispatch boundary also owns provider/binding preparation failures.
             // Durable-write rejection must reach run recovery without becoming a node outcome.
@@ -11709,6 +11762,10 @@ export async function executeDagWorkflow(
       : (await deps.store.getDagResumeSnapshot(workflowRun.id)).unfinishedInvocations;
   const runCtx: RunLayersContext = {
     unfinishedInvocations,
+    // `off` is the operator's explicit switch: nothing is classified and nothing recorded.
+    ...(config.modelRouter !== undefined && config.modelRouter.mode !== 'off'
+      ? { modelRouter: config.modelRouter }
+      : {}),
     deps,
     platform,
     conversationId,
