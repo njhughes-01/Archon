@@ -1,0 +1,10 @@
+$ cargo build --release && cargo test --release
+   Compiling regex-automata v0.4.7
+   Compiling serde_json v1.0.120
+   Compiling indexer v0.8.0 (/workspace)
+error: failed to write /workspace/target/release/deps/libregex_automata-2c41be7f0a55d1e3.rmeta: No space left on device (os error 28)
+
+error: could not compile `regex-automata` (lib) due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: failed to write /workspace/target/release/deps/serde_json-9d0c5a61b2f3e847.d: No space left on device (os error 28)
+error: could not compile `serde_json` (lib) due to 1 previous error

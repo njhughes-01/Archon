@@ -45,6 +45,15 @@ review__publish:
   report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
 validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], quarantine: [], notes: "stub: the project's aggregate gate" }
 validate__run: { status: red, summary: "stub: a check in the project gate failed" }
+# The classifier called this a defect in the code, and was sure of it. The opinion is
+# advisory: the gate reads the agent's evidenced `inherited` and passes it all the same.
+validate__failure-class:
+  status: ok
+  reason: ""
+  choice: code_defect
+  probabilities: { code_defect: 0.97, flaky_test: 0.01, dependency_failure: 0.01, environment_failure: 0.01 }
+  confidence: 0.97
+  advisory: true
 validate__classify:
   red_cause: inherited
   summary: "stub: the same inherited break, still red on the base"

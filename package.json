@@ -33,6 +33,7 @@
     "lens-yield": "bun run scripts/lens-yield.ts",
     "scout-eval": "bun run scripts/context-scout-eval.ts",
     "tool-gate-eval": "bun run scripts/tool-gate-eval.ts",
+    "second-opinion-eval": "bun run scripts/second-opinion-eval.ts",
     "test:install": "bash scripts/test-install.sh",
     "test": "bun run scripts/repo-tests.ts",
     "test:watch": "bun --filter @archon/server test:watch",
@@ -46,6 +47,7 @@
     "dev:docs": "bun --filter @archon/docs-web dev",
     "build:docs": "bun --filter @archon/docs-web build",
     "validate": "bun run scripts/validate.ts",
+    "router-eval": "bun run scripts/model-router-eval.ts",
     "prepare": "husky",
     "setup-auth": "bun --filter @archon/server setup-auth",
     "check:cli-import-boundary": "bun run scripts/check-cli-import-boundary.ts"

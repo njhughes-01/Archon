@@ -72,6 +72,9 @@ publish-pr-body: {}
 sync-pr-body: { intent: "/fixture/pr-body-intent.json" }
 validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], quarantine: [], notes: "stub: the project's aggregate gate" }
 validate__run: { status: red, summary: "stub: a check in the project gate failed" }
+# No classifier configured: the second opinion says so and sends nothing. Stubbed
+# because a fixture run inherits the operator's environment.
+validate__failure-class: { status: unavailable, reason: no_api_key, choice: null, probabilities: {}, confidence: null, advisory: true }
 validate__classify:
   red_cause: inherited
   summary: "stub: the same inherited lint break, still red on the base"

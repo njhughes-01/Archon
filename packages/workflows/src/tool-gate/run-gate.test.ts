@@ -18,6 +18,7 @@ import {
   createRunToolGate,
   emptyToolGateRoot,
   providerHonoursToolGate,
+  providersUsableUnderToolGate,
   workflowToolGateRecorder,
   type RunToolGateInput,
 } from './run-gate';
@@ -378,6 +379,21 @@ describe('assertProviderHonoursToolGate', () => {
     expect(() => {
       assertProviderHonoursToolGate(ON, 'some-provider', capabilities);
     }).toThrow(/provider 'some-provider'.*toolActionGate/s);
+  });
+
+  test('the router is offered only providers the gate can check, and every provider with the gate off', () => {
+    const capabilities = (provider: string): { toolActionGate?: boolean } =>
+      provider === 'gated'
+        ? { toolActionGate: true }
+        : provider === 'refuses'
+          ? { toolActionGate: false }
+          : {};
+    const gateOn = providersUsableUnderToolGate(ON, capabilities);
+    expect(['gated', 'refuses', 'silent'].map(gateOn)).toEqual([true, false, false]);
+    const gateOff = providersUsableUnderToolGate({ ...ON, enabled: false }, capabilities);
+    expect(['gated', 'refuses', 'silent'].map(gateOff)).toEqual([true, true, true]);
+    const noConfig = providersUsableUnderToolGate(undefined, capabilities);
+    expect(['gated', 'refuses', 'silent'].map(noConfig)).toEqual([true, true, true]);
   });
 
   test('providerHonoursToolGate answers the same question without throwing', () => {

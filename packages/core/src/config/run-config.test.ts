@@ -90,6 +90,7 @@ describe('workflow run config', () => {
       'paths',
       'concurrency',
       'recommendedWorkflows',
+      'modelRouter',
     ]) {
       expect(() =>
         parseWorkflowRunConfig({ [key]: {} }, { kind: 'http', label: 'inline' })

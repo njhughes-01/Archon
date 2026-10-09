@@ -1,0 +1,17 @@
+$ npx jest --ci
+PASS src/render/layout.test.ts
+PASS src/render/fonts.test.ts
+
+ RUNS  src/render/pdf-pages.test.ts
+A jest worker process (pid=48213) was terminated by another process: signal=SIGKILL, exitCode=null. Operating system logs may contain more information on why this occurred.
+
+ FAIL  src/render/pdf-pages.test.ts
+  ● Test suite failed to run
+
+    A jest worker process (pid=48213) was terminated by another process: signal=SIGKILL, exitCode=null. Operating system logs may contain more information on why this occurred.
+
+      at ChildProcessWorker._onExit (node_modules/jest-worker/build/workers/ChildProcessWorker.js:370:23)
+
+Test Suites: 1 failed, 2 passed, 3 total
+Tests:       31 passed, 31 total
+Time:        48.2 s

@@ -13,6 +13,7 @@ import {
 } from './dag-node';
 import { effortLevelSchema } from './effort';
 import { tierNameSchema } from './model-binding';
+import { nodeRouteSchema } from './model-router';
 import { nodeSkipReasonSchema, skipCauseSchema, suspendReasonSchema } from './node-state';
 import { checkoutObservationSchema } from './checkout-observation';
 
@@ -85,6 +86,11 @@ export const executionBindingSchema = z.object({
   effort: effortLevelSchema.optional(),
   sessionPreview: z.string().max(8).optional(),
   sessionOrigin: z.enum(['fresh', 'resumed', 'resume-failed-cold']).optional(),
+  /**
+   * The model router's decision for this attempt. Absent whenever the router did not
+   * consider the node, so records written with no router configured are unchanged.
+   */
+  route: nodeRouteSchema.optional(),
 });
 export type ExecutionBinding = z.infer<typeof executionBindingSchema>;
 

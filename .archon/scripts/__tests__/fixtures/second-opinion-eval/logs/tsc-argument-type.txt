@@ -1,0 +1,13 @@
+$ bun run type-check
+$ tsc --noEmit -p tsconfig.json
+src/orders/refund.ts(42,31): error TS2345: Argument of type 'string | undefined' is not assignable to parameter of type 'string'.
+  Type 'undefined' is not assignable to type 'string'.
+src/orders/refund.ts(57,5): error TS2322: Type 'number' is not assignable to type 'Money'.
+src/orders/refund.test.ts(12,24): error TS2554: Expected 2 arguments, but got 1.
+
+Found 3 errors in 2 files.
+
+Errors  Files
+     2  src/orders/refund.ts:42
+     1  src/orders/refund.test.ts:12
+error: script "type-check" exited with code 2

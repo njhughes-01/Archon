@@ -3,3 +3,6 @@
 // (enforced by scripts/bun-test-command.test.ts); the runners also pass it via
 // bunTestEnv. A test that covers telemetry re-enables it in its own child env.
 process.env.ARCHON_TELEMETRY_DISABLED ??= '1';
+// Same reason, same two paths (see bunTestEnv): tests never call the model router's
+// classifier. Only the router's own switch is touched, so other Jev features are unaffected.
+process.env.JEV_ROUTER_ENABLED = '0';

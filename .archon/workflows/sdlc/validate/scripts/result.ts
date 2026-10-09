@@ -12,6 +12,12 @@ const classification = JSON.parse(text(process.env.INPUTS_CLASSIFICATION)) as {
   red_cause: 'introduced' | 'inherited' | 'environment';
   summary: string;
 } | null;
+// Null when `failure-class` was skipped. Advisory: it is carried beside the verdict
+// below and never read to decide one.
+const opinion = JSON.parse(text(process.env.INPUTS_OPINION)) as {
+  status: 'ok' | 'unavailable';
+  choice: string | null;
+} | null;
 
 if (comparison !== null) {
   if (run !== null || classification !== null) {
@@ -34,6 +40,9 @@ if (comparison !== null) {
     red_cause: classification.red_cause,
     summary: classification.summary,
     evidence: null,
+    // Present only when a classifier answered. The field's name carries the warning,
+    // because a reader of the typed artifact sees the value without this comment.
+    ...(opinion?.status === 'ok' ? { advisory_failure_class: opinion.choice } : {}),
   });
 } else {
   emit({

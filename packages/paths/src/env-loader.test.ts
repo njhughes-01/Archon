@@ -244,6 +244,81 @@ describe('loadArchonEnv', () => {
     });
   }
 
+  for (const line of [
+    'JEV_API_BASE=https://classifier.example.net',
+    'JEV_API_KEY=repo-supplied',
+    'JEV_ROUTER_MIN_PROB=0',
+    'JEV_ROUTER_ENABLED=1',
+    'JEV_SOMETHING_NEW=1',
+  ]) {
+    const key = line.slice(0, line.indexOf('='));
+    it(`refuses a repo .archon/.env that sets ${key}: a repository must not repoint or retune the classifier`, () => {
+      const repoEnv = join(repoDir, '.archon', '.env');
+      writeFileSync(repoEnv, `TEST_EL_REPO_ONLY=from-repo\n${line}\n`);
+      const before = process.env[key];
+      const errors: string[] = [];
+      const errorSpy = spyOn(console, 'error').mockImplementation((msg: unknown) => {
+        errors.push(String(msg));
+      });
+      const exitSpy = spyOn(process, 'exit').mockImplementation((() => {
+        throw new Error('process.exit called');
+      }) as never);
+      try {
+        expect(() => loadArchonEnv(repoDir)).toThrow('process.exit called');
+        expect(errors.join('\n')).toContain(`${repoEnv} sets ${key}`);
+        expect(errors.join('\n')).toContain('JEV_*');
+        // Refused before anything from the file is applied.
+        expect(process.env[key]).toBe(before);
+        expect(process.env.TEST_EL_REPO_ONLY).toBeUndefined();
+      } finally {
+        errorSpy.mockRestore();
+        exitSpy.mockRestore();
+      }
+    });
+  }
+
+  it('lets the user-scope .env set the JEV_ keys a repo may not, and a repo set keys that only look similar', () => {
+    const before = process.env.JEV_API_BASE;
+    writeFileSync(join(archonHomeDir, '.env'), 'JEV_API_BASE=https://operator.example.net\n');
+    writeFileSync(join(repoDir, '.archon', '.env'), 'TEST_EL_REPO_ONLY=from-repo\nMY_JEV_NOTE=x\n');
+    try {
+      loadArchonEnv(repoDir);
+      expect(process.env.JEV_API_BASE).toBe('https://operator.example.net');
+      expect(process.env.TEST_EL_REPO_ONLY).toBe('from-repo');
+    } finally {
+      if (before === undefined) delete process.env.JEV_API_BASE;
+      else process.env.JEV_API_BASE = before;
+      delete process.env.MY_JEV_NOTE;
+    }
+  });
+
+  it("does not treat the operator's own env file as a repository's when Archon runs from the directory holding its home", () => {
+    // `cd ~ && archon ...`: <cwd>/.archon/.env is ~/.archon/.env, where the JEV_ keys belong.
+    const before = process.env.JEV_API_BASE;
+    process.env.ARCHON_HOME = join(repoDir, '.archon');
+    process.env.ARCHON_VERBOSE_BOOT = '1';
+    writeFileSync(
+      join(repoDir, '.archon', '.env'),
+      'TEST_EL_HOME_ONLY=from-home\nJEV_API_BASE=https://operator.example.net\n'
+    );
+    const exitSpy = spyOn(process, 'exit').mockImplementation((() => {
+      throw new Error('process.exit called');
+    }) as never);
+    try {
+      loadArchonEnv(repoDir);
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(process.env.JEV_API_BASE).toBe('https://operator.example.net');
+      expect(process.env.TEST_EL_HOME_ONLY).toBe('from-home');
+      // Loaded once, as the user scope.
+      expect(homeScopeLoadedLines()).toHaveLength(1);
+      expect(stderrWrites.filter(line => line.includes('repo scope'))).toEqual([]);
+    } finally {
+      exitSpy.mockRestore();
+      if (before === undefined) delete process.env.JEV_API_BASE;
+      else process.env.JEV_API_BASE = before;
+    }
+  });
+
   it('refuses a refused key in any case on Windows, where env names ignore case', () => {
     const repoEnv = join(repoDir, '.archon', '.env');
     writeFileSync(repoEnv, `path=${join(tmpRoot, 'elsewhere')}\n`);

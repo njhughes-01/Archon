@@ -2068,6 +2068,50 @@ describe('executeWorkflow', () => {
       keys: ['assistant', 'env.SHARED', 'tiers.large'],
     };
 
+    it('hands the loaded modelRouter opt-in to the DAG executor, with and without a run config layer', async () => {
+      const modelRouter = { tiers: ['medium' as const], mode: 'shadow' as const };
+      const loadedConfig = {
+        assistant: 'claude',
+        assistants: { claude: {}, codex: {} },
+        commands: {},
+        workflows: { autoResumeOnQuotaReset: false, quotaMaxAttempts: 1, quotaDeadlineMs: 1000 },
+        modelRouter,
+      };
+      const run = async (runConfig?: {
+        source: typeof sealedMetadata.source;
+        layer: Record<string, unknown>;
+      }): Promise<unknown> => {
+        mockExecuteDagWorkflow.mockClear();
+        const createRun = mock<IWorkflowStore['createWorkflowRun']>(async data =>
+          makeRun({ metadata: data.metadata })
+        );
+        const deps: WorkflowDeps = {
+          ...makeDeps(makeStore({ createWorkflowRun: createRun })),
+          sealRunConfig: mock(() => sealedMetadata),
+          loadConfig: mock(async () => loadedConfig),
+        };
+        await executeWorkflow(
+          deps,
+          makePlatform(),
+          'conv-1',
+          '/tmp',
+          makeWorkflow(),
+          'msg',
+          'db-conv-1',
+          {
+            ...(runConfig ? { runConfig } : {}),
+          }
+        );
+        return mockExecuteDagWorkflow.mock.calls[0]?.[0].config.modelRouter;
+      };
+
+      expect(await run()).toEqual(modelRouter);
+      // A run layer is merged key by key; the operator's opt-in must survive the merge.
+      expect(
+        await run({ source: sealedMetadata.source, layer: { workflows: { quotaMaxAttempts: 2 } } })
+      ).toEqual(modelRouter);
+    });
+
     it('layers file content above DB/user config and explicit model mappings above the file', async () => {
       const createRun = mock<IWorkflowStore['createWorkflowRun']>(async data =>
         makeRun({ metadata: data.metadata })

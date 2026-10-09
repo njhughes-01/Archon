@@ -26,6 +26,7 @@ import type { ToolGateConfig } from './tool-gate/config';
 // types and its parse and merge rules without loading the gate itself.
 export { mergeToolGateConfig, parseToolGateConfig } from './tool-gate/config';
 export type { ToolGateConfig, ToolGateConfigInput } from './tool-gate/config';
+import type { ModelRouterConfig } from './schemas/model-router';
 import type {
   WorkflowRunConfigLayer,
   WorkflowRunConfigMetadata,
@@ -135,6 +136,8 @@ export interface WorkflowConfig {
    * `enabled: false` means off: no node is given a gate.
    */
   toolGate?: ToolGateConfig;
+  /** Operator opt-in for the cost-aware model router. Absent leaves the router off. */
+  modelRouter?: ModelRouterConfig;
   // Intersection: generic map for community providers + typed built-in entries.
   // Built-ins are typed so executor/dag-executor get type-safe config access for
   // Claude settingSources, Codex reasoningEffort, etc. without casts.

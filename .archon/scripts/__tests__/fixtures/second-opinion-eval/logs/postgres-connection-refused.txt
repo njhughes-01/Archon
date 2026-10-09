@@ -1,0 +1,23 @@
+$ npx jest --ci --selectProjects integration
+Determining test suites to run...
+FAIL integration test/integration/orders.repository.test.ts
+  ● Test suite failed to run
+
+    connect ECONNREFUSED 127.0.0.1:5432
+
+      at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1605:16)
+      at globalSetup (test/integration/global-setup.ts:11:3)
+
+FAIL integration test/integration/customers.repository.test.ts
+  ● Test suite failed to run
+
+    connect ECONNREFUSED 127.0.0.1:5432
+
+      at TCPConnectWrap.afterConnect [as oncomplete] (node:net:1605:16)
+      at globalSetup (test/integration/global-setup.ts:11:3)
+
+Test Suites: 2 failed, 2 total
+Tests:       0 total
+Snapshots:   0 total
+Time:        0.713 s
+Ran all test suites in 1 project.

@@ -1,0 +1,20 @@
+$ ./gradlew test
+> Task :cache:test
+
+RateLimiterTest > refillsOneTokenPerInterval() FAILED
+    org.opentest4j.AssertionFailedError: waited 100 ms for the refill, elapsed should be under 120 ms but was 163 ms ==> expected: <true> but was: <false>
+        at org.junit.jupiter.api.AssertTrue.failNotTrue(AssertTrue.java:63)
+        at org.junit.jupiter.api.Assertions.assertTrue(Assertions.java:214)
+        at com.acme.cache.RateLimiterTest.refillsOneTokenPerInterval(RateLimiterTest.java:41)
+
+41 tests completed, 1 failed
+
+> Task :cache:test FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':cache:test'.
+> There were failing tests. See the report at: file:///workspace/cache/build/reports/tests/test/index.html
+
+BUILD FAILED in 14s

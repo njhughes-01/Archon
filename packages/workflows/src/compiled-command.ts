@@ -97,6 +97,13 @@ export type ComposedBlockBoundary = ComposedBlockBoundaryBase &
  */
 export interface ComposedNodeMeta {
   origin: string;
+  /**
+   * The command this node ran before composition compiled its body into an inline
+   * prompt: the plain name, as its author wrote it. Write-once, set by the include that
+   * compiled it. It is how an operator names the step in config (`modelRouter.steps`)
+   * wherever the workflow that declares it is composed.
+   */
+  command?: string;
   inputs?: Record<string, JsonValue>;
   blockEntry?: true;
   boundaries?: ComposedBlockBoundary[];

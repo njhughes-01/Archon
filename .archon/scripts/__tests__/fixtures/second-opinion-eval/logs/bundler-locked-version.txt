@@ -1,0 +1,13 @@
+$ bundle install --deployment && bundle exec rake test
+Fetching gem metadata from https://rubygems.org/.........
+Resolving dependencies...
+Could not find compatible versions
+
+Because rails >= 7.1.0, < 7.1.1 depends on activesupport = 7.1.0
+  and Gemfile depends on rails = 7.1.0,
+  activesupport = 7.1.0 is required.
+So, because Gemfile depends on activesupport ~> 7.2,
+  version solving has failed.
+
+Your bundle is locked to devise (4.9.3) from rubygems repository https://rubygems.org/ or installed locally, but that version can no longer be found in that source.
+If you are updating multiple gems in your Gemfile at once, try passing them all to `bundle update`.

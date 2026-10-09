@@ -1,0 +1,25 @@
+$ npm run test:integration
+> api@2.3.0 test:integration
+> node --test test/integration
+
+node:events:497
+      throw er; // Unhandled 'error' event
+      ^
+
+Error: listen EADDRINUSE: address already in use :::3000
+    at Server.setupListenHandle [as _listen2] (node:net:1898:16)
+    at listenInCluster (node:net:1946:12)
+    at Server.listen (node:net:2044:7)
+    at startServer (/workspace/test/integration/helpers/server.js:14:10)
+    at TestContext.<anonymous> (/workspace/test/integration/health.test.js:8:18)
+Emitted 'error' event on Server instance at:
+    at emitErrorNT (node:net:1925:8)
+    at process.processTicksAndRejections (node:internal/process/task_queues:82:21) {
+  code: 'EADDRINUSE',
+  errno: -98,
+  syscall: 'listen',
+  address: '::',
+  port: 3000
+}
+
+Node.js v22.4.1

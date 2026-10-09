@@ -41,6 +41,11 @@ review__publish:
   findings_summary: "stub: clean on initial review"
   report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
 validate__discover: { checks: [{ name: "lint", argv: ["bun", "-e", "console.log('lint passed')"] }, { name: "tests", argv: ["archon-fixture-command-that-does-not-exist"] }], quarantine: [], notes: "stub: the project's checks" }
+# Not reached while the checks above pass: the second opinion runs only on red.
+# Stubbed all the same, because the real runner decides that, and a fixture run
+# inherits the operator's environment: were a check ever edited to fail, an
+# unstubbed node would send its log to a live classifier.
+validate__failure-class: { status: unavailable, reason: no_api_key, choice: null, probabilities: {}, confidence: null, advisory: true }
 fixture:
   expect: failed
   fail-node: gate-validated

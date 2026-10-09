@@ -1,0 +1,7 @@
+$ npm ci
+npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory.
+npm error code EAI_AGAIN
+npm error syscall getaddrinfo
+npm error errno EAI_AGAIN
+npm error request to https://registry.npmjs.org/typescript/-/typescript-5.5.3.tgz failed, reason: getaddrinfo EAI_AGAIN registry.npmjs.org
+npm error A complete log of this run can be found in: /home/ci/.npm/_logs/2026-06-21T03_40_55_902Z-debug-0.log

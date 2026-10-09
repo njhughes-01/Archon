@@ -1,0 +1,26 @@
+$ bun test
+bun test v1.4.2
+
+src/profile/display-name.test.ts:
+✓ displayName > joins first and last name [0.42ms]
+✓ displayName > falls back to the email local part [0.11ms]
+14 |   const preferred = user.preferences.nickname;
+15 |   if (preferred) return preferred;
+16 |   return [user.firstName, user.lastName].filter(Boolean).join(' ') || localPart(user.email);
+17 | }
+18 |
+19 | function localPart(email: string): string {
+                         ^
+TypeError: undefined is not an object (evaluating 'user.preferences.nickname')
+      at displayName (/workspace/src/profile/display-name.ts:14:21)
+      at <anonymous> (/workspace/src/profile/display-name.test.ts:31:12)
+✗ displayName > handles a user imported without preferences [0.38ms]
+
+src/profile/avatar.test.ts:
+✓ avatarUrl > uses the uploaded image when present [0.09ms]
+✓ avatarUrl > builds an initials placeholder [0.07ms]
+
+ 4 pass
+ 1 fail
+ 6 expect() calls
+Ran 5 tests across 2 files. [61.00ms]

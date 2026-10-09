@@ -476,6 +476,12 @@ nodes:
               state or edit the canonical review comment; the following review
               owns that public verdict.
 
+              The project's own gate ran on this branch before CI concluded. Its
+              verdict, for context — it records what failed locally and what was
+              checked about the cause, and is not evidence about CI's failure:
+
+              $validate.output.summary
+
               Accepted work order, for scope only — do not reopen it:
               $INPUTS.work
 

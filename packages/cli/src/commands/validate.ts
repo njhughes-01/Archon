@@ -14,6 +14,7 @@ import {
   discoverAvailableScripts,
   findSimilar,
   makeWorkflowResult,
+  unknownModelRouterSteps,
 } from '@archon/workflows/validator';
 import type {
   ValidationIssue,
@@ -177,6 +178,21 @@ export async function validateWorkflowsCommand(
     return a.workflowName.localeCompare(b.workflowName);
   });
 
+  // The install's `modelRouter.steps` is matched by step name across every workflow, so it
+  // is checked against all of them whatever `name` narrowed the results to. A name that
+  // matches nothing is a warning and never changes the exit code.
+  const configWarnings: ValidationIssue[] = unknownModelRouterSteps(
+    mergedConfig.modelRouter?.steps,
+    workflowEntries.map(entry => entry.workflow)
+  ).map(({ step, similar }) => ({
+    level: 'warning',
+    field: 'modelRouter.steps',
+    message: `No step of any workflow found here is named '${step}', so the model router lowers nothing for it`,
+    ...(similar.length > 0
+      ? { hint: `Did you mean: ${similar.map(name => `'${name}'`).join(', ')}?` }
+      : {}),
+  }));
+
   // Output
   const totalErrors = filteredResults.filter(r => !r.valid).length;
   const totalWarnings = filteredResults.filter(r =>
@@ -193,12 +209,16 @@ export async function validateWorkflowsCommand(
           errors: totalErrors,
           warnings: totalWarnings,
         },
+        ...(configWarnings.length > 0 ? { configWarnings } : {}),
       })}\n`
     );
   } else {
     console.log(`\nValidating workflows in ${cwd}\n`);
     for (const result of filteredResults) {
       console.log(formatWorkflowResult(result));
+    }
+    if (configWarnings.length > 0) {
+      console.log(formatValidationResult('config: modelRouter.steps', configWarnings));
     }
     console.log(
       `\nResults: ${filteredResults.length - totalErrors} valid, ${totalErrors} with errors${totalWarnings > 0 ? `, ${totalWarnings} with warnings` : ''}`

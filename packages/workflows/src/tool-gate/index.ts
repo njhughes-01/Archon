@@ -67,6 +67,7 @@ export {
   createWorkflowRunToolGate,
   emptyToolGateRoot,
   providerHonoursToolGate,
+  providersUsableUnderToolGate,
   workflowToolGateRecorder,
 } from './run-gate';
 export type { RunToolGate, RunToolGateInput, WorkflowRunToolGateInput } from './run-gate';

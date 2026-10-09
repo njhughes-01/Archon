@@ -183,6 +183,19 @@ export function providerHonoursToolGate(
 }
 
 /**
+ * The same question as a predicate over provider names, for a caller that picks
+ * among providers (the model router): with the gate on, a provider that could
+ * not be checked is never offered, so a step is not routed to one that dispatch
+ * would then refuse.
+ */
+export function providersUsableUnderToolGate(
+  config: ToolGateConfig | undefined,
+  capabilitiesOf: (provider: string) => Pick<ProviderCapabilities, 'toolActionGate'>
+): (provider: string) => boolean {
+  return provider => providerHonoursToolGate(config, capabilitiesOf(provider));
+}
+
+/**
  * Refuses a provider that would run tools without asking while the gate is on.
  * Called where a step is dispatched, with the provider it resolved to.
  */

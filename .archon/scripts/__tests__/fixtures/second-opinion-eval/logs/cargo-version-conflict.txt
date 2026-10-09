@@ -1,0 +1,13 @@
+$ cargo test --locked
+    Updating crates.io index
+error: failed to select a version for `tokio`.
+    ... required by package `stream-util v0.9.3`
+    ... which satisfies dependency `stream-util = "^0.9"` of package `ingest v0.1.0 (/workspace/crates/ingest)`
+versions that meet the requirements `^1.38` are: 1.38.1, 1.38.0
+
+all possible versions conflict with previously selected packages.
+
+  previously selected package `tokio v1.36.0`
+    ... which satisfies dependency `tokio = "=1.36.0"` of package `gateway v0.3.0 (/workspace/crates/gateway)`
+
+failed to select a version for `tokio` which could resolve this conflict

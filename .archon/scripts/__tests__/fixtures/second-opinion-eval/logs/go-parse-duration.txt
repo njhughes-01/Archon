@@ -1,0 +1,13 @@
+$ go test ./...
+ok  	example.com/billing/internal/ledger	0.412s
+ok  	example.com/billing/internal/money	0.208s
+--- FAIL: TestParseBillingPeriod (0.00s)
+    --- FAIL: TestParseBillingPeriod/quarterly (0.00s)
+        period_test.go:47: ParseBillingPeriod("3m") = 2160h0m0s, want 2190h0m0s
+    --- FAIL: TestParseBillingPeriod/yearly (0.00s)
+        period_test.go:47: ParseBillingPeriod("1y") = 8640h0m0s, want 8760h0m0s
+    --- PASS: TestParseBillingPeriod/monthly (0.00s)
+FAIL
+FAIL	example.com/billing/internal/period	0.006s
+ok  	example.com/billing/internal/tax	0.115s
+FAIL

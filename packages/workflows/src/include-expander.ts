@@ -68,6 +68,7 @@ import { resolveWorkflowName } from './router';
 import { parseWhenAtom, whenAtoms } from './when-atom';
 import { mapNodeTemplateSlots, mapNodeTemplateValueSlots } from './template-walker';
 import { resolveWorkflow, resolvedBodyNodes } from './graph-plan';
+import { parsePackagedResourceReference } from './packaged-workflow';
 import {
   COMPILED_LOOP_COMMAND,
   COMPOSED_NODE,
@@ -794,6 +795,10 @@ function inlineInclude(
     // so one node's rewrite cannot reach another's.
     markComposedNode(clone, {
       origin: child.name,
+      // Read off the child's own node: `clone` is already an inline prompt.
+      ...(isAgentNode(cn) && cn.source.kind === 'command'
+        ? { command: parsePackagedResourceReference(cn.source.name)?.name ?? cn.source.name }
+        : {}),
       ...(Object.keys(resolvedInputs).length > 0 ? { inputs: { ...resolvedInputs } } : {}),
       ...(wasEntry ? { blockEntry: true as const } : {}),
       ...(hasActivationBoundary

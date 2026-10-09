@@ -1,0 +1,23 @@
+$ node --test
+node:internal/modules/esm/resolve:838
+  throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);
+        ^
+
+Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'zod' imported from /workspace/src/config/schema.js
+    at packageResolve (node:internal/modules/esm/resolve:838:9)
+    at moduleResolve (node:internal/modules/esm/resolve:907:18)
+    at defaultResolve (node:internal/modules/esm/resolve:1037:11)
+    at ModuleLoader.defaultResolve (node:internal/modules/esm/loader:650:12)
+    at ModuleLoader.resolve (node:internal/modules/esm/loader:599:25)
+    at ModuleLoader.getModuleJobForImport (node:internal/modules/esm/loader:347:38)
+    at ModuleJob._link (node:internal/modules/esm/module_job:136:49) {
+  code: 'ERR_MODULE_NOT_FOUND'
+}
+
+Node.js v22.4.1
+✖ test/config.test.js (48.9ms)
+  'test failed'
+
+ℹ tests 1
+ℹ pass 0
+ℹ fail 1

@@ -15,9 +15,10 @@ import {
   validateWorkflowResources,
   validateCommand,
   discoverAvailableCommands,
+  unknownModelRouterSteps,
 } from './validator';
 import type { WorkflowDefinition, DagNode } from './schemas';
-import { makeTestWorkflow } from './test-utils';
+import { makeTestResolvedWorkflow, makeTestWorkflow } from './test-utils';
 import { formatPackagedResourceReference } from './packaged-workflow';
 
 // =============================================================================
@@ -139,6 +140,46 @@ describe('findSimilar', () => {
 // =============================================================================
 // validateWorkflowResources — command nodes
 // =============================================================================
+
+describe('unknownModelRouterSteps', () => {
+  const workflows = [
+    makeTestResolvedWorkflow({
+      name: 'steps',
+      nodes: [
+        { id: 'first', command: 'discover-checks' },
+        {
+          id: 'second',
+          command: formatPackagedResourceReference(
+            { source: 'project', pack: 'pack', workflow: 'flow' },
+            'sync-pr-body'
+          ),
+        },
+        { id: 'summarise', prompt: 'hello' },
+        { id: 'shell-step', bash: 'true' },
+      ],
+    }),
+  ];
+
+  test('matches a command by its plain name and an inline prompt by its node id', () => {
+    expect(
+      unknownModelRouterSteps(['discover-checks', 'sync-pr-body', 'summarise'], workflows)
+    ).toEqual([]);
+  });
+
+  test('reports a name no agent step answers to, with the names it resembles', () => {
+    // A command step is named by its command, not its node id; a shell step is no agent step.
+    expect(unknownModelRouterSteps(['discover-cheks', 'first', 'shell-step'], workflows)).toEqual([
+      { step: 'discover-cheks', similar: ['discover-checks'] },
+      { step: 'first', similar: [] },
+      { step: 'shell-step', similar: [] },
+    ]);
+  });
+
+  test('has nothing to report without a list', () => {
+    expect(unknownModelRouterSteps(undefined, workflows)).toEqual([]);
+    expect(unknownModelRouterSteps([], workflows)).toEqual([]);
+  });
+});
 
 describe('validateWorkflowResources — command nodes', () => {
   test('no issues when command file exists', async () => {

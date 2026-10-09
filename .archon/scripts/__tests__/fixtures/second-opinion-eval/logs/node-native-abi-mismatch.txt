@@ -1,0 +1,23 @@
+$ npx vitest run
+ RUN  v2.0.5 /workspace
+
+⎯⎯⎯⎯⎯⎯ Failed Suites 3 ⎯⎯⎯⎯⎯⎯⎯
+
+ FAIL  src/store/sessions.test.ts [ src/store/sessions.test.ts ]
+ FAIL  src/store/migrations.test.ts [ src/store/migrations.test.ts ]
+ FAIL  src/store/audit-log.test.ts [ src/store/audit-log.test.ts ]
+Error: The module '/workspace/node_modules/better-sqlite3/build/Release/better_sqlite3.node'
+was compiled against a different Node.js version using
+NODE_MODULE_VERSION 115. This version of Node.js requires
+NODE_MODULE_VERSION 127. Please try re-compiling or re-installing
+the module (for instance, using `npm rebuild` or `npm install`).
+ ❯ Object.Module._extensions..node node:internal/modules/cjs/loader:1586:18
+ ❯ bindings node_modules/bindings/bindings.js:112:48
+ ❯ new Database node_modules/better-sqlite3/lib/database.js:48:64
+ ❯ src/store/open.ts:7:10
+
+⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯
+
+ Test Files  3 failed | 11 passed (14)
+      Tests  96 passed (96)
+   Duration  2.41s

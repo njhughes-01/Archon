@@ -1,0 +1,38 @@
+$ npx cypress run --spec cypress/e2e/inbox.cy.ts
+  Running:  inbox.cy.ts                                                           (1 of 1)
+
+  inbox
+    ✓ lists unread conversations first (812ms)
+    (Attempt 1 of 3) archives a conversation from the list
+    (Attempt 2 of 3) archives a conversation from the list
+    1) archives a conversation from the list
+    ✓ restores an archived conversation (1033ms)
+
+  2 passing (19s)
+  1 failing
+
+  1) inbox
+       archives a conversation from the list:
+     CypressError: Timed out retrying after 4000ms: `cy.click()` failed because the page updated while this command was executing. It expected to find the element still attached to the DOM, but it had been re-rendered.
+
+Cypress requires elements be attached in the DOM to interact with them.
+
+The previous command that ran was:
+
+  > `cy.contains()`
+
+This DOM element likely became detached somewhere between the previous and current command.
+      at cypress/e2e/inbox.cy.ts:27:48
+
+  (Results)
+
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │ Tests:        3                                                            │
+  │ Passing:      2                                                            │
+  │ Failing:      1                                                            │
+  │ Pending:      0                                                            │
+  │ Skipped:      0                                                            │
+  │ Screenshots:  3                                                            │
+  │ Duration:     19 seconds                                                   │
+  │ Spec Ran:     inbox.cy.ts                                                  │
+  └────────────────────────────────────────────────────────────────────────────┘

@@ -4,6 +4,7 @@ import type { DagNode } from './schemas/dag-node';
 import type { EffortLevel } from './schemas/effort';
 import type { TierName } from './schemas/model-binding';
 import type { CheckoutObservation } from './schemas/checkout-observation';
+import type { NodeRoute } from './schemas/model-router';
 import { tokenUsageSchema } from '@archon/provider-contract';
 import {
   nodeExecutionMetadataSchema,
@@ -81,6 +82,8 @@ export function startNodeExecution(input: {
   accounting?: NodeExecutionRecord['accounting'];
   /** This attempt's checkout sample; the invocation keeps its own first sample. */
   checkoutStart?: CheckoutObservation;
+  /** The model router's decision for this attempt, when it considered the node. */
+  route?: NodeRoute;
   now?: string;
 }): NodeExecutionRecord {
   const now = input.now ?? new Date().toISOString();
@@ -118,6 +121,7 @@ export function startNodeExecution(input: {
         : hasProvider
           ? { sessionOrigin: 'fresh' as const }
           : {}),
+      ...(input.route !== undefined ? { route: input.route } : {}),
     },
     timing: { startedAt: now },
     spend: {

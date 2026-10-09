@@ -1,0 +1,32 @@
+$ bundle exec rspec --format documentation spec/models/subscription_spec.rb
+Subscription
+  #renews_on
+    is one month after the day it was created (FAILED - 1)
+    skips to the last day of a shorter month
+  #active?
+    is true until the renewal date has passed
+
+Failures:
+
+  1) Subscription#renews_on is one month after the day it was created
+     Failure/Error: expect(subscription.renews_on).to eq(Date.today >> 1)
+
+       expected: Wed, 15 Apr 2026
+            got: Tue, 14 Apr 2026
+
+       (compared using ==)
+
+       Diff:
+       @@ -1 +1 @@
+       -Wed, 15 Apr 2026
+       +Tue, 14 Apr 2026
+     # ./spec/models/subscription_spec.rb:52:in `block (3 levels) in <top (required)>'
+
+Finished in 0.04112 seconds (files took 2.9 seconds to load)
+3 examples, 1 failure
+
+Failed examples:
+
+rspec ./spec/models/subscription_spec.rb:49 # Subscription#renews_on is one month after the day it was created
+
+Randomized with seed 51873

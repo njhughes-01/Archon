@@ -184,6 +184,61 @@ workflows:
       expect(config.workflows).toEqual({ autoResumeOnQuotaReset: true });
     });
 
+    test('keeps a modelRouter block as written, without filling in defaults', async () => {
+      mockFsReadFile.mockResolvedValue(`
+modelRouter:
+  mode: apply
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.modelRouter).toEqual({ mode: 'apply' });
+    });
+
+    test.each([
+      ['an unknown tier', 'tiers: [medium, huge]', 'tiers'],
+      ['an unknown mode', 'mode: sometimes', 'mode'],
+      ['tiers that are not a list', 'tiers: medium', 'tiers'],
+      ['a mistyped key', 'teirs: [medium]', 'teirs'],
+      ['another mistyped key', 'mdoe: apply', 'mdoe'],
+      ['a step that is not a name', 'steps: [discover-checks, 7]', 'steps'],
+    ])(
+      'switches the router off for a modelRouter block with %s, names the key, and keeps the rest of the file',
+      async (_label, line, key) => {
+        mockLogger.error.mockClear();
+        mockFsReadFile.mockResolvedValue(`
+defaultAssistant: codex
+tiers:
+  small: { provider: codex, model: gpt-mini }
+modelRouter:
+  ${line}
+`);
+
+        const config = await loadGlobalConfig();
+
+        expect(config.modelRouter).toBeUndefined();
+        expect(config.defaultAssistant).toBe('codex');
+        expect(config.tiers).toEqual({ small: { provider: 'codex', model: 'gpt-mini' } });
+        const [data, event] = mockLogger.error.mock.calls.at(-1) as unknown as [
+          { detail: string },
+          string,
+        ];
+        expect(event).toBe('config.model_router_invalid_router_disabled');
+        expect(data.detail).toContain(key);
+      }
+    );
+
+    test('keeps a steps list as written', async () => {
+      mockFsReadFile.mockResolvedValue(`
+modelRouter:
+  steps: [discover-checks, sync-pr-body]
+`);
+
+      const config = await loadGlobalConfig();
+
+      expect(config.modelRouter).toEqual({ steps: ['discover-checks', 'sync-pr-body'] });
+    });
+
     test('caches config on subsequent calls', async () => {
       mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
 
@@ -393,6 +448,147 @@ recommendedWorkflows: "archon-plan"
         quotaMaxAttempts: 1,
         quotaDeadlineMs: 86_400_000,
       });
+    });
+
+    test('leaves the model router unconfigured when neither file names it', async () => {
+      mockFsReadFile.mockResolvedValue('defaultAssistant: claude');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
+    });
+
+    test('a modelRouter block opts in, on the medium tier in shadow mode by default', async () => {
+      mockFsReadFile.mockResolvedValueOnce('modelRouter: {}').mockResolvedValueOnce('');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'shadow' });
+    });
+
+    test.each([
+      ['turn it off', 'mode: off', { tiers: ['medium', 'large'], mode: 'off' }],
+      ['turn apply down to shadow', 'mode: shadow', { tiers: ['medium', 'large'], mode: 'shadow' }],
+      ['take a tier away', 'tiers: [medium]', { tiers: ['medium'], mode: 'apply' }],
+      ['take every tier away', 'tiers: []', { tiers: [], mode: 'apply' }],
+    ])('a repo modelRouter block can %s', async (_label, line, expected) => {
+      mockFsReadFile.mockResolvedValueOnce(`
+modelRouter:
+  tiers: [medium, large]
+  mode: apply
+`).mockResolvedValueOnce(`
+modelRouter:
+  ${line}
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect<unknown>(config.modelRouter).toEqual(expected);
+    });
+
+    test.each([
+      ['switch shadow to apply', 'mode: apply'],
+      ['add a tier', 'tiers: [small, medium, large]'],
+      ['add a tier while keeping the mode', 'tiers: [large]\n  mode: shadow'],
+    ])('a repo modelRouter block cannot %s', async (_label, line) => {
+      mockFsReadFile.mockResolvedValueOnce(`
+modelRouter:
+  tiers: [medium]
+  mode: shadow
+`).mockResolvedValueOnce(`
+modelRouter:
+  ${line}
+`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter?.mode).toBe('shadow');
+      expect(config.modelRouter?.tiers.every(tier => tier === 'medium')).toBe(true);
+    });
+
+    test.each([
+      [
+        'narrow an install with no list to its own list',
+        'tiers: [medium]',
+        'steps: [pr, triage]',
+        ['pr', 'triage'],
+      ],
+      [
+        'remove entries from the install list',
+        'steps: [discover-checks, sync-pr-body, pr]',
+        'steps: [pr, discover-checks]',
+        ['discover-checks', 'pr'],
+      ],
+      [
+        'not add an entry the install does not list',
+        'steps: [discover-checks]',
+        'steps: [discover-checks, triage]',
+        ['discover-checks'],
+      ],
+      ['remove every entry', 'steps: [discover-checks]', 'steps: []', []],
+    ])('a repo modelRouter steps list can %s', async (_label, install, repo, expected) => {
+      mockFsReadFile
+        .mockResolvedValueOnce(`modelRouter:\n  ${install}`)
+        .mockResolvedValueOnce(`modelRouter:\n  ${repo}`);
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter?.steps).toEqual(expected);
+    });
+
+    test('an invalid repo modelRouter block switches the router off for that repo and keeps the rest of its file', async () => {
+      // A repository can only narrow. Dropping its mistyped block would leave the
+      // router on where the repository asked for less.
+      mockLogger.error.mockClear();
+      mockFsReadFile
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply')
+        .mockResolvedValueOnce('assistant: claude\nmodelRouter:\n  mdoe: off');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'off' });
+      expect(config.assistant).toBe('claude');
+      const [data, event] = mockLogger.error.mock.calls.at(-1) as unknown as [
+        { detail: string; scope: string },
+        string,
+      ];
+      expect(event).toBe('config.model_router_invalid_router_disabled');
+      expect(data.scope).toBe('repo');
+      expect(data.detail).toContain('mdoe');
+    });
+
+    test('an invalid repo modelRouter block cannot switch the router on where the install has not', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce('defaultAssistant: claude')
+        .mockResolvedValueOnce('modelRouter:\n  teirs: [medium]');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
+    });
+
+    test('a repo modelRouter block cannot override an install-level off', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce('modelRouter:\n  mode: off')
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'off' });
+    });
+
+    test('a repo modelRouter block cannot opt in where the install has not, and says so', async () => {
+      mockLogger.warn.mockClear();
+      mockFsReadFile
+        .mockResolvedValueOnce('defaultAssistant: claude')
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply\n  tiers: [medium, large]');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
+      expect(mockLogger.warn.mock.calls.map(call => call[1])).toContain(
+        'config.model_router_repo_block_ignored_without_install_opt_in'
+      );
     });
 
     test('merges global and repo quota continuation policy per field', async () => {
