@@ -205,13 +205,13 @@ export async function routeNodeModel(
     usesPersistedScope: dispatch.usesPersistedScope,
     sameProviderOnly: sessionMayCrossNode(run.layers, dispatch.layerIndex),
     ...(run.providerUsable !== undefined ? { providerUsable: run.providerUsable } : {}),
+    workflowBetas: run.workflowLevelOptions.betas,
     inContainer: run.execContext.kind === 'container',
     capabilityScope: {
       declaredEffort: resolution.declaredEffort,
       workflowFallbackModel: run.workflowLevelOptions.fallbackModel,
       workflowSandbox: run.workflowLevelOptions.sandbox,
       webSearchMode: run.workflowLevelOptions.webSearchMode,
-      workflowBetas: run.workflowLevelOptions.betas,
       hasEnvVars: (run.config.envVars && Object.keys(run.config.envVars).length > 0) === true,
     },
     loadStepText: async () => {

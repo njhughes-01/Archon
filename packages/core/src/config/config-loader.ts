@@ -317,9 +317,10 @@ function validateWorkflowContinuationConfig(parsed: unknown, configPath: string)
 }
 
 /**
- * Validate a `modelRouter:` block where it is read. A mistyped tier or mode must be
- * refused here: read leniently, it would either widen which steps may be lowered or
- * leave the operator believing a mode is on that is not.
+ * Validate a `modelRouter:` block. A mistyped key, tier or mode is refused with the key
+ * named: read leniently, it would either widen which steps may be lowered or leave the
+ * operator believing a setting is in force that is not. The settings write path throws
+ * this; the read paths go through `dropInvalidModelRouterConfig`.
  */
 function validateModelRouterConfig(parsed: unknown, configPath: string): void {
   if (typeof parsed !== 'object' || parsed === null || !('modelRouter' in parsed)) return;
@@ -333,6 +334,26 @@ function validateModelRouterConfig(parsed: unknown, configPath: string): void {
     throw new InvalidConfigError('Invalid modelRouter config', configPath, issues);
   }
   config.modelRouter = result.data;
+}
+
+/**
+ * Read-side handling of a `modelRouter:` block: an invalid one switches the router off
+ * and nothing else. The loaders degrade a file they reject to an empty config, which for
+ * most blocks is the safe reading. Here it is not: one mistyped router key would also
+ * throw away the operator's tiers and assistants. So the block alone is dropped, loudly,
+ * and the rest of the file stands.
+ */
+function dropInvalidModelRouterConfig(parsed: unknown, configPath: string): void {
+  try {
+    validateModelRouterConfig(parsed, configPath);
+  } catch (error) {
+    if (!(error instanceof InvalidConfigError)) throw error;
+    getLog().error(
+      { configPath, detail: error.summary },
+      'config.model_router_invalid_router_disabled'
+    );
+    delete (parsed as { modelRouter?: unknown }).modelRouter;
+  }
 }
 
 function isConfigRecord(value: unknown): value is Record<string, unknown> {
@@ -420,7 +441,7 @@ async function readGlobalConfigOrDegrade(configPath: string): Promise<GlobalConf
     const content = await readConfigFile(configPath);
     const parsed = parseYaml(content);
     validateWorkflowContinuationConfig(parsed, configPath);
-    validateModelRouterConfig(parsed, configPath);
+    dropInvalidModelRouterConfig(parsed, configPath);
     validateModelBindingConfig(parsed, configPath);
     return (parsed as GlobalConfig | null) ?? {};
   } catch (error) {
@@ -487,7 +508,7 @@ async function readRepoConfigOrDegrade(configPath: string): Promise<RepoConfig> 
     const content = await readConfigFile(configPath);
     const raw = parseYaml(content);
     validateWorkflowContinuationConfig(raw, configPath);
-    validateModelRouterConfig(raw, configPath);
+    dropInvalidModelRouterConfig(raw, configPath);
     validateModelBindingConfig(raw, configPath);
     const parsed = (raw as RepoConfig | null) ?? {};
     const recommendedWorkflows = sanitizeRecommendedWorkflows(

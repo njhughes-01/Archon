@@ -43,7 +43,7 @@ import {
 } from './node-model-resolution';
 import type { ResolvedAiProfile } from './model-validation';
 import type { WorkflowConfig } from './deps';
-import { authoredCeiling, routerInactiveReason } from './jev/model-router';
+import { authoredCeiling, routerInactiveReason, stepExclusion } from './jev/model-router';
 import { MODEL_ROUTER_RECORDED_MODES, type ModelRouterConfig } from './schemas/model-router';
 import { tierNameSchema } from './schemas/model-binding';
 import {
@@ -397,7 +397,8 @@ const dryRunResolutionSchema = z.object({
     .optional(),
   /**
    * Set when the model router is configured and this node is one it may lower: an agent
-   * node on a routable tier that declares an output contract. A dry run makes no network
+   * node on a routable tier that declares an output contract, does not declare
+   * `mutates_checkout: false`, and is on the operator's `steps` list when there is one. A dry run makes no network
    * call, so it never knows the route: everything above is the unrouted resolution, which
    * is the most the node can run on. In `apply` mode a real run may use a tier below
    * `ceiling`; in `shadow` mode it records a route and runs as reported.
@@ -687,10 +688,15 @@ function resolutionFor(node: DagNode, ctx: DryRunContext): DryRunResolution | un
     ctx.assistantModels,
     ctx.aiProfile
   );
-  // Only single-shot agent nodes with an output contract are lowered: a loop keeps one
-  // binding for all its turns, and without a contract escalation has nothing to check.
+  // Only a single-shot agent node that passes the step-level rules can be lowered: listed
+  // by the operator when there is a list, free to write the checkout, and declaring an
+  // output contract. A loop keeps one binding for all its turns.
   const router =
-    isAgentNode(node) && node.output_format !== undefined ? ctx.modelRouter : undefined;
+    isAgentNode(node) &&
+    ctx.modelRouter !== undefined &&
+    stepExclusion(node, ctx.modelRouter) === undefined
+      ? ctx.modelRouter
+      : undefined;
   const ceiling = router && authoredCeiling(node, resolved, router);
   const routerNote =
     router && ceiling

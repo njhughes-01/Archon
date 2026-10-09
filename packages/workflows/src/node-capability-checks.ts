@@ -17,8 +17,6 @@ export interface NodeCapabilityScope {
   workflowSandbox: unknown;
   /** Workflow-level `webSearchMode:`; see `providerReadsWebSearchMode`. */
   webSearchMode: unknown;
-  /** Workflow-level `betas:`; see `providerReadsBetas`. */
-  workflowBetas: unknown;
   /** The install injects environment variables into provider subprocesses. */
   hasEnvVars: boolean;
 }
@@ -31,14 +29,6 @@ export interface NodeCapabilityScope {
  */
 export function providerReadsWebSearchMode(provider: string): boolean {
   return provider === 'codex';
-}
-
-/**
- * `betas:` names Claude SDK beta features. Only the Claude provider reads it, and like
- * `webSearchMode:` it has no ProviderCapabilities axis.
- */
-export function providerReadsBetas(provider: string): boolean {
-  return provider === 'claude';
 }
 
 /** Field names as the author wrote them, in a stable order. Empty when all are honoured. */
@@ -78,9 +68,6 @@ export function unsupportedNodeFields(
   // loud mismatch as every other field.
   if (!providerReadsWebSearchMode(provider) && scope.webSearchMode !== undefined) {
     unsupported.push('webSearchMode');
-  }
-  if (!providerReadsBetas(provider) && (node.betas ?? scope.workflowBetas) !== undefined) {
-    unsupported.push('betas');
   }
   return unsupported;
 }

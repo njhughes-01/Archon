@@ -1735,7 +1735,6 @@ async function resolveNodeProviderAndModel(
     workflowFallbackModel: workflowLevelOptions.fallbackModel,
     workflowSandbox: workflowLevelOptions.sandbox,
     webSearchMode: workflowLevelOptions.webSearchMode,
-    workflowBetas: workflowLevelOptions.betas,
     hasEnvVars: (config.envVars && Object.keys(config.envVars).length > 0) === true,
   });
 
@@ -10632,37 +10631,11 @@ async function runLayers(parentCtx: RunLayersContext): Promise<void> {
             // attempts there ended in a failure of a kind `escalationReason` names, runs
             // once more exactly as it would have with no router: the authored tier, its
             // own retry policy, and the session input the node started from, never the
-            // failed attempt's own new session. This sits before the `mutates_checkout`
-            // assertion on purpose: a lower-tier attempt that completed after changing
-            // the tree fails there, on its own record.
+            // failed attempt's own new session. The `mutates_checkout` assertion below is
+            // never about a lower tier: a node that declares it is never lowered.
             const lowerTierRoute = ctx.nodeRoute;
             const escalation = escalationReason(lowerTierRoute, retriedOutput);
-            // A lower-tier attempt that changed a checkout the node promised to leave
-            // alone owns that violation. Running the authored tier next would only have
-            // the final assertion blame an attempt that did nothing wrong, so the node
-            // stays failed on the attempt that caused it.
-            const treeAfterLowerTier =
-              escalation !== undefined && treeBefore !== undefined
-                ? await snapshotCheckout(ctx.cwd, checkoutExcludes)
-                : undefined;
-            const lowerTierChangedCheckout =
-              treeAfterLowerTier !== undefined && treeAfterLowerTier !== treeBefore;
-            if (lowerTierRoute !== undefined && lowerTierChangedCheckout) {
-              getLog().error(
-                {
-                  nodeId: node.id,
-                  routedTier: lowerTierRoute.routedTier,
-                  authoredTier: lowerTierRoute.authoredTier,
-                },
-                'model_router.escalation_skipped_checkout_changed'
-              );
-              await safeSendMessage(
-                ctx.platform,
-                ctx.conversationId,
-                `Node \`${node.id}\` failed on the \`${lowerTierRoute.routedTier}\` tier after changing a checkout it declares \`mutates_checkout: false\`. It was not run again on its authored tier.`,
-                { workflowId: ctx.workflowRun.id, nodeName: node.id }
-              );
-            } else if (lowerTierRoute !== undefined && escalation !== undefined) {
+            if (lowerTierRoute !== undefined && escalation !== undefined) {
               const lowerTierOutput = retriedOutput;
               ctx.nodeRoute = escalateRoute(lowerTierRoute, escalation);
               getLog().warn(

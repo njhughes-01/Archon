@@ -15,10 +15,15 @@ export type ModelRouterMode = z.infer<typeof modelRouterModeSchema>;
  * the operator's opt-in; in a repository's config it can only narrow that opt-in (see
  * `narrowModelRouterConfig`). Sparse, so a block can set one field and leave the other.
  */
-export const modelRouterConfigInputSchema = z.object({
-  tiers: z.array(tierNameSchema).optional(),
-  mode: modelRouterModeSchema.optional(),
-});
+export const modelRouterConfigInputSchema = z
+  .object({
+    tiers: z.array(tierNameSchema).optional(),
+    mode: modelRouterModeSchema.optional(),
+    steps: z.array(z.string().trim().min(1)).optional(),
+  })
+  // Strict on purpose, unlike the rest of the config: a mistyped key here (`teirs`,
+  // `mdoe`) would otherwise leave the operator on defaults they did not choose.
+  .strict();
 export type ModelRouterConfigInput = z.infer<typeof modelRouterConfigInputSchema>;
 
 /**
@@ -28,6 +33,12 @@ export type ModelRouterConfigInput = z.infer<typeof modelRouterConfigInputSchema
 export interface ModelRouterConfig {
   tiers: TierName[];
   mode: ModelRouterMode;
+  /**
+   * The steps the router may lower, by step name (see `routerStepName`). Absent means
+   * every step on a routable tier; present, only these. A listed name grants nothing by
+   * itself: the step must still pass every other rule.
+   */
+  steps?: string[];
 }
 
 /** Only the tier meant for ordinary work may be lowered until an operator names others. */
@@ -38,7 +49,7 @@ export const DEFAULT_MODEL_ROUTER_MODE: ModelRouterMode = 'shadow';
 /**
  * Apply a repository's `modelRouter:` block to the install's. A repository can only narrow
  * what the operator allowed: turn the router down or off, and take tiers away. It cannot
- * switch the router on, move it toward `apply`, or add a tier. `MODEL_ROUTER_MODES` is
+ * switch the router on, move it toward `apply`, add a tier, or add a step. `MODEL_ROUTER_MODES` is
  * ordered from least to most effect, which is the order "narrower" means here.
  *
  * The operator's install config decides what may be sent off the machine and which steps
@@ -50,7 +61,16 @@ export function narrowModelRouterConfig(
   repo: ModelRouterConfigInput
 ): ModelRouterConfig {
   const repoTiers = repo.tiers;
+  const repoSteps = repo.steps;
   const rank = (mode: ModelRouterMode): number => MODEL_ROUTER_MODES.indexOf(mode);
+  // No install list means every step. A repository list then narrows "every step" to
+  // its own entries; with an install list it can only keep entries the install has.
+  const steps =
+    repoSteps === undefined
+      ? install.steps
+      : install.steps === undefined
+        ? repoSteps
+        : install.steps.filter(step => repoSteps.includes(step));
   return {
     tiers:
       repoTiers === undefined
@@ -58,6 +78,7 @@ export function narrowModelRouterConfig(
         : install.tiers.filter(tier => repoTiers.includes(tier)),
     mode:
       repo.mode !== undefined && rank(repo.mode) < rank(install.mode) ? repo.mode : install.mode,
+    ...(steps !== undefined ? { steps } : {}),
   };
 }
 
@@ -65,6 +86,7 @@ export function resolveModelRouterConfig(input: ModelRouterConfigInput): ModelRo
   return {
     tiers: input.tiers ?? [...DEFAULT_MODEL_ROUTER_TIERS],
     mode: input.mode ?? DEFAULT_MODEL_ROUTER_MODE,
+    ...(input.steps !== undefined ? { steps: input.steps } : {}),
   };
 }
 

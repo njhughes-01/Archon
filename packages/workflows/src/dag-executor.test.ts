@@ -2921,6 +2921,123 @@ describe('executeDagWorkflow -- cost-aware model router', () => {
     }
   );
 
+  it('never lowers a node that promises to leave the checkout alone, on any provider', async () => {
+    for (const aiProfile of [
+      profile(),
+      profile({ small: { provider: 'codex', model: 'gpt-mini' } }),
+    ]) {
+      mockSendQueryDag.mockClear();
+      const deps = await run({ aiProfile, nodes: [mediumStep({ mutates_checkout: false })] });
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(sentModels()).toEqual(['sonnet']);
+      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({
+        source: 'disabled',
+        routedTier: 'medium',
+        applied: false,
+        reason: 'read_only_node',
+      });
+    }
+  });
+
+  describe('with an operator list of steps', () => {
+    const listed = (steps: string[], mode: 'shadow' | 'apply' = 'apply'): WorkflowConfig => ({
+      ...minimalConfig,
+      modelRouter: { tiers: ['medium'], mode, steps },
+    });
+    const commandStep = (id: string): DagNode =>
+      ({
+        id,
+        kind: 'agent',
+        source: { kind: 'command', name: 'discover' },
+        model: 'medium',
+        output_format: CONTRACT,
+      }) as DagNode;
+
+    it('lowers a listed command and nothing else', async () => {
+      const deps = await run({
+        config: listed(['discover']),
+        nodes: [commandStep('listed'), mediumStep({ id: 'other', depends_on: ['listed'] })],
+      });
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(sentModels()).toEqual(['haiku', 'sonnet']);
+      expect(bindingsOf(deps, 'node_started', 'listed')[0].route).toMatchObject({ applied: true });
+    });
+
+    it.each(['shadow', 'apply'] as const)(
+      'records a step that is not listed as not_listed in %s mode, without asking',
+      async mode => {
+        const deps = await run({ config: listed(['discover'], mode) });
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(sentModels()).toEqual(['sonnet']);
+        expect(bindingsOf(deps, 'node_started')[0].route).toEqual({
+          mode,
+          source: 'disabled',
+          authoredTier: 'medium',
+          routedTier: 'medium',
+          applied: false,
+          reason: 'not_listed',
+        });
+      }
+    );
+
+    it('names an inline prompt step by its node id', async () => {
+      await run({ config: listed(['step1']) });
+      expect(sentModels()).toEqual(['haiku']);
+    });
+
+    it('matches a composed step by the command its own workflow names', async () => {
+      await mkdir(join(testDir, '.archon', 'workflows'), { recursive: true });
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'inner.yaml'),
+        `
+name: inner
+description: one command step
+model: medium
+nodes:
+  - id: find
+    command: discover
+    output_format:
+      type: object
+      properties: { ok: { type: boolean } }
+      required: [ok]
+`
+      );
+      await writeFile(
+        join(testDir, '.archon', 'workflows', 'outer.yaml'),
+        `
+name: outer
+description: composes inner
+nodes:
+  - id: block
+    include: inner
+`
+      );
+      const discovered = await discoverWorkflows(testDir, { loadDefaults: false });
+      expect(discovered.errors).toEqual([]);
+      const outer = discovered.workflows.find(w => w.workflow.name === 'outer');
+      if (!outer) throw new Error('outer was not discovered');
+      const runOuter = async (steps: string[]): Promise<unknown[]> => {
+        mockSendQueryDag.mockClear();
+        await executeDagWorkflow({
+          ...dagOptions({
+            deps: createMockDeps(),
+            cwd: testDir,
+            workflow: { name: 'placeholder', nodes: [] },
+            workflowRun: makeWorkflowRun('router-composed', { user_message: TASK }),
+            aiProfile: profile(),
+            config: listed(steps),
+          }),
+          workflow: outer.workflow,
+        });
+        return sentModels();
+      };
+      // The composed node is an inline prompt called `block__find`; the operator still
+      // names it by its command.
+      expect(await runOuter(['discover'])).toEqual(['haiku']);
+      expect(await runOuter(['block__find'])).toEqual(['sonnet']);
+    });
+  });
+
   it('never lowers a node with no output contract, and records it as unverifiable', async () => {
     mockSendQueryDag.mockImplementation(async function* () {
       yield { type: 'assistant', content: 'prose' };
@@ -3298,21 +3415,6 @@ nodes:
       }
     );
 
-    it('is not offered to a node that promises to leave the checkout alone', async () => {
-      const deps = await run({
-        aiProfile: crossProvider(),
-        nodes: [mediumStep({ mutates_checkout: false })],
-      });
-      expect(fetchSpy).not.toHaveBeenCalled();
-      expect(sentModels()).toEqual(['sonnet']);
-      expect(bindingsOf(deps, 'node_started')[0].route).toMatchObject({ reason: 'no_lower_tier' });
-
-      // On its own provider the same node may still be lowered.
-      mockSendQueryDag.mockClear();
-      await run({ nodes: [mediumStep({ mutates_checkout: false })] });
-      expect(sentModels()).toEqual(['haiku']);
-    });
-
     it('is offered to a node in a parallel layer, where no session crosses the node', async () => {
       const deps = await run({
         aiProfile: crossProvider(),
@@ -3541,68 +3643,6 @@ nodes:
         { model: 'haiku', resume: 'first-session' },
         { model: 'sonnet', resume: 'first-session' },
       ]);
-    });
-
-    describe('a lower tier that changes a checkout the node declares read-only', () => {
-      const readOnlyStep = (): DagNode =>
-        mediumStep({ mutates_checkout: false, retry: { max_attempts: 0 } });
-
-      beforeEach(async () => {
-        await git.execFileAsync('git', ['init', '-q'], { cwd: testDir });
-        await writeFile(join(testDir, '.gitignore'), '.archon/\nartifacts/\nstate/\nlogs/\n');
-        await git.execFileAsync('git', ['add', '.gitignore'], { cwd: testDir });
-        await git.execFileAsync(
-          'git',
-          ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-qm', 'ignore'],
-          { cwd: testDir }
-        );
-      });
-
-      it('fails on its own attempt when it completed, and is not run again', async () => {
-        mockSendQueryDag.mockImplementation(async function* () {
-          await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
-          yield* meetsContract();
-        });
-        const deps = await run({ nodes: [readOnlyStep()] });
-        expect(sentModels()).toEqual(['haiku']);
-        const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
-        expect(failed.map(event => event.data?.failure_kind)).toEqual(['output_contract']);
-        expect((failed[0].data?.binding as Record<string, unknown>).tier).toBe('small');
-      });
-
-      it('is not escalated when it failed: the authored tier is never blamed for the write', async () => {
-        const platform = createMockPlatform();
-        mockSendQueryDag.mockImplementation(async function* () {
-          await writeFile(join(testDir, 'stray.txt'), 'written by the agent');
-          yield { type: 'assistant', content: 'prose, not the contract' };
-          yield { type: 'result', sessionId: 'sid' };
-        });
-        const deps = await run({ nodes: [readOnlyStep()], platform });
-        // The contract failure would escalate, but the tree is already changed.
-        expect(sentModels()).toEqual(['haiku']);
-        const failed = eventsOf(deps).filter(event => event.event_type === 'node_failed');
-        expect(failed).toHaveLength(1);
-        expect((failed[0].data?.binding as Record<string, unknown>).route).toMatchObject({
-          routedTier: 'small',
-          applied: true,
-        });
-        expect(deliveredMessages(platform)).toContain(
-          'Node `step1` failed on the `small` tier after changing a checkout it declares `mutates_checkout: false`. It was not run again on its authored tier.'
-        );
-      });
-
-      it('is escalated as usual when it failed without touching the checkout', async () => {
-        mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
-          if ((options as { model?: string } | undefined)?.model === 'haiku') {
-            yield { type: 'assistant', content: 'prose' };
-            yield { type: 'result', sessionId: 'sid' };
-            return;
-          }
-          yield* meetsContract();
-        });
-        await run({ nodes: [readOnlyStep()] });
-        expect(sentModels()).toEqual(['haiku', 'sonnet']);
-      });
     });
   });
 

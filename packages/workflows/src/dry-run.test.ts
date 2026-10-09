@@ -2718,6 +2718,13 @@ describe('dryRunWorkflow — the model router never changes the reported resolut
       output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
     },
     { id: 'unchecked', prompt: 'p', model: 'medium' },
+    {
+      id: 'readonly',
+      prompt: 'p',
+      model: 'medium',
+      mutates_checkout: false,
+      output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
+    },
     { id: 'pinned', prompt: 'p', model: 'sonnet' },
     { id: 'frontier', prompt: 'p', model: 'large' },
     {
@@ -2735,6 +2742,7 @@ describe('dryRunWorkflow — the model router never changes the reported resolut
     modelRouter?: {
       tiers: ('small' | 'medium' | 'large')[];
       mode: 'off' | 'shadow' | 'apply';
+      steps?: string[];
     },
     env: Record<string, string> = { JEV_API_KEY: 'k' }
   ): Promise<Awaited<ReturnType<typeof dryRunWorkflow>>> {
@@ -2742,7 +2750,14 @@ describe('dryRunWorkflow — the model router never changes the reported resolut
       workflow: makeTestWorkflow({ name: 'routed', nodes }),
       userMessage: 'go',
       cwd: process.cwd(),
-      stubs: { routable: '{"ok":true}', unchecked: 'ok', pinned: 'ok', frontier: 'ok', body: 'ok' },
+      stubs: {
+        routable: '{"ok":true}',
+        unchecked: 'ok',
+        readonly: '{"ok":true}',
+        pinned: 'ok',
+        frontier: 'ok',
+        body: 'ok',
+      },
       env,
       config: { ...config, ...(modelRouter ? { modelRouter } : {}) },
       aiProfile,
@@ -2758,16 +2773,16 @@ describe('dryRunWorkflow — the model router never changes the reported resolut
     const applied = await dryRun({ tiers: ['medium'], mode: 'apply' });
     const byId = resolutions(applied);
 
-    for (const id of ['routable', 'unchecked', 'pinned', 'frontier', 'group', 'body']) {
+    for (const id of ['routable', 'unchecked', 'readonly', 'pinned', 'frontier', 'group', 'body']) {
       const { modelRouter: _note, ...resolution } = byId.get(id) ?? {};
       expect(resolution).toEqual(unrouted.get(id) ?? {});
       expect(unrouted.get(id)?.modelRouter).toBeUndefined();
     }
     expect(byId.get('routable')?.model).toBe('sonnet');
     expect(byId.get('routable')?.modelRouter).toEqual({ mode: 'apply', ceiling: 'medium' });
-    // A step with no output contract, a literal model, a tier the operator did not name,
+    // A step with no output contract, a step that may not write the checkout, a literal model, a tier the operator did not name,
     // and a loop_group with its body are never lowered, so nothing is said about them.
-    for (const id of ['unchecked', 'pinned', 'frontier', 'group', 'body']) {
+    for (const id of ['unchecked', 'readonly', 'pinned', 'frontier', 'group', 'body']) {
       expect(byId.get(id)?.modelRouter).toBeUndefined();
     }
     expect(formatDryRunTrace(applied)).toContain(
@@ -2800,6 +2815,13 @@ describe('dryRunWorkflow — the model router never changes the reported resolut
       );
       expect(formatDryRunTrace(inactive)).not.toContain('may run this step below');
     }
+
+    // With an operator list, only listed steps are marked.
+    const listed = await dryRun({ tiers: ['medium'], mode: 'apply', steps: ['routable'] });
+    expect(resolutions(listed).get('routable')?.modelRouter).toBeDefined();
+    const unlisted = await dryRun({ tiers: ['medium'], mode: 'apply', steps: ['something-else'] });
+    expect(resolutions(unlisted).get('routable')?.modelRouter).toBeUndefined();
+    expect(formatDryRunTrace(unlisted)).not.toContain('model router');
 
     const off = await dryRun({ tiers: ['medium'], mode: 'off' });
     expect(resolutions(off).get('routable')?.modelRouter).toBeUndefined();

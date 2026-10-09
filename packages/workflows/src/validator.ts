@@ -63,6 +63,7 @@ import { discoverScriptsForCwd } from './script-discovery';
 import { isInlineScript } from './executor-shared';
 import { buildAiProfile, isLiteralSpec, resolveModelSpec } from './model-validation';
 import { parsePackagedResourceReference } from './packaged-workflow';
+import { routerStepName } from './jev/model-router';
 import { liveSourceRoots, packagedWorkflowDirectory } from './workflow-source';
 import type { RawAliasesConfig, RawTiersConfig, ResolvedAiProfile } from './model-validation';
 
@@ -126,6 +127,31 @@ export interface ValidationConfig {
 // internal command/tool did-you-mean hints). Re-exported to preserve validator.ts's
 // public surface for existing importers (e.g. validator.test.ts).
 export { levenshtein, findSimilar };
+
+/**
+ * The names in the install's `modelRouter.steps` that no agent step of these workflows
+ * answers to, each with the step names it most resembles.
+ *
+ * The list is matched by name and an unmatched name lowers nothing, so a misspelt entry is
+ * silent at run time. It is a warning and never an error: a name can belong to a workflow
+ * that is not installed here, and the router is no less safe for an entry that matches
+ * nothing.
+ */
+export function unknownModelRouterSteps(
+  steps: readonly string[] | undefined,
+  workflows: readonly { nodes: readonly DagNode[] }[]
+): { step: string; similar: string[] }[] {
+  if (steps === undefined || steps.length === 0) return [];
+  const known = new Set<string>();
+  for (const workflow of workflows) {
+    for (const node of workflow.nodes) {
+      if (node.kind === 'agent') known.add(routerStepName(node));
+    }
+  }
+  return steps
+    .filter(step => !known.has(step))
+    .map(step => ({ step, similar: findSimilar(step, [...known]) }));
+}
 
 // =============================================================================
 // Command discovery

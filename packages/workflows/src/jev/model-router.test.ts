@@ -4,6 +4,8 @@ import { dagNodeSchema, type AgentNode } from '../schemas/dag-node';
 import { nodeRouteSchema, type ModelRouterConfig, type NodeRoute } from '../schemas/model-router';
 import type { ResolvedAiProfile, TierName } from '../schemas/model-binding';
 import { resolveNodeModel } from '../node-model-resolution';
+import { COMPOSED_NODE, type NodeWithComposedMeta } from '../compiled-command';
+import { formatPackagedResourceReference } from '../packaged-workflow';
 import { JEV_ENDPOINT_PATH, type Fetch } from './jev-client';
 import {
   ROUTER_DEFAULTS,
@@ -14,6 +16,7 @@ import {
   offerTiers,
   readRouterSettings,
   routeAgentNode,
+  routerStepName,
   routingCeiling,
   type CapabilityLookup,
   type RouteAgentNodeInput,
@@ -123,7 +126,6 @@ function candidate(overrides: CandidateOverrides = {}): RouteAgentNodeInput {
       workflowFallbackModel: undefined,
       workflowSandbox: undefined,
       webSearchMode: undefined,
-      workflowBetas: undefined,
       hasEnvVars: false,
     },
     loadStepText: () => Promise.resolve(STEP_TEXT),
@@ -418,11 +420,45 @@ describe('offerTiers: which lower tiers may be offered', () => {
     });
   });
 
-  it('does not move a node that promises to leave the checkout alone to another provider', () => {
+  it('never offers a tier to a node that promises to leave the checkout alone, on any provider', () => {
     const node = agentNode({ mutates_checkout: false });
     expect(offer({ node, profile: CROSS_PROVIDER }).excluded).toEqual({ small: 'read_only_node' });
-    // On its own provider the node keeps its guard and its escalation path.
+    expect(offer({ node }).excluded).toEqual({ small: 'read_only_node' });
+  });
+
+  it('offers nothing to a step the operator did not list', () => {
+    const config: ModelRouterConfig = { tiers: ['medium'], mode: 'apply', steps: ['other'] };
+    expect(offer({ config }).excluded).toEqual({ small: 'not_listed' });
+    expect(offer({ config: { ...config, steps: ['step'] } }).offered).toEqual(['small']);
+    expect(offer({ config: { ...config, steps: [] } }).excluded).toEqual({ small: 'not_listed' });
+  });
+
+  it('does not offer a strict-schema provider an object that declares no properties', () => {
+    // The shape of a step whose output carries a free-form object: a strict provider's
+    // normaliser closes it and the provider then rejects the whole schema.
+    const node = agentNode({
+      output_format: {
+        type: 'object',
+        properties: { mode: { type: 'string' }, pr: { type: 'object' } },
+        required: ['mode', 'pr'],
+      },
+    });
+    const strict = lookup({ requiresAllPropertiesRequired: true });
+    expect(offer({ node, profile: CROSS_PROVIDER }, strict).excluded).toEqual({
+      small: 'open_schema',
+    });
+    // The authored provider, which is not strict, still gets its own lower tier.
     expect(offer({ node }).offered).toEqual(['small']);
+    const nullable = agentNode({
+      output_format: {
+        type: 'object',
+        properties: { pr: { type: ['object', 'null'] } },
+        required: ['pr'],
+      },
+    });
+    expect(offer({ node: nullable, profile: CROSS_PROVIDER }, strict).excluded).toEqual({
+      small: 'open_schema',
+    });
   });
 
   it('does not offer a provider the run may not use', () => {
@@ -446,11 +482,7 @@ describe('offerTiers: which lower tiers may be offered', () => {
     const both: CapabilityLookup = () => FULL;
     const node = agentNode({ betas: ['context-1m-2025-08-07'] });
     const withBetas = candidate({ node, profile });
-    const withBetasScope = candidate({ profile });
-    const scoped = {
-      ...withBetasScope,
-      capabilityScope: { ...withBetasScope.capabilityScope, workflowBetas: ['x'] },
-    };
+    const scoped = candidate({ profile, workflowBetas: ['x'] });
     expect(offerTiers(withBetas, 'medium', both).excluded).toEqual({ small: 'unsupported:betas' });
     expect(offerTiers(scoped, 'medium', both).excluded).toEqual({ small: 'unsupported:betas' });
     expect(offerTiers(candidate({ profile }), 'medium', both).offered).toEqual(['small']);
@@ -619,6 +651,9 @@ describe('readRouterSettings', () => {
     [{ ...ENV, JEV_ROUTER_ENABLED: 'false' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_ENABLED: 'OFF' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_ENABLED: ' no ' }, 'disabled_by_env'],
+    [{ ...ENV, JEV_ROUTER_ENABLED: 'disabled' }, 'disabled_by_env'],
+    [{ ...ENV, JEV_ROUTER_ENABLED: 'flase' }, 'disabled_by_env'],
+    [{ ...ENV, JEV_ENABLED: 'none' }, 'disabled_by_env'],
     [{ ...ENV, JEV_ROUTER_MIN_PROB: '1.5' }, 'invalid_setting:JEV_ROUTER_MIN_PROB'],
     [{ ...ENV, JEV_ROUTER_RISK_THRESHOLD: 'high' }, 'invalid_setting:JEV_ROUTER_RISK_THRESHOLD'],
     [{ ...ENV, JEV_ROUTER_TIMEOUT_MS: '0' }, 'invalid_setting:JEV_ROUTER_TIMEOUT_MS'],
@@ -628,8 +663,12 @@ describe('readRouterSettings', () => {
     expect(readRouterSettings(env)).toEqual({ ok: false, reason });
   });
 
-  it('leaves a master switch that is on, and one that is unset, alone', () => {
-    expect(readRouterSettings({ ...ENV, JEV_ENABLED: '1', JEV_ROUTER_ENABLED: '' }).ok).toBe(true);
+  it.each([
+    [{ JEV_ENABLED: '1', JEV_ROUTER_ENABLED: '' }],
+    [{ JEV_ENABLED: 'TRUE', JEV_ROUTER_ENABLED: ' On ' }],
+    [{ JEV_ROUTER_ENABLED: 'yes' }],
+  ])('is on for the explicit on spellings, and for unset or empty: %p', switches => {
+    expect(readRouterSettings({ ...ENV, ...switches }).ok).toBe(true);
   });
 });
 
@@ -687,7 +726,6 @@ describe('routeAgentNode', () => {
       allowed_tools: ['Read'],
       mcp: 'servers.json',
       skills: ['lint'],
-      mutates_checkout: false,
       output_format: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] },
     });
     const { fetch, bodies, raw } = fakeFetch(answering());
@@ -713,7 +751,8 @@ describe('routeAgentNode', () => {
       tools_declared: true,
       mcp_present: true,
       skills_present: true,
-      read_only_enforced: true,
+      // Constant: a step that promises to leave the checkout alone is never asked about.
+      read_only_enforced: false,
       context_chars: STEP_TEXT.length + TASK_TEXT.length,
     });
     // The author's own tier would anchor the answer, so it is never among the facts.
@@ -731,7 +770,6 @@ describe('routeAgentNode', () => {
     const standalone = await sent(agentNode({ prompt: undefined, command: 'sdlc-step' }));
     const composed = await sent(agentNode({ id: 'outer__inner__step' }));
     expect(standalone).toEqual(composed);
-    expect(standalone.features).toMatchObject({ read_only_enforced: false });
     expect(JSON.stringify(standalone)).not.toContain('sdlc-step');
   });
 
@@ -863,6 +901,61 @@ describe('routeAgentNode', () => {
       applied: false,
       reason: 'invalid_setting:JEV_ROUTER_MIN_CONFIDENCE',
     });
+  });
+
+  it.each([
+    [
+      'a step the operator did not list',
+      { config: { tiers: ['medium'], mode: 'apply', steps: ['other'] } },
+      'not_listed',
+    ],
+    [
+      'a step that promises to leave the checkout alone',
+      { node: agentNode({ mutates_checkout: false }) },
+      'read_only_node',
+    ],
+  ] as [string, CandidateOverrides, string][])(
+    'never asks about %s, even when an earlier pass recorded a lower tier for it',
+    async (_label, overrides, reason) => {
+      const recorded: NodeRoute = {
+        mode: 'apply',
+        source: 'jev',
+        authoredTier: 'medium',
+        routedTier: 'small',
+        applied: true,
+      };
+      const { fetch, urls } = fakeFetch(answering());
+      const routed = await routeAgentNode(candidate({ ...overrides, recorded }), opts({ fetch }));
+      expect(urls).toEqual([]);
+      expect(routed).toEqual({
+        route: {
+          mode: 'apply',
+          source: 'disabled',
+          authoredTier: 'medium',
+          routedTier: 'medium',
+          applied: false,
+          reason,
+        },
+      });
+    }
+  );
+
+  it('keeps the ceiling when redaction leaves none of the task to show the classifier', async () => {
+    const { fetch, urls } = fakeFetch(answering());
+    const routed = await routeAgentNode(
+      candidate({ taskText: () => 'A'.repeat(40_000) }),
+      opts({ fetch })
+    );
+    expect(urls).toEqual([]);
+    expect(routed?.route).toMatchObject({
+      source: 'fallback',
+      routedTier: 'medium',
+      applied: false,
+      reason: 'no_task_text',
+    });
+    // A run with no task at all is still classified on its step.
+    await routeAgentNode(candidate({ taskText: () => '' }), opts({ fetch }));
+    expect(urls).toHaveLength(1);
   });
 
   it.each(['shadow', 'apply'] as const)(
@@ -1099,6 +1192,37 @@ describe('routeAgentNode', () => {
       expect(serialized).not.toContain(TASK_TEXT);
       expect(serialized).not.toContain(API_KEY);
     }
+  });
+});
+
+describe('routerStepName: how an operator names a step', () => {
+  it('names a command step by its command, without the pack prefix', () => {
+    expect(routerStepName(agentNode({ prompt: undefined, command: 'discover-checks' }))).toBe(
+      'discover-checks'
+    );
+    const packaged = formatPackagedResourceReference(
+      { source: 'bundled', pack: 'sdlc', workflow: 'validate' },
+      'discover-checks'
+    );
+    expect(routerStepName(agentNode({ prompt: undefined, command: packaged }))).toBe(
+      'discover-checks'
+    );
+  });
+
+  it('names a composed command step by the command composition recorded', () => {
+    const composed = agentNode({ id: 'deliver__validate__discover' });
+    (composed as AgentNode & NodeWithComposedMeta)[COMPOSED_NODE] = {
+      origin: 'archon-validate',
+      command: 'discover-checks',
+    };
+    expect(routerStepName(composed)).toBe('discover-checks');
+  });
+
+  it('names an inline prompt step by its node id as it appears in the run', () => {
+    expect(routerStepName(agentNode())).toBe('step');
+    const composed = agentNode({ id: 'outer__inner' });
+    (composed as AgentNode & NodeWithComposedMeta)[COMPOSED_NODE] = { origin: 'inner-workflow' };
+    expect(routerStepName(composed)).toBe('outer__inner');
   });
 });
 

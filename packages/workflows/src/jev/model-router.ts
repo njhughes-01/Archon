@@ -26,7 +26,9 @@ import { hasOpenAdditionalProperties } from '@archon/providers/structured-output
 import type { ProviderCapabilities } from '@archon/providers/types';
 import { unsupportedNodeFields, type NodeCapabilityScope } from '../node-capability-checks';
 import type { NodeModelResolution } from '../node-model-resolution';
-import { redactForClassifier } from '../redaction';
+import { readComposedMeta } from '../compiled-command';
+import { parsePackagedResourceReference } from '../packaged-workflow';
+import { classifierTextIsEmpty, redactForClassifier } from '../redaction';
 import { isNodeContextResume, type AgentNode } from '../schemas/dag-node';
 import { TIER_NAMES, type ResolvedAiProfile, type TierName } from '../schemas/model-binding';
 import type { NodeFailureKind } from '../schemas/node-execution';
@@ -79,11 +81,16 @@ export type RouterEnv = Readonly<Record<string, string | undefined>>;
 const isUnit = (value: number): boolean => value >= 0 && value <= 1;
 const isPositiveInteger = (value: number): boolean => Number.isInteger(value) && value > 0;
 
-const OFF_VALUES = new Set(['0', 'false', 'off', 'no']);
+const ON_VALUES = new Set(['1', 'true', 'on', 'yes']);
 
-/** `0`, `false`, `off` or `no` in any case. Unset and empty leave the feature on. */
+/**
+ * A switch is on when it is unset, empty, or one of `1`, `true`, `on`, `yes` in any case.
+ * Anything else turns the feature off: a value the operator typed to disable the router
+ * (`disabled`, `none`, a typo of `false`) must never be read as "on".
+ */
 function isSwitchedOff(raw: string | undefined): boolean {
-  return raw !== undefined && OFF_VALUES.has(raw.trim().toLowerCase());
+  const value = raw?.trim().toLowerCase() ?? '';
+  return value !== '' && !ON_VALUES.has(value);
 }
 
 /** Why the router makes no request at all in this environment, or `undefined` when it can. */
@@ -171,6 +178,8 @@ export interface RoutingCandidate {
   /** The run executes inside the container backend. */
   inContainer: boolean;
   capabilityScope: NodeCapabilityScope;
+  /** Workflow-level `betas:`, which a node inherits when it names none. */
+  workflowBetas?: unknown;
   /**
    * Whether this run may use a provider at all, for conditions no node field expresses.
    * Absent means every registered provider is usable. The tool-action gate supplies it:
@@ -223,12 +232,73 @@ export function routingCeiling(
 }
 
 /**
+ * The name an operator uses for a step in `modelRouter.steps`.
+ *
+ * A step that runs a command is named by the command, as its author wrote it and without
+ * the pack prefix the loader adds. That holds wherever the workflow declaring it is
+ * composed: composition records the command on the node it compiles. A step with an inline
+ * `prompt:` has no command and is named by its node id as it appears in the run, which for
+ * a composed step is the prefixed id (`outer__inner__step`).
+ */
+export function routerStepName(node: AgentNode): string {
+  if (node.source.kind === 'command') {
+    return parsePackagedResourceReference(node.source.name)?.name ?? node.source.name;
+  }
+  return readComposedMeta(node)?.command ?? node.id;
+}
+
+/**
+ * Why a step is never lowered, on any provider, or `undefined` when it may be. These are
+ * properties of the step and the operator's list alone, so a dry run can know them.
+ *
+ *  - `not_listed`: the operator named the steps the router may lower, and this is not one.
+ *  - `read_only_node`: the step promises to leave the checkout alone. A lower tier that
+ *    writes to it fails a run that would have succeeded, and no second attempt can undo
+ *    the write.
+ *  - `unverifiable`: the step declares no output contract, so escalation would have
+ *    nothing to check and a weak answer from a lower tier would pass unseen.
+ */
+export function stepExclusion(
+  node: AgentNode,
+  config: Pick<ModelRouterConfig, 'steps'>
+): 'not_listed' | 'read_only_node' | 'unverifiable' | undefined {
+  if (config.steps !== undefined && !config.steps.includes(routerStepName(node))) {
+    return 'not_listed';
+  }
+  if (node.mutates_checkout === false) return 'read_only_node';
+  return node.output_format === undefined ? 'unverifiable' : undefined;
+}
+
+/** A schema node a strict provider treats as an object: the rule its normaliser applies. */
+function isObjectSchemaNode(node: Record<string, unknown>): boolean {
+  return (
+    node.type === 'object' ||
+    (Array.isArray(node.type) && node.type.includes('object')) ||
+    'properties' in node
+  );
+}
+
+/**
+ * True when some object in `schema` declares no `properties`. A strict provider's
+ * normaliser closes such an object (`additionalProperties: false`) and the provider then
+ * rejects the schema outright, so to the router it is as open as an explicit open record.
+ * Kept here, not in the providers' shared helper: that helper also decides a warning on
+ * unrouted runs, which must not change.
+ */
+function hasPropertylessObject(schema: unknown): boolean {
+  if (Array.isArray(schema)) return schema.some(hasPropertylessObject);
+  if (schema === null || typeof schema !== 'object') return false;
+  const node = schema as Record<string, unknown>;
+  if (isObjectSchemaNode(node) && !('properties' in node)) return true;
+  return Object.values(node).some(hasPropertylessObject);
+}
+
+/**
  * Why a provider cannot be trusted to show that it got the node wrong, or `undefined` when
  * it can. A node is lowered only where escalation could catch a bad result, and the one
  * thing escalation can see is a failed output contract. So the target must enforce the
  * node's `output_format` as written: grammar-constrained decoding, every property required
- * where the provider demands it, and no open `additionalProperties` that a strict provider
- * would silently close.
+ * where the provider demands it, and no object a strict provider would close or reject.
  */
 function unverifiableOn(node: AgentNode, caps: ProviderCapabilities): string | undefined {
   if (node.output_format === undefined) return 'unverifiable';
@@ -238,7 +308,19 @@ function unverifiableOn(node: AgentNode, caps: ProviderCapabilities): string | u
   if (findRequiredPropertyGaps(node.output_format, 'output_format').length > 0) {
     return 'strict_schema';
   }
-  return hasOpenAdditionalProperties(node.output_format) ? 'open_schema' : undefined;
+  return hasOpenAdditionalProperties(node.output_format) ||
+    hasPropertylessObject(node.output_format)
+    ? 'open_schema'
+    : undefined;
+}
+
+/**
+ * `betas:` names Claude SDK beta features. Only the Claude provider reads it, and no
+ * capability flag covers it. It is checked here and not in the executor's warning list,
+ * so a run with no router reports exactly what it always has.
+ */
+function providerReadsBetas(provider: string): boolean {
+  return provider === 'claude';
 }
 
 /** Why a provider other than the ceiling's cannot take the node, or `undefined` when it can. */
@@ -253,9 +335,6 @@ function crossProviderExclusion(
   // A node that names its provider would get a new "model resolves to another provider"
   // warning, and the author's stated provider would lose to the router's.
   if (node.provider !== undefined && node.provider !== provider) return 'declared_provider';
-  // A node that promises to leave the checkout alone fails outright if a lower tier on
-  // another provider writes to it, and no second attempt can undo the write.
-  if (node.mutates_checkout === false) return 'read_only_node';
   // The run-start container pre-scan only looked at the authored tier's provider.
   if (candidate.inContainer && !caps.containerExec) return 'container_exec';
   // A field the ceiling honours and this provider would silently ignore: a dropped tool
@@ -266,7 +345,13 @@ function crossProviderExclusion(
   const lost = unsupportedNodeFields(node, provider, caps, capabilityScope).find(
     field => !ceilingUnsupported.has(field)
   );
-  return lost !== undefined ? `unsupported:${lost}` : undefined;
+  if (lost !== undefined) return `unsupported:${lost}`;
+  const namesBetas = (node.betas ?? candidate.workflowBetas) !== undefined;
+  return namesBetas &&
+    providerReadsBetas(candidate.resolution.provider) &&
+    !providerReadsBetas(provider)
+    ? 'unsupported:betas'
+    : undefined;
 }
 
 export interface TierOffer {
@@ -299,6 +384,7 @@ export function offerTiers(
   ) {
     return offer;
   }
+  const stepReason = stepExclusion(candidate.node, candidate.config);
   for (const tier of TIER_NAMES.slice(0, TIER_NAMES.indexOf(ceiling))) {
     const preset = Object.hasOwn(candidate.aiProfile.aliases, tier)
       ? candidate.aiProfile.aliases[tier]
@@ -312,6 +398,8 @@ export function offerTiers(
       preset.effort === ceilingPreset.effort
     ) {
       exclusion = 'same_as_ceiling';
+    } else if (stepReason !== undefined) {
+      exclusion = stepReason;
     } else {
       const caps = getCapabilities(preset.provider);
       if (caps === undefined) exclusion = 'unregistered_provider';
@@ -383,12 +471,16 @@ export function decideTier(
 /**
  * Facts about a step computed in code, so the classifier need not infer them from prose.
  *
- * Nothing here depends on how the step reached the run. A command run by its own workflow
- * and the same command composed into another through `include:` differ in node id and in
- * source kind, and must look identical to the classifier, so neither is sent. The authored
- * tier is not sent either: the offered tiers are already the question's options, and
+ * None of these facts depends on how the step reached the run: a command run by its own
+ * workflow and the same command composed into another through `include:` differ in node id
+ * and in source kind, so neither is sent. That is true of the facts, not of the step text.
+ * Composition writes the caller's input values into a composed step's text, so the same
+ * command can read differently in two workflows, and the classifier is shown the text of
+ * the step that actually runs.
+ *
+ * The authored tier is not sent: the offered tiers are already the question's options, and
  * naming the one the author picked anchors the answer there. Whether the step declares an
- * output format is not a fact worth sending, because only steps that do are classified.
+ * output format is not sent either: only steps that declare one are ever classified.
  */
 export interface RouteFeatures {
   [key: string]: JevStateValue;
@@ -396,10 +488,11 @@ export interface RouteFeatures {
   mcp_present: boolean;
   skills_present: boolean;
   /**
-   * The node declares `mutates_checkout: false`, so the engine fails it if it changes the
-   * working tree. Named for what is known: a node that does not declare it may still be
-   * read-only by its instructions, so the reverse (`mutates_checkout: true`) would claim
-   * more than the engine knows.
+   * The node declares `mutates_checkout: false`. A node that does is never lowered and so
+   * never classified, which makes this `false` in every question the router sends. It is
+   * still sent: the classifier's wording and thresholds were measured with it present, and
+   * taking a field out of the question is a change to the classifier's input that needs
+   * its own evaluation run.
    */
   read_only_enforced: boolean;
   /** Characters of step and task text before either is cut. */
@@ -607,11 +700,12 @@ async function decideRoute(
   if (!read.ok) return { route: finish(ceilingRoute(mode, ceiling, 'disabled', read.reason)) };
   const { settings } = read;
 
-  // A node with no output contract gives escalation nothing to check, so a weak answer
-  // from a lower tier would pass unseen. It is never lowered, on any provider, and the
-  // classifier is not asked.
-  if (input.node.output_format === undefined) {
-    return { route: finish(ceilingRoute(mode, ceiling, 'disabled', 'unverifiable')) };
+  // Before anything an earlier pass recorded: a step the operator did not list, a step
+  // that must not write the checkout and a step with no output contract are never
+  // lowered, on any provider, and the classifier is not asked about them.
+  const stepReason = stepExclusion(input.node, input.config);
+  if (stepReason !== undefined) {
+    return { route: finish(ceilingRoute(mode, ceiling, 'disabled', stepReason)) };
   }
 
   // A resumed or restarted run keeps the route its first pass recorded: the same node of
@@ -654,6 +748,16 @@ async function decideRoute(
   }
   const taskText = input.taskText();
   const credentialValues = input.credentialValues();
+  const task = redactForClassifier(taskText, credentialValues, settings.maxTaskChars);
+  // Redaction keeps whole words of a bounded window. A task that is one unbroken run of
+  // characters (a pasted blob) leaves nothing, and a step must not be judged routine for
+  // a task the classifier was never shown.
+  if (taskText.trim() !== '' && classifierTextIsEmpty(task)) {
+    return {
+      stepText,
+      route: finish(ceilingRoute(mode, ceiling, 'fallback', 'no_task_text')),
+    };
+  }
 
   const result = await askJev({
     apiBase: settings.apiBase,
@@ -665,7 +769,7 @@ async function decideRoute(
     // The task and the computed facts come first and the step text is only its opening:
     // what the run was asked to do decides the tier far more than the step's procedure.
     state: {
-      task: redactForClassifier(taskText, credentialValues, settings.maxTaskChars),
+      task,
       features: routeFeatures(input.node, stepText, taskText),
       step: redactForClassifier(stepText, credentialValues, settings.maxStepChars),
     },
