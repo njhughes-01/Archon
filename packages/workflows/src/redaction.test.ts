@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import {
+  classifierTextIsEmpty,
   collectCredentialValues,
   maskSecretShapes,
   redactCredentialValues,
@@ -108,6 +109,23 @@ describe('maskSecretShapes: one row per shape', () => {
     ['a Telegram bot URL', `https://api.telegram.org/bot123456:${SECRET}/sendMessage`],
     ['a URL password holding a slash', `postgres://app:pa/${SECRET}@db.internal/app`],
     ['a URL password holding an at sign', `https://bot:p@${SECRET}@git.example.com/x`],
+    ['an environment subscript assignment', `os.environ["API_TOKEN"] = "${SECRET}"`],
+    ['JSON escaped inside a string', `{\\"clientSecret\\": \\"${SECRET}\\"}`],
+    [
+      'an Azure SAS signature',
+      `https://acct.blob.example.net/c/f?sv=2024&sig=${SECRET}%3D&se=2026`,
+    ],
+    ['an auth query parameter', `https://db.example.com/data.json?auth=${SECRET}`],
+    ['an OAuth code query parameter', `https://app.example.com/callback?code=${SECRET}&state=x`],
+    ['curl basic credentials', `curl -u deploy:${SECRET} https://example.com`],
+    ['an sshpass password', `sshpass -p ${SECRET} ssh host`],
+    ['a webhook signing secret', `whsec_${SECRET}abcdefgh`],
+    ['a GitLab token', `glpat-${SECRET}abcdefgh`],
+    ['an npm token', `npm_${SECRET}abcdefghijklmnop`],
+    ['a Google API key', `AIza${SECRET}abcdefghijklmnopqrstu`],
+    ['a SendGrid key', `SG.${SECRET}abc.${SECRET}def`],
+    ['a Telegram bot token', `123456789:AA${SECRET}abcdefghijklmnopqrstuvw`],
+    ['an auth-named variable', `TWILIO_AUTH=${SECRET}`],
   ])('masks %s', (_label, text) => {
     const masked = maskSecretShapes(text);
     expect(masked).not.toContain(SECRET);
@@ -119,6 +137,13 @@ describe('maskSecretShapes: one row per shape', () => {
     ['a sentence about keys', 'Rotate the session signing key and keep the monkey patch.'],
     ['a plain URL', 'See https://example.com/docs/page for the token bucket design.'],
     ['an ordinary assignment', 'retries=3 and mode: fast'],
+    ['a key the task talks about', 'key: rotate the signing key before Friday'],
+    [
+      'a session the task talks about',
+      'Session: Tuesday 10am, signature: does not match the header',
+    ],
+    ['options that start like a password flag', 'find . -path ./src -print -perm 644'],
+    ['an author field', 'commit_author=bob and author: Alice'],
   ])('leaves %s alone', (_label, text) => {
     expect(maskSecretShapes(text)).toBe(text);
   });
@@ -152,6 +177,19 @@ describe('redaction cost', () => {
     const out = redactForClassifier(`${keyBlock} note ${token} tail ${'x '.repeat(200)}`, [], 200);
     expect(out.startsWith(`${REDACTED} note`)).toBe(true);
     expect(out).not.toContain('eyJ');
+  });
+});
+
+describe('classifierTextIsEmpty', () => {
+  it('is true when the window held no whole word to keep', () => {
+    const blob = redactForClassifier('A'.repeat(20_000), [], 1200);
+    expect(classifierTextIsEmpty(blob)).toBe(true);
+    expect(classifierTextIsEmpty('')).toBe(true);
+  });
+
+  it('is false for text that was kept, cut or not', () => {
+    expect(classifierTextIsEmpty('fix the login bug')).toBe(false);
+    expect(classifierTextIsEmpty(redactForClassifier('word '.repeat(5000), [], 100))).toBe(false);
   });
 });
 
