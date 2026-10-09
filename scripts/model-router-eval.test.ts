@@ -651,6 +651,24 @@ describe('main', () => {
     expect(text).toContain('under-routed: 0');
   });
 
+  it('does not ask about a read-only case, says so, and keeps it out of the routine share', async () => {
+    const cases = await readCases(EVAL_CASES);
+    const readOnly = cases.filter(c => !c.features.mutates_checkout);
+    const routine = cases.filter(c => c.kind === 'extraction' || c.kind === 'mechanical');
+    const routineAsked = routine.filter(c => c.features.mutates_checkout);
+    expect(readOnly.length).toBeGreaterThan(0);
+    expect(routineAsked.length).toBeLessThan(routine.length);
+    const { fetch, tasks } = classifier(() => ({ choice: 'small', risk: 0, ambiguity: 0 }));
+    const { text } = await capture(['--ceiling', 'medium'], LIVE_ENV, fetch);
+    expect(tasks).toHaveLength(cases.length - readOnly.length);
+    expect(text).toContain(
+      `Never asked, by the router's own rules (read_only_node): ${String(readOnly.length)} of ${String(cases.length)} cases, ${String(routine.length - routineAsked.length)} of them routine.`
+    );
+    expect(text).toContain(
+      `routine cases routed below the ceiling: ${String(routineAsked.length)} of ${String(routineAsked.length)}`
+    );
+  });
+
   it('exits 1 when a confident classifier under-routes', async () => {
     const { fetch } = classifier(() => ({
       choice: 'small',

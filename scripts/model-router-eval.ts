@@ -827,7 +827,7 @@ export function formatReport(report: EvalReport): string {
   if (neverAsked.length > 0) {
     lines.push(
       `Never asked, by the router's own rules (${[...new Set(neverAsked.map(r => r.notOfferedReason ?? 'unknown'))].join(', ')}): ` +
-        `${String(neverAsked.length)} of ${String(report.results.length)} cases. They stay on the ceiling and are not in the routine share.`
+        `${String(neverAsked.length)} of ${String(report.results.length)} cases, ${String(neverAsked.filter(r => ROUTINE_KINDS.includes(r.kind)).length)} of them routine. They stay on the ceiling and are not in the routine share.`
     );
   }
   if (!score.scored) {
