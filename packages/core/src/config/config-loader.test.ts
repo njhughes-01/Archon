@@ -536,15 +536,35 @@ modelRouter:
       expect(config.modelRouter?.steps).toEqual(expected);
     });
 
-    test('an invalid repo modelRouter block is dropped and the install block stands', async () => {
+    test('an invalid repo modelRouter block switches the router off for that repo and keeps the rest of its file', async () => {
+      // A repository can only narrow. Dropping its mistyped block would leave the
+      // router on where the repository asked for less.
+      mockLogger.error.mockClear();
       mockFsReadFile
-        .mockResolvedValueOnce('modelRouter:\n  mode: shadow')
+        .mockResolvedValueOnce('modelRouter:\n  mode: apply')
         .mockResolvedValueOnce('assistant: claude\nmodelRouter:\n  mdoe: off');
 
       const config = await loadConfig('/test/repo');
 
-      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'shadow' });
+      expect(config.modelRouter).toEqual({ tiers: ['medium'], mode: 'off' });
       expect(config.assistant).toBe('claude');
+      const [data, event] = mockLogger.error.mock.calls.at(-1) as unknown as [
+        { detail: string; scope: string },
+        string,
+      ];
+      expect(event).toBe('config.model_router_invalid_router_disabled');
+      expect(data.scope).toBe('repo');
+      expect(data.detail).toContain('mdoe');
+    });
+
+    test('an invalid repo modelRouter block cannot switch the router on where the install has not', async () => {
+      mockFsReadFile
+        .mockResolvedValueOnce('defaultAssistant: claude')
+        .mockResolvedValueOnce('modelRouter:\n  teirs: [medium]');
+
+      const config = await loadConfig('/test/repo');
+
+      expect(config.modelRouter).toBeUndefined();
     });
 
     test('a repo modelRouter block cannot override an install-level off', async () => {

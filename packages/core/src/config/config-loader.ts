@@ -58,6 +58,7 @@ import {
   modelRouterConfigInputSchema,
   narrowModelRouterConfig,
   resolveModelRouterConfig,
+  type ModelRouterConfigInput,
 } from '@archon/workflows/schemas/model-router';
 
 /**
@@ -340,19 +341,30 @@ function validateModelRouterConfig(parsed: unknown, configPath: string): void {
  * Read-side handling of a `modelRouter:` block: an invalid one switches the router off
  * and nothing else. The loaders degrade a file they reject to an empty config, which for
  * most blocks is the safe reading. Here it is not: one mistyped router key would also
- * throw away the operator's tiers and assistants. So the block alone is dropped, loudly,
+ * throw away the operator's tiers and assistants. So the block alone is replaced, loudly,
  * and the rest of the file stands.
+ *
+ * What "off" takes depends on the file. The install block is the opt-in, so dropping it
+ * leaves the router off. A repository block can only narrow the install's, so dropping it
+ * would do the opposite: a repository that wrote `mdoe: off` would run with the router
+ * on. An invalid repository block therefore becomes `mode: off`.
  */
-function dropInvalidModelRouterConfig(parsed: unknown, configPath: string): void {
+function dropInvalidModelRouterConfig(
+  parsed: unknown,
+  configPath: string,
+  scope: 'install' | 'repo'
+): void {
   try {
     validateModelRouterConfig(parsed, configPath);
   } catch (error) {
     if (!(error instanceof InvalidConfigError)) throw error;
     getLog().error(
-      { configPath, detail: error.summary },
+      { configPath, scope, detail: error.summary },
       'config.model_router_invalid_router_disabled'
     );
-    delete (parsed as { modelRouter?: unknown }).modelRouter;
+    const config = parsed as { modelRouter?: ModelRouterConfigInput };
+    if (scope === 'repo') config.modelRouter = { mode: 'off' };
+    else delete config.modelRouter;
   }
 }
 
@@ -441,7 +453,7 @@ async function readGlobalConfigOrDegrade(configPath: string): Promise<GlobalConf
     const content = await readConfigFile(configPath);
     const parsed = parseYaml(content);
     validateWorkflowContinuationConfig(parsed, configPath);
-    dropInvalidModelRouterConfig(parsed, configPath);
+    dropInvalidModelRouterConfig(parsed, configPath, 'install');
     validateModelBindingConfig(parsed, configPath);
     return (parsed as GlobalConfig | null) ?? {};
   } catch (error) {
@@ -508,7 +520,7 @@ async function readRepoConfigOrDegrade(configPath: string): Promise<RepoConfig> 
     const content = await readConfigFile(configPath);
     const raw = parseYaml(content);
     validateWorkflowContinuationConfig(raw, configPath);
-    dropInvalidModelRouterConfig(raw, configPath);
+    dropInvalidModelRouterConfig(raw, configPath, 'repo');
     validateModelBindingConfig(raw, configPath);
     const parsed = (raw as RepoConfig | null) ?? {};
     const recommendedWorkflows = sanitizeRecommendedWorkflows(
