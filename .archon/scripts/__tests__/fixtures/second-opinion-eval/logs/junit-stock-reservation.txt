@@ -1,0 +1,24 @@
+$ mvn -B -q test
+[INFO] Running com.acme.warehouse.StockReservationTest
+[ERROR] Tests run: 7, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.214 s <<< FAILURE! -- in com.acme.warehouse.StockReservationTest
+[ERROR] com.acme.warehouse.StockReservationTest.releasesReservedUnitsWhenOrderIsCancelled -- Time elapsed: 0.011 s <<< FAILURE!
+org.opentest4j.AssertionFailedError: expected: <12> but was: <9>
+	at org.junit.jupiter.api.AssertionFailureBuilder.build(AssertionFailureBuilder.java:151)
+	at org.junit.jupiter.api.AssertEquals.failNotEqual(AssertEquals.java:197)
+	at org.junit.jupiter.api.AssertEquals.assertEquals(AssertEquals.java:150)
+	at org.junit.jupiter.api.Assertions.assertEquals(Assertions.java:531)
+	at com.acme.warehouse.StockReservationTest.releasesReservedUnitsWhenOrderIsCancelled(StockReservationTest.java:64)
+
+[INFO] Running com.acme.warehouse.PickListTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.092 s -- in com.acme.warehouse.PickListTest
+[INFO]
+[INFO] Results:
+[INFO]
+[ERROR] Failures:
+[ERROR]   StockReservationTest.releasesReservedUnitsWhenOrderIsCancelled:64 expected: <12> but was: <9>
+[INFO]
+[ERROR] Tests run: 18, Failures: 1, Errors: 0, Skipped: 0
+[INFO]
+[ERROR] Failed to execute goal org.apache.maven.plugins:maven-surefire-plugin:3.2.5:test (default-test) on project warehouse: There are test failures.
+[ERROR]
+[ERROR] Please refer to /workspace/target/surefire-reports for the individual test results.

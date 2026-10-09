@@ -1,14 +1,31 @@
 # A failing check: the real runner reports red, which is the only status that
-# reaches classify. Validation itself completes; the red verdict is its result.
+# reaches the second opinion and classify. Validation itself completes; the red
+# verdict is its result.
+#
+# No classifier is configured here, which is the usual install: the second
+# opinion is `unavailable`, classify is told so and works without it, and the
+# real result script reports the verdict with no failure class beside it.
+# `failure-class` is stubbed because a fixture run inherits the operator's
+# environment, and an unstubbed one would send this log to a live classifier;
+# second-opinion-script.test.ts runs the real script instead.
 discover:
   checks:
     - { name: "tests", argv: ["bun", "-e", "console.error('1 test failed'); process.exitCode = 1"] }
   quarantine: []
   notes: "stub: the project's test command"
+failure-class:
+  status: unavailable
+  reason: no_api_key
+  choice: null
+  probabilities: {}
+  confidence: null
+  advisory: true
 classify:
   red_cause: introduced
   summary: "stub: the failing test covers code this change added"
 fixture:
   expect: completed
-  reached: [mode, discover, run, classify, result]
+  reached: [mode, discover, run, failure-class, classify, result]
+  resolved-text-contains:
+    classify: '"status":"unavailable","reason":"no_api_key"'
 exec-code: true

@@ -1,0 +1,20 @@
+$ bundle exec rspec
+.....................F..........
+
+Failures:
+
+  1) Invoice#number pads the sequence to six digits within a fiscal year
+     Failure/Error: expect(invoice.number).to eq("2026-000042")
+
+       expected: "2026-000042"
+            got: "2026-42"
+
+       (compared using ==)
+     # ./spec/models/invoice_spec.rb:27:in `block (3 levels) in <top (required)>'
+
+Finished in 1.87 seconds (files took 2.41 seconds to load)
+32 examples, 1 failure
+
+Failed examples:
+
+rspec ./spec/models/invoice_spec.rb:24 # Invoice#number pads the sequence to six digits within a fiscal year

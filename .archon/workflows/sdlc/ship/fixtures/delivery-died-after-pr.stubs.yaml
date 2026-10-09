@@ -54,6 +54,9 @@ deliver__review__publish:
 deliver__gate-ready: '{"gate":"ready"}'
 deliver__validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], quarantine: [], notes: "stub: the project's aggregate gate" }
 deliver__validate__run: { status: red, summary: "stub: a check in the project gate failed" }
+# No classifier configured: the second opinion says so and sends nothing. Stubbed
+# because a fixture run inherits the operator's environment.
+deliver__validate__failure-class: { status: unavailable, reason: no_api_key, choice: null, probabilities: {}, confidence: null, advisory: true }
 deliver__validate__classify:
   red_cause: introduced
   summary: "stub: the change broke one spec in the project gate"

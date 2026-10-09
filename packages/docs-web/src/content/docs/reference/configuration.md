@@ -642,6 +642,40 @@ Each run is bounded by a file, a window and a character budget. When a budget is
 
 An unusable number makes the classification report `unavailable` and name the variable; it never falls back to the default, so a mistyped threshold or budget cannot quietly become another policy.
 
+### Second opinion -- Jev (optional)
+
+When a project gate goes red in `archon-validate`, a classifier can say which kind of failure the record shows before the agent that classifies the red reads it: `code_defect`, `flaky_test`, `dependency_failure` or `environment_failure`. The agent gets that answer as a hypothesis to check first, which is meant to keep a failure the machine or a package caused from being written up as a defect and sent back for a code fix. It uses the same [Jev](https://docs.typesafe.ai/) key, endpoint and model as the context scout.
+
+**It is advisory.** The agent must verify the answer against the log before acting on it, and where the two disagree the log wins and the agent says so in its summary. No class decides the validation verdict: the agent still declares `red_cause` under the same evidence rules, and a failure the classifier calls an environment failure is not thereby one. The validation result carries the class as `advisory_failure_class`, beside `red_cause`, only when a classifier answered. Nothing in the bundled workflows reads that field to decide anything. `confidence` reports how concentrated the classifier's answer was, not the chance that it is right.
+
+The second opinion is on when `JEV_API_KEY` is set. To turn it off and keep the key, set `JEV_OPINION_ENABLED=0`; `JEV_ENABLED=0` turns it off along with every other Jev feature. Without a key, or with either switch off, nothing is sent and validation runs as it always has. It spends no AI turn in either state: the step is a script. A [container run](#container-runs-and-run-output) does not inherit the host's environment, so there it is off unless the project's own environment variables supply the key.
+
+With a key set, a red gate adds one classifier request before the agent starts, bounded by `JEV_OPINION_TIMEOUT_MS`. Every way the classifier cannot answer -- a timeout, an HTTP error, an answer that is not one of the four classes, an unusable setting, a failing check that printed nothing to judge -- gives the agent an `unavailable` result naming the reason, and the agent works without an opinion. The step does not fail the run on those.
+
+**What leaves the machine.** One request to `JEV_API_BASE` per red gate, carrying the question, the four criteria, and the end of `validation.md` from the run's artifacts: the failing check's name, command, exit status and the last lines of its output. At most `JEV_OPINION_MAX_EVIDENCE_CHARS` characters of it are sent, starting on a whole line unless that would drop more than half of them.
+
+Before that cut, recognisable secrets are replaced with `[REDACTED]`:
+
+- the exact value of every secret-named variable in the step's environment, when it is eight characters or longer;
+- private keys, including encrypted and PGP ones and a key printed on one line;
+- values assigned to secret-named keys (`DB_PASS=...`, `signing_key: ...`, `"client_secret": "..."`, a YAML value on the lines under such a key), taken to the end of the line unless they are quoted or sit in a query string;
+- values passed after secret-named flags (`--token ...`), and a MySQL client's `-p...`;
+- `Cookie`, `Set-Cookie`, `Authorization` and bearer credentials;
+- the password in a URL (`scheme://user:password@host`), and a token in front of a host;
+- well-known token formats, among them OpenAI, GitHub, GitLab, Slack, Stripe, Google, SendGrid, Twilio and npm tokens, AWS key ids, and JSON Web Tokens.
+
+A name counts as secret when one of its parts is `PASSWORD`, `SECRET`, `TOKEN`, `CREDENTIAL` or `COOKIE`, when it ends in `AUTH`, `SIGNATURE`, `SIG` or `DSN`, or when a longer name ends in `KEY`, `PASS` or `PWD`. The name of an error class (`TokenExpiredError: ...`) is never one, so the error's message stays. This is a filter over known shapes, not a guarantee: a credential that a failing command printed in some other shape is sent as it is. For a project where that matters, leave the second opinion off or point `JEV_API_BASE` at a service you host. Neither the record nor the key is written to the run's output.
+
+| Variable | Description | Default |
+| --- | --- | --- |
+| `JEV_OPINION_ENABLED` | Set to `0` or `false` to turn only the second opinion off | on when the key is set |
+| `JEV_OPINION_TIMEOUT_MS` | Longest the one classifier request may take. Must be under `120000`, the step's own time limit. | `30000` |
+| `JEV_OPINION_MAX_EVIDENCE_CHARS` | Most characters of the failing check's record sent. The end of the record is what is kept. | `16000` |
+
+`JEV_API_KEY`, `JEV_ENABLED`, `JEV_API_BASE` and `JEV_MODEL` are shared with the scout and listed above. An unusable number makes the step report `unavailable` and name the variable; it never falls back to the default.
+
+Whether the classifier names the right class is measured by `bun run second-opinion-eval`, a manual command that needs the key. Whether the opinion reduces unnecessary edits is not measured by it, and has not been measured. No agent that edits code reads the opinion itself. Its effect reaches an edit only through the cause and summary the classifying agent writes: the summary states the class the classifier chose and whether the log bore it out, and `archon-deliver` hands that summary to its CI correction step as context. The SDLC pack's README describes the paired runs that would measure it.
+
 ### Telemetry
 
 Archon sends a few anonymous events — `archon_started` (once per CLI invocation or server boot), `archon_active` (daily server heartbeat), `chat_turn_handled` (direct chat turn — platform, provider, model, duration, and usage totals, counted as failed when the provider errors mid-turn; never message content), `workflow_invoked` (workflow start or resumed segment), `workflow_completed`/`workflow_failed`/`workflow_cancelled` (sent once when the run's final status is saved), `workflow_approval_resolved` (binary approve/reject), and `codebase_registered` (pure count — no name/path/URL). Categorical only: workflow name (real for bundled workflows, `"custom"` for your own), platform, provider id (model id on `workflow_invoked`), node shape (`nodes_<type>` counts, `graph_depth`, `max_fan_out`, `command_refs`, `prompt_chars_bucket`) and feature flags, `derived_from`/`derived_similarity` naming the bundled workflow a custom one was copied from (never the copy's own name), outcome/duration, aggregate provider-reported usage (gross input, output, optional cache-read/cache-write totals plus a flag when those totals are a floor, cost, and loop iterations), a fixed-enum failure class and exit/cancel reason (never error text), a `run_ref` hash that joins one run's events without sending its id, deployment shape (adapter/db/auth booleans), OS/arch/version, install channel (`binary`/`docker`/`source`) and build commit, a `schema_version`, and a random install UUID stored at `$ARCHON_HOME/telemetry-id`. No code, prompts, paths, IP, geo, or error text. Any one of the variables below disables it. See `archon telemetry status` to inspect the live state.

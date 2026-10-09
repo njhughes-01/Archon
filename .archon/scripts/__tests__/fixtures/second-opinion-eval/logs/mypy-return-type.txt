@@ -1,0 +1,9 @@
+$ make check
+ruff check .
+All checks passed!
+mypy src
+src/reports/summary.py:44: error: Incompatible return value type (got "dict[str, float]", expected "list[SummaryRow]")  [return-value]
+src/reports/summary.py:61: error: Argument 1 to "render_table" has incompatible type "dict[str, float]"; expected "list[SummaryRow]"  [arg-type]
+src/reports/export.py:19: error: "SummaryRow" has no attribute "total_cents"; maybe "total"?  [attr-defined]
+Found 3 errors in 2 files (checked 38 source files)
+make: *** [Makefile:14: check] Error 1

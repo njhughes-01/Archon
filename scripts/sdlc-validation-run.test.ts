@@ -293,7 +293,12 @@ describe('run-checks', () => {
   );
 });
 
-function result(bindings: { comparison?: unknown; run?: unknown; classification?: unknown }): {
+function result(bindings: {
+  comparison?: unknown;
+  run?: unknown;
+  classification?: unknown;
+  opinion?: unknown;
+}): {
   exitCode: number;
   output: unknown;
 } {
@@ -304,6 +309,7 @@ function result(bindings: { comparison?: unknown; run?: unknown; classification?
       INPUTS_COMPARISON: JSON.stringify(bindings.comparison ?? null),
       INPUTS_RUN: JSON.stringify(bindings.run ?? null),
       INPUTS_CLASSIFICATION: JSON.stringify(bindings.classification ?? null),
+      INPUTS_OPINION: JSON.stringify(bindings.opinion ?? null),
     }),
     stdout: 'pipe',
     stderr: 'pipe',
@@ -394,5 +400,135 @@ describe('validation result', () => {
   it('passes the comparison verdict through unchanged', () => {
     const comparison = { green: false, red_cause: 'interaction', summary: 's', evidence: null };
     expect(result({ comparison }).output).toEqual(comparison);
+  });
+
+  const red = { status: 'red', summary: 'tests failed' };
+  const opinion = (choice: string): Record<string, unknown> => ({
+    status: 'ok',
+    reason: '',
+    choice,
+    probabilities: { [choice]: 1 },
+    confidence: 0.99,
+    advisory: true,
+  });
+  const noOpinion = {
+    status: 'unavailable',
+    reason: 'no_api_key',
+    choice: null,
+    probabilities: {},
+    confidence: null,
+    advisory: true,
+  };
+
+  it("carries the classifier's failure class beside the cause, as its own field", () => {
+    const classification = { red_cause: 'introduced', summary: 'the change broke the parser' };
+    expect(result({ run: red, classification, opinion: opinion('flaky_test') }).output).toEqual({
+      green: false,
+      red_cause: 'introduced',
+      summary: 'the change broke the parser',
+      evidence: null,
+      advisory_failure_class: 'flaky_test',
+    });
+  });
+
+  it('leaves the field out when no opinion was given', () => {
+    const classification = { red_cause: 'introduced', summary: 'the change broke the parser' };
+    const expected = {
+      green: false,
+      red_cause: 'introduced',
+      summary: 'the change broke the parser',
+      evidence: null,
+    };
+    expect(result({ run: red, classification, opinion: noOpinion }).output).toEqual(expected);
+    // `failure-class` was skipped: its timeout stopped it.
+    expect(result({ run: red, classification }).output).toEqual(expected);
+  });
+
+  // Decision: the classifier's answer is advisory. It rides beside the verdict and never
+  // changes it, whichever class it names and however sure it claims to be.
+  it.each(['introduced', 'inherited', 'environment'])(
+    'reports a red declared %s identically whatever the classifier said',
+    cause => {
+      const classification = { red_cause: cause, summary: 'evidence for the cause' };
+      const verdicts = [
+        opinion('code_defect'),
+        opinion('flaky_test'),
+        opinion('dependency_failure'),
+        opinion('environment_failure'),
+        noOpinion,
+        undefined,
+      ].map(given => {
+        const { exitCode, output } = result({ run: red, classification, opinion: given });
+        expect(exitCode).toBe(0);
+        const verdict = { ...(output as Record<string, unknown>) };
+        delete verdict.advisory_failure_class;
+        return verdict;
+      });
+      for (const verdict of verdicts) {
+        expect(verdict).toEqual({
+          green: false,
+          red_cause: cause,
+          summary: 'evidence for the cause',
+          evidence: null,
+        });
+      }
+    }
+  );
+
+  it('never lets an opinion stand in for the classification of a red gate', () => {
+    const { exitCode, output } = result({ run: red, opinion: opinion('environment_failure') });
+    expect(exitCode).not.toBe(0);
+    expect(output).toBeNull();
+  });
+
+  it('carries no failure class on a gate that is not red', () => {
+    const green = result({ run: { status: 'green', summary: 'all passed' } }).output;
+    expect(green).not.toHaveProperty('advisory_failure_class');
+    expect(result({}).output).not.toHaveProperty('advisory_failure_class');
+  });
+});
+
+/**
+ * Every place a workflow in this pack reads archon-validate's result. The delivery gate
+ * decides on `green`, `red_cause` and `summary`; nothing may come to read the advisory
+ * failure class, or the classifier would be deciding what ships.
+ */
+describe('the advisory failure class and the delivery gate', () => {
+  const sdlc = join(import.meta.dir, '..', '.archon', 'workflows', 'sdlc');
+  const sources = [...new Bun.Glob('**/*.{yaml,ts,md}').scanSync({ cwd: sdlc, dot: true })]
+    .map(path => path.split('\\').join('/'))
+    .filter(path => !path.includes('/fixtures/'))
+    .map(path => ({ path, text: readFileSync(join(sdlc, path), 'utf8') }));
+
+  it('is read by nothing outside validation itself', () => {
+    const readers = sources
+      .filter(source => source.text.includes('advisory_failure_class'))
+      .map(source => source.path)
+      .sort();
+    expect(readers).toEqual([
+      'README.md',
+      'validate/README.md',
+      'validate/archon-validate.yaml',
+      'validate/scripts/result.ts',
+    ]);
+  });
+
+  it("is not among the fields delivery binds from validation's result", () => {
+    const deliver = sources.find(source => source.path === 'deliver/archon-deliver.yaml');
+    const bound = [...(deliver?.text ?? '').matchAll(/\$validate\.output\.([a-z_]+)/g)].map(
+      match => match[1]
+    );
+    expect([...new Set(bound)].sort()).toEqual(['green', 'red_cause', 'summary']);
+  });
+
+  it('cannot reach the gate script, which takes its verdict from four bindings', () => {
+    const gate = readFileSync(join(sdlc, 'deliver', 'scripts', 'gate-green.ts'), 'utf8');
+    const reads = [...gate.matchAll(/process\.env\.(INPUTS_[A-Z_]+)/g)].map(match => match[1]);
+    expect(reads.sort()).toEqual([
+      'INPUTS_GREEN',
+      'INPUTS_RED_CAUSE',
+      'INPUTS_STAGE',
+      'INPUTS_SUMMARY',
+    ]);
   });
 });

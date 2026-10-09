@@ -25,6 +25,13 @@ import { closeSync, cpSync, existsSync, mkdirSync, openSync, readFileSync, rmSyn
 import { isAbsolute, join, normalize } from 'node:path';
 import { artifactsDir, emit, text } from '../../.shared/io.ts';
 import { projectEnvironment } from '../../.shared/node-env.ts';
+import {
+  describeOutcome,
+  outputTail,
+  renderValidationRecord,
+  type CheckOutcome,
+  type RecordedCheck,
+} from '../../.shared/validation-record.ts';
 
 interface Check {
   name: string;
@@ -37,18 +44,10 @@ interface Discovery {
   notes: string;
 }
 
-type Outcome =
-  | { kind: 'passed' }
-  | { kind: 'failed'; exitCode: number | null; signal: string | null }
-  | { kind: 'not-started'; error: string }
-  | { kind: 'stopped'; signal: string }
-  | { kind: 'running' }
-  | { kind: 'never-ran' };
-
 interface Entry {
   check: Check;
   log: string;
-  outcome: Outcome;
+  outcome: CheckOutcome;
   seconds: number | null;
 }
 
@@ -62,66 +61,30 @@ const report = join(artifacts, 'validation.md');
 // The checks run as the project's own gate, not as part of this run.
 const gateEnv = projectEnvironment(process.env);
 
-const TAIL_LINES = 60;
-
-function describe(outcome: Outcome): string {
-  switch (outcome.kind) {
-    case 'passed':
-      return 'passed (exit 0)';
-    case 'failed':
-      return outcome.signal === null
-        ? `failed (exit ${String(outcome.exitCode)})`
-        : `failed (killed by ${outcome.signal})`;
-    case 'not-started':
-      return `could not start: ${outcome.error}`;
-    case 'stopped':
-      return `did not finish: the node's time limit stopped it (${outcome.signal})`;
-    case 'running':
-      return 'running';
-    case 'never-ran':
-      return 'never ran';
-  }
-}
-
-function tail(path: string): string {
-  if (!existsSync(path)) return '';
-  const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
-  return lines.slice(-TAIL_LINES).join('\n');
+/** The record's view of one entry. Output is read only for a check that did not pass. */
+function recorded(entry: Entry): RecordedCheck {
+  const { kind } = entry.outcome;
+  const shown = kind === 'failed' || kind === 'stopped' || kind === 'not-started';
+  return {
+    name: entry.check.name,
+    argv: entry.check.argv,
+    outcome: entry.outcome,
+    seconds: entry.seconds,
+    output: shown && existsSync(entry.log) ? outputTail(readFileSync(entry.log, 'utf8')) : '',
+    log: entry.log,
+  };
 }
 
 function render(entries: readonly Entry[], quarantined: readonly string[]): void {
-  const lines = ['# Validation', ''];
-  if (discovery.notes.trim() !== '') lines.push(discovery.notes.trim(), '');
-  if (entries.length === 0) lines.push('The project defines no checks, so none ran.', '');
-  if (quarantined.length > 0) {
-    lines.push(
-      'Moved aside while the checks ran (untracked run scaffolding):',
-      ...quarantined.map(path => `- \`${path}\``),
-      ''
-    );
-  }
-  if (kept.length > 0) {
-    lines.push(
-      'Not restored, because the checkout already had the path again. The moved copy is kept at:',
-      ...kept.map(path => `- \`${path}\``),
-      ''
-    );
-  }
-  for (const [index, entry] of entries.entries()) {
-    const seconds = entry.seconds === null ? '' : ` after ${entry.seconds.toFixed(0)}s`;
-    lines.push(`## ${String(index + 1)}. ${entry.check.name}`, '');
-    lines.push(`\`${entry.check.argv.join(' ')}\` ${describe(entry.outcome)}${seconds}.`);
-    const kind = entry.outcome.kind;
-    if (kind === 'failed' || kind === 'stopped' || kind === 'not-started') {
-      const output = tail(entry.log);
-      if (output !== '') {
-        lines.push('', `Last ${String(TAIL_LINES)} lines of output:`, '', '```', output, '```');
-      }
-    }
-    if (kind !== 'never-ran' && kind !== 'not-started') lines.push('', `Full output: \`${entry.log}\``);
-    lines.push('');
-  }
-  writeFileSync(report, `${lines.join('\n').trimEnd()}\n`);
+  writeFileSync(
+    report,
+    renderValidationRecord({
+      notes: discovery.notes,
+      checks: entries.map(recorded),
+      quarantined,
+      kept,
+    })
+  );
 }
 
 /** Git's view of a path: whether anything at or under it is tracked. */
@@ -259,7 +222,7 @@ function runOne(entry: Entry): Promise<void> {
     // A command that cannot be spawned reports `error` and may or may not also
     // report `close`; whichever settles the check first wins.
     let settled = false;
-    const settle = (outcome: Outcome): void => {
+    const settle = (outcome: CheckOutcome): void => {
       if (settled) return;
       settled = true;
       current = null;
@@ -304,12 +267,12 @@ const ranPassed = passed.length === 0 ? 'No check passed before it.' : `Passed f
 if (failed !== undefined) {
   emit({
     status: 'red',
-    summary: `${failed.check.name} ${describe(failed.outcome)}. ${ranPassed} See validation.md.`,
+    summary: `${failed.check.name} ${describeOutcome(failed.outcome)}. ${ranPassed} See validation.md.`,
   });
 } else if (unstarted !== undefined) {
   emit({
     status: 'incomplete',
-    summary: `${unstarted.check.name} ${describe(unstarted.outcome)}. ${ranPassed} Later checks never ran.`,
+    summary: `${unstarted.check.name} ${describeOutcome(unstarted.outcome)}. ${ranPassed} Later checks never ran.`,
   });
 } else if (entries.length === 0) {
   emit({ status: 'green', summary: `No checks defined by this project. ${discovery.notes}`.trim() });

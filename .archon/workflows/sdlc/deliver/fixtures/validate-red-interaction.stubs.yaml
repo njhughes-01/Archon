@@ -35,6 +35,9 @@ review__publish:
   report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
 validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], quarantine: [], notes: "stub: the project's aggregate gate" }
 validate__run: { status: red, summary: "stub: a check in the project gate failed" }
+# No classifier configured: the second opinion says so and sends nothing. Stubbed
+# because a fixture run inherits the operator's environment.
+validate__failure-class: { status: unavailable, reason: no_api_key, choice: null, probabilities: {}, confidence: null, advisory: true }
 validate__classify:
   red_cause: introduced
   summary: "stub: the full gate caught two type errors this change added"

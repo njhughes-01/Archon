@@ -1,0 +1,13 @@
+$ bun run test:e2e
+$ bun run scripts/e2e.ts
+e2e: starting the app under test
+/workspace/src/config/env.ts:23
+    throw new Error(`Missing required environment variable: ${name}`);
+          ^
+Error: Missing required environment variable: OBJECT_STORE_BUCKET
+    at required (/workspace/src/config/env.ts:23:11)
+    at loadConfig (/workspace/src/config/env.ts:41:13)
+    at main (/workspace/src/server.ts:9:18)
+
+e2e: the app exited with code 1 before it was ready
+error: script "test:e2e" exited with code 1

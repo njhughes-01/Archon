@@ -1,0 +1,18 @@
+$ go test -v -count=6 -run TestBatcherFlushesOnInterval ./internal/batcher/...
+=== RUN   TestBatcherFlushesOnInterval
+--- PASS: TestBatcherFlushesOnInterval (0.05s)
+=== RUN   TestBatcherFlushesOnInterval
+--- PASS: TestBatcherFlushesOnInterval (0.05s)
+=== RUN   TestBatcherFlushesOnInterval
+    batcher_test.go:73: after 50ms: flushed 0 batches, want 1
+--- FAIL: TestBatcherFlushesOnInterval (0.06s)
+=== RUN   TestBatcherFlushesOnInterval
+--- PASS: TestBatcherFlushesOnInterval (0.05s)
+=== RUN   TestBatcherFlushesOnInterval
+--- PASS: TestBatcherFlushesOnInterval (0.05s)
+=== RUN   TestBatcherFlushesOnInterval
+    batcher_test.go:73: after 50ms: flushed 0 batches, want 1
+--- FAIL: TestBatcherFlushesOnInterval (0.05s)
+FAIL
+FAIL	example.com/ingest/internal/batcher	0.318s
+FAIL

@@ -1,0 +1,17 @@
+$ python -m pytest -q
+==================================== ERRORS ====================================
+____________________ ERROR collecting tests/test_settings.py ___________________
+ImportError while importing test module '/workspace/tests/test_settings.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/test_settings.py:3: in <module>
+    from app.settings import load_settings
+app/settings.py:5: in <module>
+    import yaml
+E   ModuleNotFoundError: No module named 'yaml'
+=========================== short test summary info ============================
+ERROR tests/test_settings.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+1 error in 0.31s

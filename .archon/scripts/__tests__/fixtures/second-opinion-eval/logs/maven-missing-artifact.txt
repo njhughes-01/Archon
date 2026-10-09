@@ -1,0 +1,19 @@
+$ mvn -B verify
+[INFO] Scanning for projects...
+[INFO]
+[INFO] ----------------------< com.acme:pricing-service >----------------------
+[INFO] Building pricing-service 1.14.0-SNAPSHOT
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD FAILURE
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  1.932 s
+[INFO] ------------------------------------------------------------------------
+[ERROR] Failed to execute goal on project pricing-service: Could not resolve dependencies for project com.acme:pricing-service:jar:1.14.0-SNAPSHOT: The following artifacts could not be resolved: com.acme:money-types:jar:2.7.0 (absent): Could not find artifact com.acme:money-types:jar:2.7.0 in central (https://repo.maven.apache.org/maven2) -> [Help 1]
+[ERROR]
+[ERROR]
+[ERROR] To see the full stack trace of the errors, re-run Maven with the -e switch.
+[ERROR] Re-run Maven using the -X switch to enable full debug logging.
+[ERROR]
+[ERROR] For more information about the errors and possible solutions, please read the following articles:
+[ERROR] [Help 1] http://cwiki.apache.org/confluence/display/MAVEN/DependencyResolutionException

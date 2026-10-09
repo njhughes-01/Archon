@@ -7,6 +7,11 @@ discover:
     - { name: "tests", argv: ["bun", "-e", "console.log('tests passed')"] }
   quarantine: []
   notes: "stub: the project's checks"
+# Not reached while the checks above pass: the second opinion runs only on red.
+# Stubbed all the same, because the real runner decides that, and a fixture run
+# inherits the operator's environment: were a check ever edited to fail, an
+# unstubbed node would send its log to a live classifier.
+failure-class: { status: unavailable, reason: no_api_key, choice: null, probabilities: {}, confidence: null, advisory: true }
 fixture:
   expect: completed
   reached: [mode, discover, run, result]

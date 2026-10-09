@@ -1,0 +1,33 @@
+$ cargo test --workspace
+   Compiling pager v0.4.2 (/workspace/crates/pager)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.31s
+     Running unittests src/lib.rs (target/debug/deps/pager-6f1c2a9d0b7e4c11)
+
+running 9 tests
+test tests::empty_list_has_one_page ... ok
+test tests::exact_multiple_has_no_extra_page ... FAILED
+test tests::first_page_starts_at_zero ... ok
+test tests::last_page_is_partial ... ok
+test tests::offset_of_page_two ... ok
+test tests::page_size_one ... ok
+test tests::rejects_zero_page_size ... ok
+test tests::single_item ... ok
+test tests::window_clamps_to_len ... ok
+
+failures:
+
+---- tests::exact_multiple_has_no_extra_page stdout ----
+
+thread 'tests::exact_multiple_has_no_extra_page' panicked at crates/pager/src/lib.rs:88:9:
+assertion `left == right` failed
+  left: 5
+ right: 4
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::exact_multiple_has_no_extra_page
+
+test result: FAILED. 8 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p pager --lib`

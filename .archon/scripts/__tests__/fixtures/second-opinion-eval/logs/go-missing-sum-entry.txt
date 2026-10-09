@@ -1,0 +1,6 @@
+$ go vet ./... && go test ./...
+internal/httpx/retry.go:9:2: missing go.sum entry for module providing package github.com/cenkalti/backoff/v4 (imported by example.com/fetcher/internal/httpx); to add:
+	go get example.com/fetcher/internal/httpx
+internal/trace/span.go:6:2: missing go.sum entry for module providing package go.opentelemetry.io/otel/trace (imported by example.com/fetcher/internal/trace); to add:
+	go get example.com/fetcher/internal/trace
+make: *** [Makefile:9: vet] Error 1
