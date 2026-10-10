@@ -86,14 +86,12 @@ export function readApplyPatch(
  * the payload carries it, resolved against the hook's own. `undefined` when the
  * field holds something that is not a directory name.
  *
- * Open question, and a limit until it is answered: Codex's shell tool takes a
- * `workdir` argument (it is among the tool's argument names in the CLI 0.157.0
- * binary), so the model can run a command somewhere else. Whether the hook's
- * `tool_input` carries that argument is not known: the hook schema leaves
- * `tool_input` untyped, and the payloads seen in real runs (CLI 0.157.0 and
- * 0.159.3) held only `command`, from calls that may never have set one. If
- * Codex leaves it out, a call that sets `workdir` is judged against the
- * payload's `cwd`, the turn's directory, and not where it runs.
+ * A known limit: Codex's shell tool takes a `workdir` argument, so the model
+ * can run a command somewhere else, and the hook is not told. In a real run
+ * with CLI 0.159.3 a call that set `workdir` to `/` ran there, while the hook's
+ * `tool_input` held only `command` and its `cwd` was the turn's directory. Such
+ * a call is therefore judged against the turn's directory, not where it runs.
+ * The fields are still read, so a CLI that starts sending one is honoured.
  */
 function shellCallCwd(input: Record<string, unknown>, cwd: string): string | undefined {
   for (const field of SHELL_DIRECTORY_FIELDS) {

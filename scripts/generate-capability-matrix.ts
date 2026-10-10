@@ -126,7 +126,9 @@ const CAVEATS: readonly { provider: string; key: keyof ProviderCapabilities; not
       '0.157.0 or newer. A gated turn runs without TTY sessions, and with hooks forced on under ' +
       "the trust bypass, so the user's own configured hooks run too. Hosted tools (web search) " +
       'never reach the hook. If Codex does not run the hook, the turn is stopped at the first ' +
-      'tool call with `codex_tool_gate_inactive`.',
+      'tool call with `codex_tool_gate_inactive`. Codex does not tell the hook when a shell call ' +
+      'sets its own working directory (seen in a real run with CLI 0.159.3), so a relative path ' +
+      "in such a call is judged against the turn's directory, not where the command runs.",
   },
   {
     provider: 'pi',
