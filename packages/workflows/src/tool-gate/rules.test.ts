@@ -179,13 +179,13 @@ posix('find -delete: filtered or not', () => {
     ['find -delete', 'deny.rm_recursive_root'],
     ['find . -depth -delete', 'deny.rm_recursive_root'],
     ['find . -maxdepth 3 -delete', 'deny.rm_recursive_root'],
-    ['find . -name "*.pyc" -delete', 'risk.mutation_verb'],
+    ['find . -name "*.pyc" -delete', 'default.no_signal'],
     ['find . -type f -mtime +7 -delete', 'risk.mutation_verb'],
     ['find src -delete', 'risk.mutation_verb'],
     // `build` holds what a build makes again: emptying it raises nothing.
     ['find build -delete', 'default.no_signal'],
     ['find build -name "*.o" -delete', 'default.no_signal'],
-    ['find build src -name "*.tmp" -delete', 'risk.mutation_verb'],
+    ['find build src -name "*.tmp" -delete', 'default.no_signal'],
     ['find . -name "*.pyc"', 'allow.read_only'],
   ])('%s → %s', async (command, expected) => {
     expect(await ruleOf(command, makeTree())).toBe(expected);

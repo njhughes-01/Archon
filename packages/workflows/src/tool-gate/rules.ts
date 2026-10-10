@@ -1950,6 +1950,69 @@ async function judgeRm(view: CommandView, scope: ShellScope): Promise<void> {
   await judgeRemoval(parsed.positionals, recursive, scope, buildOutput || named);
 }
 
+/** Names of files and directories that their tools make again: caches, editor and merge leftovers. */
+const DISPOSABLE_NAMES: ReadonlySet<string> = new Set([
+  ...['__pycache__', '*.pyc', '*.pyo', '.pytest_cache', '.mypy_cache', '.ruff_cache'],
+  ...['*.orig', '*.rej', '.DS_Store', 'Thumbs.db', '*.swp', '*~', '*.tmp'],
+]);
+const FIND_VALUE_TESTS: ReadonlySet<string> = new Set(['-type', '-maxdepth', '-mindepth']);
+const FIND_PLAIN_WORDS: ReadonlySet<string> = new Set([
+  ...['-prune', '-depth', '-delete', '-print', '-print0', '-xdev', '-mount'],
+]);
+
+/**
+ * Whether a find removes nothing but files of a disposable name, inside the
+ * write roots: `find . -name '*.pyc' -delete`,
+ * `find . -name __pycache__ -type d -prune -exec rm -rf {} +`.
+ *
+ * Read strictly, because find runs its expression left to right: every test is
+ * one of a short list, a name test stands in front of the first removal, and
+ * what `-exec` runs is `rm` on `{}` and nothing else.
+ */
+async function removesOnlyDisposableNames(
+  view: CommandView,
+  tests: readonly Arg[],
+  starts: readonly Arg[],
+  scope: ShellScope
+): Promise<boolean> {
+  let named = false;
+  for (let index = 0; index < tests.length; index++) {
+    const test = tests[index];
+    if (test === undefined || test.dynamic || test.glob) return false;
+    if (test.text === '-name' || test.text === '-iname') {
+      const pattern = tests[index + 1];
+      if (pattern === undefined || pattern.dynamic || pattern.glob) return false;
+      if (!DISPOSABLE_NAMES.has(pattern.text)) return false;
+      named = true;
+      index++;
+    } else if (FIND_VALUE_TESTS.has(test.text)) {
+      index++;
+    } else if (!FIND_PLAIN_WORDS.has(test.text) || (test.text === '-delete' && !named)) {
+      return false;
+    }
+  }
+  const firstName = view.args.findIndex(arg => arg.text === '-name' || arg.text === '-iname');
+  const firstExec = view.args.findIndex(arg => FIND_EXEC_ACTIONS.has(arg.text));
+  if (!named || (firstExec !== -1 && firstExec < firstName)) return false;
+  for (const child of view.execChildren) {
+    const { command } = child;
+    if (command.head !== 'rm' || command.wrappers.length > 0 || command.redirections.length > 0) {
+      return false;
+    }
+    if (!child.args.every(arg => !arg.dynamic && /^(\{\}|-[rRf]+|--)$/.test(arg.text)))
+      return false;
+  }
+  for (const start of starts) {
+    if (start.dynamic || start.glob) return false;
+    const where = await locate(start.text, scope.cwd, scope.context);
+    if (where.kind !== 'resolved' || writeRootOf(where.real, scope.context) === undefined) {
+      return false;
+    }
+  }
+  noteFact(scope.judgement.facts, 'removalTarget', 'build_or_cache_output');
+  return true;
+}
+
 /** find: the files its actions write, and what `-delete` removes. */
 async function judgeFind(view: CommandView, scope: ShellScope): Promise<void> {
   const { args } = view;
@@ -1987,13 +2050,28 @@ async function judgeFind(view: CommandView, scope: ShellScope): Promise<void> {
     inExec = !arg.dynamic && FIND_EXEC_ACTIONS.has(arg.text);
     return !inExec;
   });
-  const filtered = tests.some(
-    arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text))
-  );
+  // Only a test in front of the removal narrows it: `find . -delete -name x`
+  // has removed everything before the name is looked at. An `-o` gives the
+  // removal a branch of its own, which no test in front of it narrows.
+  const firstRemoval = tests.findIndex(arg => !arg.dynamic && arg.text === '-delete');
+  const before = removes || firstRemoval === -1 ? tests : tests.slice(0, firstRemoval);
+  const alternatives = tests.some(arg => !arg.dynamic && /^(-o|-or|,)$/.test(arg.text));
+  const filtered =
+    !alternatives &&
+    before.some(
+      arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text))
+    );
   const removed = starts.length > 0 ? starts : [plainPath('.')];
   const buildOutput = await removesOnlyBuildOutput(removed, scope);
-  await judgeRemoval(removed, !filtered, scope, buildOutput);
-  if (!buildOutput) signal(scope.judgement, 'risk.mutation_verb');
+  // Files every tool makes again, picked by name inside the write roots.
+  const disposable =
+    !alternatives && (await removesOnlyDisposableNames(view, tests, removed, scope));
+  if (disposable) {
+    scope.judgement.settled.add(view.command);
+    for (const child of view.execChildren) scope.judgement.settled.add(child.command);
+  }
+  await judgeRemoval(removed, !filtered, scope, buildOutput || disposable);
+  if (!buildOutput && !disposable) signal(scope.judgement, 'risk.mutation_verb');
 }
 
 // --- write targets ---------------------------------------------------------
@@ -2997,13 +3075,15 @@ const NAME_ONLY: ReadonlySet<string> = new Set([
  * that only reads is `grep -r` spelled differently. `xargs` feeding names to a
  * command that only looks at names adds nothing either.
  */
-function isRead(kind: OpaqueKind, view: CommandView): boolean {
+function isRead(kind: OpaqueKind, view: CommandView, judgement: Judgement): boolean {
   const { command } = view;
   const plain = command.wrappers.every(wrapper => WRAPPERS[wrapper]?.kind === 'benign');
   switch (kind) {
     case 'command_substitution':
       return plain && VALUE_INDIFFERENT.has(command.head);
     case 'find_exec':
+      // Settled already: a removal of disposable names, read word for word.
+      if (judgement.settled.has(command)) return true;
       return (
         view.execChildren.length > 0 &&
         view.execChildren.every(
@@ -3042,7 +3122,6 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
     else if (!where.inside) signal(judgement, 'risk.cwd_outside_root');
   }
 
-  if (command.opaque.some(kind => !isRead(kind, view))) signal(judgement, 'risk.opaque_shell');
   if (command.assignments.some(name => EXEC_VARIABLES.has(name))) {
     signal(judgement, 'risk.opaque_shell');
   }
@@ -3063,6 +3142,10 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
   if (command.head === 'git') gitReadOnly = await judgeGit(view, scope, mode);
   if (command.head === 'rm' || command.head === 'rimraf') await judgeRm(view, scope);
   if (command.head === 'find') await judgeFind(view, scope);
+  // After find's own rules: they settle what some of its `-exec` clauses are.
+  if (command.opaque.some(kind => !isRead(kind, view, judgement))) {
+    signal(judgement, 'risk.opaque_shell');
+  }
   if (command.head === 'rg' && hasOption(parseOptions(args, specFor('rg')), ...RG_EXEC_FLAGS)) {
     signal(judgement, 'risk.opaque_shell');
   }

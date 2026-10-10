@@ -475,7 +475,7 @@
 {"id":"f4-rg-e-escaped-env","tool":"Bash","kind":"shell","command":"rg -e '\\.env' src","cwd":"{root}","expect":"allow","ruleId":"allow.read_only"}
 {"id":"f4-grep-e-pattern-then-env-file-denied","tool":"Bash","kind":"shell","command":"grep -e API .env","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"f4-git-grep-pattern-then-env-path-denied","tool":"Bash","kind":"shell","command":"git grep API -- .env","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
-{"id":"f5-find-filtered-delete","tool":"Bash","kind":"shell","command":"find . -name '*.pyc' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"f5-find-disposable-delete","tool":"Bash","kind":"shell","command":"find . -name '*.pyc' -delete","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"f6-cd-subdir-rm-bare-glob","tool":"Bash","kind":"shell","command":"cd dist && rm -rf *","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"f6-cd-subdir-rm-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r .","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"f6-cd-subdir-rm-dot-slash-dot","tool":"Bash","kind":"shell","command":"cd build && rm -r ./.","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
@@ -630,6 +630,16 @@
 {"id":"p3-deny-go-build-output-equals-outside","tool":"Bash","kind":"shell","command":"go build -o={outside}/tool .","cwd":"{root}","expect":"deny","ruleId":"deny.path_outside_root"}
 {"id":"p3-deny-unknown-tool-padded-with-command-words","tool":"Bash","kind":"shell","command":"mytool git git git git git git git reset --hard","cwd":"{root}","expect":"deny","ruleId":"deny.command_too_large"}
 {"id":"p3-deny-unknown-tool-padded-with-quoted-words","tool":"Bash","kind":"shell","command":"mytool \"a b\" \"c d\" \"e f\" \"g h\" \"i j\" \"k l\" \"m n\" \"o p\" \"git reset --hard\"","cwd":"{root}","expect":"deny","ruleId":"deny.git_reset_hard"}
+{"id":"p3-allow-find-exec-rm-pycache","tool":"Bash","kind":"shell","command":"find . -name '__pycache__' -type d -prune -exec rm -rf {} +","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"p3-allow-find-delete-merge-leftovers","tool":"Bash","kind":"shell","command":"find src -type f -name '*.orig' -delete","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
+{"id":"p3-deny-find-delete-before-name","tool":"Bash","kind":"shell","command":"find . -delete -name '*.pyc'","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
+{"id":"p3-deny-find-name-or-delete","tool":"Bash","kind":"shell","command":"find . -name '*.pyc' -o -delete","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
+{"id":"p3-escalate-find-delete-source-by-name","tool":"Bash","kind":"shell","command":"find . -name '*.ts' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"p3-escalate-find-delete-disposable-and-not","tool":"Bash","kind":"shell","command":"find . -name '*.pyc' ! -name 'keep.pyc' -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"p3-escalate-find-disposable-name-unquoted","tool":"Bash","kind":"shell","command":"find . -name *.pyc -delete","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"p3-escalate-find-disposable-exec-other-command","tool":"Bash","kind":"shell","command":"find . -name '*.orig' -exec shred {} +","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"p3-escalate-find-disposable-exec-rm-extra-operand","tool":"Bash","kind":"shell","command":"find . -name '*.orig' -exec rm -rf {} src +","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"p3-deny-find-disposable-outside","tool":"Bash","kind":"shell","command":"find {outside} -name '*.pyc' -delete","cwd":"{root}","expect":"deny","ruleId":"deny.path_outside_root"}
 {"id":"p3-allow-unknown-tool-many-quoted-values","tool":"Bash","kind":"shell","command":"mytool \"a b\" \"c d\" \"e f\" \"g h\" \"i j\" \"k l\" \"m n\" \"o p\"","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"r3-escalate-python-quoted-reset","tool":"Bash","kind":"shell","command":"python3 -c \"print('git reset --hard')\"","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
 {"id":"r3-escalate-node-writes-doc-about-clean","tool":"Bash","kind":"shell","command":"node -e \"require('fs').writeFileSync('docs/x.md', 'Do not run git clean -fdx')\"","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
@@ -772,7 +782,7 @@
 {"id":"r3-escalate-rebase-variable","tool":"Bash","kind":"shell","command":"git rebase $ARGS","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"r3-deny-find-exec-rm-recursive-everything","tool":"Bash","kind":"shell","command":"find . -exec rm -rf {} +","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
 {"id":"r3-deny-find-home-exec-rm","tool":"Bash","kind":"shell","command":"find ~ -exec rm {} \\;","cwd":"{root}","expect":"deny","ruleId":"deny.rm_recursive_root"}
-{"id":"r3-escalate-find-filtered-exec-rm","tool":"Bash","kind":"shell","command":"find . -name '*.orig' -exec rm {} +","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
+{"id":"r3-escalate-find-filtered-exec-rm","tool":"Bash","kind":"shell","command":"find . -name '*.bak' -exec rm {} +","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"r3-allow-find-exec-grep","tool":"Bash","kind":"shell","command":"find src -name \"*.ts\" -exec grep -l TODO {} +","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
 {"id":"r3-deny-find-env-files-exec-cat","tool":"Bash","kind":"shell","command":"find . -name '.env*' -exec cat {} +","cwd":"{root}","expect":"deny","ruleId":"deny.secret_read"}
 {"id":"r3-escalate-find-exec-shell","tool":"Bash","kind":"shell","command":"find . -name '*.sh' -exec sh {} \\;","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
