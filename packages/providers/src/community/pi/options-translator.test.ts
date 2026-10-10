@@ -1,7 +1,7 @@
 import { describe, expect, mock, test, beforeAll, afterAll } from 'bun:test';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { removeTempTree } from '@archon/paths/test-utils';
 
@@ -412,7 +412,8 @@ describe('gatePiBuiltinTools / gatePiNativeTools', () => {
         toolName: 'edit',
         kind: 'file_write',
         cwd,
-        paths: ['src/a.ts'],
+        // The file Pi's tool would open, not the text the model wrote: see tool-gate.test.ts.
+        paths: [resolve(cwd, 'src/a.ts')],
         input: { path: 'src/a.ts', edits: [] },
         toolCallId: 'c3',
       },
@@ -420,7 +421,7 @@ describe('gatePiBuiltinTools / gatePiNativeTools', () => {
         toolName: 'write',
         kind: 'file_write',
         cwd,
-        paths: ['/etc/hosts'],
+        paths: [resolve('/etc/hosts')],
         input: { path: '/etc/hosts', content: 'x' },
         toolCallId: 'c4',
       },
@@ -470,7 +471,7 @@ describe('gatePiBuiltinTools / gatePiNativeTools', () => {
         toolName: 'write',
         kind: 'file_write',
         cwd: dir,
-        paths: ['denied.txt'],
+        paths: [join(dir, 'denied.txt')],
       });
     });
 

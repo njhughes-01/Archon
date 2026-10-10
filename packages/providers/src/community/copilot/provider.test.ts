@@ -8,6 +8,8 @@
  * Runs in its own bun test invocation — mocks @github/copilot-sdk and
  * @archon/paths process-wide.
  */
+import { join } from 'node:path';
+
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { SessionEvent } from '@github/copilot-sdk';
 
@@ -457,7 +459,13 @@ describe('CopilotProvider.sendQuery', () => {
         toolName: 'apply_patch',
         kind: 'file_write',
         cwd,
-        paths: ['src/new.ts', 'src/old.ts', 'src/renamed.ts', '../outside.txt'],
+        // Placed as the runtime places them: see tool-gate.test.ts.
+        paths: [
+          join(cwd, 'src/new.ts'),
+          join(cwd, 'src/old.ts'),
+          join(cwd, 'src/renamed.ts'),
+          join(cwd, '../outside.txt'),
+        ],
         input: { input: patch },
       },
       {

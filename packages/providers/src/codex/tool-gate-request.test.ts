@@ -150,6 +150,9 @@ describe('translateCodexHookCall', () => {
     ['a header in another letter case', '*** update file: ../x'],
     ['an environment header', '*** Environment ID: other-machine'],
     ['a bare carriage return inside a path', '*** Add File: ok\r/../../out.txt'],
+    // Codex CLI 0.157.0 drops the tab: these wrote `../out.txt` and `.env`.
+    ['a tab inside a climbing path', '*** Add File: .\t./out.txt'],
+    ['a tab inside a file name', '*** Add File: .e\tnv'],
   ])('apply_patch with %s is marked unreadable for the gate', (_label, line) => {
     const patch = ['*** Begin Patch', '*** Add File: ok.txt', '+x', line, '*** End Patch'].join(
       '\n'
@@ -194,19 +197,21 @@ describe('translateCodexHookCall', () => {
     expect(toolInput).toEqual({ command: '*** Begin Patch\n*** Add File:\n*** End Patch' });
   });
 
-  test('an unreadable patch piped to apply_patch in the shell is marked too', () => {
-    const command =
-      "apply_patch <<'EOF'\n*** Begin Patch\n*** Environment ID: e1\n*** Add File: a.txt\n+x\n*** End Patch\nEOF";
+  // The gate's rules refuse the unreadable mark on a file write, not on a
+  // shell command, so the shell form is refused before the gate is asked.
+  test.each([
+    ['an environment header', '*** Environment ID: e1\n*** Add File: a.txt'],
+    // Codex CLI 0.157.0 drops the tab and writes `../out.txt`.
+    ['a tab inside a climbing path', '*** Add File: .\t./out.txt'],
+    ['a header in another letter case', '*** Add File: a.txt\n+x\n*** delete file: ../x'],
+  ])('a patch with %s piped to apply_patch in the shell is denied', (_label, headers) => {
+    const command = `apply_patch <<'EOF'\n*** Begin Patch\n${headers}\n+x\n*** End Patch\nEOF`;
     const result = translateCodexHookCall(
       hookPayload({ tool_name: 'Bash', tool_input: { command } })
     );
 
-    expect(result.outcome === 'ask' && result.request).toMatchObject({
-      kind: 'shell',
-      command,
-      paths: ['/repo/a.txt'],
-      input: { command, unreadablePatch: true },
-    });
+    expect(result.outcome).toBe('deny');
+    expect(result.category).toBe('command');
   });
 
   test('shell text that only mentions patch headers is not read as a patch', () => {

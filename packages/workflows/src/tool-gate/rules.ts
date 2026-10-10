@@ -665,6 +665,8 @@ interface Judgement {
   environment: Set<string>;
   /** Whether the call named more paths than were placed: set by `evaluateRules`. */
   exhausted: () => boolean;
+  /** Where a shell request starts, which is what its provider placed the request's own paths by. */
+  startCwd: string | undefined;
 }
 
 function newJudgement(): Judgement {
@@ -683,6 +685,7 @@ function newJudgement(): Judgement {
     pushRelied: undefined,
     environment: new Set(),
     exhausted: () => false,
+    startCwd: undefined,
   };
 }
 
@@ -3108,6 +3111,9 @@ function isRead(kind: OpaqueKind, view: CommandView, judgement: Judgement): bool
   }
 }
 
+/** Patch appliers a provider's shell offers: the patch on their stdin names the files they write. */
+const PATCH_TOOLS: ReadonlySet<string> = new Set(['apply_patch', 'applypatch']);
+
 /** Judges one command. Returns whether it matched the read-only allow rule. */
 async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): Promise<boolean> {
   const { command, args } = view;
@@ -3180,6 +3186,15 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
     }
   }
   if (await runsFetchedFile(view, scope)) deny(judgement, 'deny.pipe_to_shell');
+  // A patch tool run from a shell writes the files its patch names, relative to
+  // where it stands. The provider named those files by the directory the call
+  // started in, so a patch applied anywhere else is one nobody placed.
+  if (
+    PATCH_TOOLS.has(command.head) &&
+    (scope.cwd === undefined || scope.cwd !== judgement.startCwd)
+  ) {
+    deny(judgement, 'deny.path_unresolvable');
+  }
   if (command.head === 'ln' || command.head === 'cp') await noteLinks(view, scope);
 
   await judgeReads(view, scope, mode);
@@ -3577,6 +3592,10 @@ export async function evaluateRules(
     return denied('deny.unreadable_request');
   }
 
+  // The provider could not read every file header of a patch the call carries:
+  // what it writes is unknown, whichever tool carries it.
+  if (input.unreadablePatch === true) return denied('deny.unreadable_request');
+
   const scope: ShellScope = { context, judgement, cwd };
   for (const path of paths) {
     if (isUnplaceableForm(path)) deny(judgement, 'deny.path_unresolvable');
@@ -3586,9 +3605,7 @@ export async function evaluateRules(
   switch (request.kind) {
     case 'file_write':
       // The provider could not read every header of a patch: what it writes is unknown.
-      if (paths.length === 0 || input.unreadablePatch === true) {
-        return denied('deny.unreadable_request');
-      }
+      if (paths.length === 0) return denied('deny.unreadable_request');
       return conclude(judgement, 'allow.write_in_root', cwdInside);
     case 'network':
       signal(judgement, 'risk.kind_network');
@@ -3608,6 +3625,7 @@ export async function evaluateRules(
       // A persistent shell may stand somewhere this request does not say.
       judgement.cwdUntrusted = options.cwdUntrusted === true;
       const start = judgement.cwdUntrusted ? undefined : cwd;
+      judgement.startCwd = start;
       let allReadOnly = true;
       for (const text of texts) {
         if (!(await judgeScript(parseShell(text), start, context, judgement))) allReadOnly = false;

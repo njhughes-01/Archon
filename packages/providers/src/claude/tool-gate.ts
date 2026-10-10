@@ -100,6 +100,28 @@ function classifyClaudeTool(
 }
 
 /**
+ * The path a Write, Edit or NotebookEdit call names, as the gate should judge
+ * it.
+ *
+ * Claude Code resolves these paths itself (`expandPath` in the 2.1.282 CLI
+ * that SDK 0.3.282 ships: trim, then a leading `~` or `~/` is the home
+ * directory, anything else is resolved against the session directory; a
+ * leading `@` and a `file://` URL are ordinary relative names) and hands a
+ * PreToolUse hook the result, with the same session directory as the hook's
+ * `cwd`. So the path seen here is normally the absolute file already. This is
+ * read from the CLI's bundled source, not seen in a live run.
+ *
+ * A path that did not come through that step (a node hook's `updatedInput`,
+ * another CLI version) is only trimmed, as Claude Code will trim it. A `~` it
+ * still starts with is not expanded here: the CLI is a separate process whose
+ * home directory this one does not know. The gate's rules refuse that form.
+ */
+function claudeWriteTarget(toolInput: Record<string, unknown>): string | undefined {
+  const target = toolInput.file_path ?? toolInput.notebook_path;
+  return typeof target === 'string' ? target.trim() : undefined;
+}
+
+/**
  * Describe a PreToolUse call in the gate's terms, or `undefined` for a
  * read-only tool, which the gate is never asked about.
  */
@@ -111,7 +133,7 @@ export function toClaudeToolAction(
   if (kind === 'read_only') return undefined;
 
   const toolInput = isRecord(input.tool_input) ? input.tool_input : {};
-  const writeTarget = toolInput.file_path ?? toolInput.notebook_path;
+  const writeTarget = kind === 'file_write' ? claudeWriteTarget(toolInput) : undefined;
   return {
     toolName: input.tool_name,
     kind,
@@ -119,7 +141,7 @@ export function toClaudeToolAction(
     ...(kind === 'shell' && typeof toolInput.command === 'string'
       ? { command: toolInput.command }
       : {}),
-    ...(kind === 'file_write' && typeof writeTarget === 'string' ? { paths: [writeTarget] } : {}),
+    ...(writeTarget !== undefined ? { paths: [writeTarget] } : {}),
     ...(kind === 'network' && typeof toolInput.url === 'string' ? { url: toolInput.url } : {}),
     input: toolInput,
     toolCallId: input.tool_use_id,

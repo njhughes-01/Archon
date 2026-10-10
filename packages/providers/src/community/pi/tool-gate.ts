@@ -16,11 +16,20 @@
  * This module imports types only from the Pi SDK, so the provider can import
  * it statically (see the lazy-load note in provider.ts).
  */
+import { homedir } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import { createLogger } from '@archon/paths';
 import type { ToolCallEvent } from '@earendil-works/pi-coding-agent';
 
 import type { ToolActionKind, ToolActionRequest } from '../../types';
-import { askToolGate, formatToolGateDenial, type ToolGate } from '../../shared/tool-gate';
+import {
+  askToolGate,
+  formatToolGateDenial,
+  toolGateFailure,
+  type ToolGate,
+} from '../../shared/tool-gate';
 
 /**
  * Pi's built-in tool names, taken from the SDK's own tool-call event union
@@ -63,24 +72,115 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * The file Pi's `write` and `edit` tools open for a path the model gave: a
+ * copy of the SDK's `resolveToCwd` (pi-coding-agent 0.87.1,
+ * `dist/core/tools/path-utils.js`, over `normalizePath` and `resolvePath` in
+ * `dist/utils/paths.js`), which the package does not export. Those tools turn
+ * `~/x` into a file under the home directory, drop a leading `@` and decode a
+ * `file://` URL, so the text the model wrote is not the file that is written.
+ * tool-gate.test.ts runs the SDK's real tools against this copy.
+ *
+ * Pi runs in this process, so `homedir()` here is the directory its tools see.
+ */
+const PI_UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+/** Pi's `normalizeWindowsShellPath`: a Git Bash, MSYS, Cygwin or WSL drive path as Windows reads it. */
+function piWindowsShellPath(filePath: string): string {
+  if (!filePath.startsWith('/') || filePath.startsWith('//') || filePath.includes('\\')) {
+    return filePath;
+  }
+  const match = /^\/(?:mnt\/|cygdrive\/)?([a-z])(?:\/(.*))?$/i.exec(filePath);
+  if (!match) return filePath;
+  const [, drive, rest] = match;
+  return `${drive.toUpperCase()}:\\${rest?.replaceAll('/', '\\') ?? ''}`;
+}
+
+/**
+ * Pi's `normalizePath`. `fromModel` is the pair of options its file tools set
+ * for the model's path (`normalizeUnicodeSpaces`, `stripAtPrefix`); the base
+ * directory goes through with neither.
+ */
+function piNormalizePath(input: string, fromModel: boolean): string {
+  let normalized = input;
+  if (fromModel) {
+    normalized = normalized.replace(PI_UNICODE_SPACES, ' ');
+    if (normalized.startsWith('@')) normalized = normalized.slice(1);
+  }
+  const onWindows = process.platform === 'win32';
+  if (onWindows) normalized = piWindowsShellPath(normalized);
+  if (normalized === '~') return homedir();
+  if (normalized.startsWith('~/') || (onWindows && normalized.startsWith('~\\'))) {
+    return join(homedir(), normalized.slice(2));
+  }
+  // Throws for a URL that names no local file; Pi's tool throws on it too.
+  if (normalized.startsWith('file://')) return fileURLToPath(normalized);
+  return normalized;
+}
+
+/**
+ * The absolute file a `write` or `edit` call would open, or `undefined` when
+ * Pi's own resolution throws. The call then fails inside the tool before it
+ * writes anything, and the path goes to the gate as the model wrote it.
+ */
+function piWriteTarget(filePath: string, cwd: string): string | undefined {
+  try {
+    const normalized = piNormalizePath(filePath, true);
+    const base = piNormalizePath(cwd, false);
+    return isAbsolute(normalized) ? resolve(normalized) : resolve(base, normalized);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Where the context sits among the arguments Pi passes after `toolCallId` and `params`. */
+const CONTEXT_ARGUMENT = 2;
+
+/**
+ * The directory a built-in tool works in. Pi's tools read it as
+ * `ctx?.cwd || cwd`: the directory of the context Pi passes as the call's last
+ * argument when there is one, else the directory the tool was built with.
+ * `undefined` when the context names something that is not a directory name.
+ */
+function piToolCwd(context: unknown, builtCwd: string): string | undefined {
+  const fromContext: unknown = isRecord(context) ? context.cwd : undefined;
+  if (!fromContext) return builtCwd;
+  return typeof fromContext === 'string' ? fromContext : undefined;
+}
+
 function gatePiTool<T extends GateablePiTool>(
   tool: T,
   kind: ToolActionKind,
   toolGate: ToolGate,
-  cwd: string
+  builtCwd: string
 ): T {
   const execute = async (
     toolCallId: string,
     params: unknown,
     ...rest: unknown[]
   ): Promise<unknown> => {
+    const cwd = piToolCwd(rest[CONTEXT_ARGUMENT], builtCwd);
+    if (cwd === undefined) {
+      getLog().error({ toolName: tool.name, kind }, 'pi.tool_gate_cwd_unreadable');
+      throw new Error(
+        formatToolGateDenial(
+          toolGateFailure(
+            'The directory this call would run in could not be read, so it was not allowed.'
+          )
+        )
+      );
+    }
     const input = isRecord(params) ? params : {};
+    const writeTarget =
+      kind === 'file_write' && typeof input.path === 'string'
+        ? (piWriteTarget(input.path, cwd) ?? input.path)
+        : undefined;
     const request: ToolActionRequest = {
       toolName: tool.name,
       kind,
       cwd,
       ...(kind === 'shell' && typeof input.command === 'string' ? { command: input.command } : {}),
-      ...(kind === 'file_write' && typeof input.path === 'string' ? { paths: [input.path] } : {}),
+      ...(writeTarget !== undefined ? { paths: [writeTarget] } : {}),
       input,
       toolCallId,
     };
@@ -97,7 +197,9 @@ function gatePiTool<T extends GateablePiTool>(
 
 /**
  * Gate Pi's built-in tools. Read-only tools are returned as they are; every
- * other tool, including a name this table has never seen, is wrapped.
+ * other tool, including a name this table has never seen, is wrapped. `cwd` is
+ * the directory the tools were built with: a call is judged in the directory of
+ * the context Pi passes with it, and in this one only when there is none.
  */
 export function gatePiBuiltinTools<T extends GateablePiTool>(
   tools: readonly T[],

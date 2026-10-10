@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
@@ -1959,7 +1959,11 @@ describe('PiProvider', () => {
     const write = (callArgs.customTools as SessionTool[]).find(t => t.name === 'write');
     expect(await write?.execute('call-1', { path: 'a.txt', content: 'x' })).toBe('write ran');
     expect(bodies.write).toHaveBeenCalledTimes(1);
-    expect(gate.mock.calls[0][0]).toMatchObject({ kind: 'file_write', paths: ['a.txt'] });
+    // The file Pi's tool would open, not the text the model wrote: see tool-gate.test.ts.
+    expect(gate.mock.calls[0][0]).toMatchObject({
+      kind: 'file_write',
+      paths: [resolve('/tmp/repo', 'a.txt')],
+    });
   });
 
   test('toolGate works together with restrictFileWrites and native tools', async () => {

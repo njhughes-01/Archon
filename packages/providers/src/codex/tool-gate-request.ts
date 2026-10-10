@@ -61,10 +61,12 @@ const SHELL_DIRECTORY_FIELDS = ['workdir', 'cwd'] as const;
  * absolute paths, and whether it has a header that could not be read.
  *
  * Codex resolves a patch path against the working directory as it is written:
- * no `~` expansion, and the space between a marker and its path is part of the
- * file name (CLI 0.157.0 wrote `   a.txt` for `*** Add File:    a.txt`). The
- * CLI is the user's own and may be newer than the one this was run against, so
- * a path with such space is named in both spellings.
+ * `~/x`, `@x` and `file:///x` name files under the working directory (CLI
+ * 0.157.0 wrote `~/new.txt`, `@new.txt` and `file:/x/new.txt` there), and the
+ * space between a marker and its path is part of the file name (it wrote
+ * `   a.txt` for `*** Add File:    a.txt`). The CLI is the user's own and may
+ * be newer than the one this was run against, so a path with such space is
+ * named in both spellings.
  */
 export function readApplyPatch(
   patch: string,
@@ -84,8 +86,14 @@ export function readApplyPatch(
  * the payload carries it, resolved against the hook's own. `undefined` when the
  * field holds something that is not a directory name.
  *
- * The payloads seen in real runs (CLI 0.157.0 and 0.159.3) carry only
- * `command`, so whether Codex ever sends this field is not established.
+ * Open question, and a limit until it is answered: Codex's shell tool takes a
+ * `workdir` argument (it is among the tool's argument names in the CLI 0.157.0
+ * binary), so the model can run a command somewhere else. Whether the hook's
+ * `tool_input` carries that argument is not known: the hook schema leaves
+ * `tool_input` untyped, and the payloads seen in real runs (CLI 0.157.0 and
+ * 0.159.3) held only `command`, from calls that may never have set one. If
+ * Codex leaves it out, a call that sets `workdir` is judged against the
+ * payload's `cwd`, the turn's directory, and not where it runs.
  */
 function shellCallCwd(input: Record<string, unknown>, cwd: string): string | undefined {
   for (const field of SHELL_DIRECTORY_FIELDS) {
@@ -135,13 +143,16 @@ export function translateCodexHookCall(payload: unknown): CodexHookTranslation {
     const patch = command.includes(PATCH_BEGIN)
       ? readApplyPatch(command, callCwd)
       : { paths: [], unreadable: false };
+    // The gate's rules refuse the `unreadablePatch` mark on a file write only,
+    // so a shell command whose patch could not be read is refused here: what
+    // it would write is unknown.
+    if (patch.unreadable) return { outcome: 'deny', category, reason: UNREADABLE_CALL };
     return {
       outcome: 'ask',
       category,
       request: {
         ...base,
         cwd: callCwd,
-        ...(patch.unreadable ? { input: { ...input, unreadablePatch: true } } : {}),
         kind: 'shell',
         command,
         ...(patch.paths.length > 0 ? { paths: patch.paths } : {}),

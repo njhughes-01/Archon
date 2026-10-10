@@ -56,18 +56,30 @@ const PATCH_TARGET_HEADERS = [
   '*** Move to: ',
 ] as const;
 
-/**
- * A line that reads as one of those headers, or as the header that sends the
- * patch to another environment, in any letter case or spacing.
- */
-const PATCH_HEADER_LIKE = /^\*{3}\s*(?:add file|update file|delete file|move to|environment id)\b/i;
+/** Space, control and format characters: none of them is part of a header's words. */
+const PATCH_INVISIBLE_CHARACTERS = /[\s\p{Cc}\p{Cf}]/gu;
 
 /**
- * Characters the two `apply_patch` parsers read differently: one ends a line
- * at a bare carriage return and the other keeps it inside a path; one trims
- * U+0085 and the other U+FEFF.
+ * A line that, with those characters taken out, reads as one of the file
+ * headers or as the header that sends the patch to another environment, in any
+ * letter case.
+ */
+const PATCH_HEADER_LIKE = /^\*{3}(?:addfile|updatefile|deletefile|moveto|environmentid)/i;
+
+/**
+ * Characters the two `apply_patch` parsers read differently around a header:
+ * Copilot ends a line at a bare carriage return, which Codex drops; Codex
+ * trims U+0085 where Copilot does not, and the reverse for U+FEFF.
  */
 const PATCH_AMBIGUOUS_CHARACTERS = /[\r\u0085\u2028\u2029\uFEFF\0]/;
+
+/**
+ * Control and format characters inside a path. Codex CLI 0.157.0 drops a tab
+ * and a carriage return from anywhere in a path, so `.\t./x` is written as
+ * `../x`; Copilot keeps the tab. What other versions do with the rest of these
+ * is not known, so none of them is read as part of a file name.
+ */
+const PATCH_PATH_UNSAFE_CHARACTERS = /[\p{Cc}\p{Cf}]/u;
 
 export interface PatchReading {
   /**
@@ -93,24 +105,30 @@ export interface PatchReading {
  * are matched in exact letter case and need the space before the path; `\r\n`
  * ends a line.
  *
- * It errs toward naming too much. Inside an update hunk a line that starts
- * with a space is context to both parsers, but is read here as a header when
- * it looks like one, so a patch to a file that quotes patch headers can name
- * a target it does not write.
+ * It errs toward naming too much, and toward `unreadable`. Inside an update
+ * hunk a line that starts with a space is context to both parsers, but is read
+ * here as a header when it looks like one, so a patch to a file that quotes
+ * patch headers can name a target it does not write. A line that only
+ * resembles a header (another letter case, other spacing, a character hidden
+ * in the marker) is rejected by both parsers today and is not trusted to stay
+ * rejected.
  */
 export function readPatchTargets(patch: string): PatchReading {
   const targets = new Set<string>();
   let unreadable = false;
   for (const rawLine of patch.split('\n')) {
+    if (!rawLine.includes('*')) continue;
     const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
     if (line.includes('***') && PATCH_AMBIGUOUS_CHARACTERS.test(line)) {
       unreadable = true;
       continue;
     }
+    if (!PATCH_HEADER_LIKE.test(line.replace(PATCH_INVISIBLE_CHARACTERS, ''))) continue;
     const trimmed = line.trim();
     const header = PATCH_TARGET_HEADERS.find(prefix => trimmed.startsWith(prefix));
-    if (header !== undefined) targets.add(trimmed.slice(header.length));
-    else if (PATCH_HEADER_LIKE.test(trimmed)) unreadable = true;
+    const target = header === undefined ? undefined : trimmed.slice(header.length);
+    if (target === undefined || PATCH_PATH_UNSAFE_CHARACTERS.test(target)) unreadable = true;
+    else targets.add(target);
   }
   return { targets: [...targets], unreadable };
 }

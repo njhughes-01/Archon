@@ -171,6 +171,15 @@
       "src/shared/tool-gate.test.ts"
     ],
     [
+      "src/claude/tool-gate.test.ts"
+    ],
+    [
+      "src/community/pi/tool-gate.test.ts"
+    ],
+    [
+      "src/community/copilot/tool-gate.test.ts"
+    ],
+    [
       "src/claude/container-spawn.test.ts"
     ],
     [

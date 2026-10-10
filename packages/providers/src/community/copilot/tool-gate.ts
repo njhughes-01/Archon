@@ -35,6 +35,8 @@
  *
  * This module imports types only from the SDK (see provider-lazy-load.test.ts).
  */
+import { isAbsolute, join, normalize, resolve } from 'node:path';
+
 import { createLogger } from '@archon/paths';
 import type { SessionConfig } from '@github/copilot-sdk';
 
@@ -42,6 +44,7 @@ import type { ToolActionKind, ToolActionRequest } from '../../types';
 import {
   askToolGate,
   formatToolGateDenial,
+  readPatchTargets,
   toolGateFailure,
   type ToolGate,
   type ToolGateDenial,
@@ -83,13 +86,7 @@ const COPILOT_TOOL_CLASSES: Record<string, ToolActionKind | 'read_only'> = {
 /** `str_replace_editor` is one tool for reading and writing; this sub-command only reads. */
 const EDITOR_VIEW_COMMAND = 'view';
 
-/** The file headers of the `apply_patch` envelope, each followed by one path. */
-const PATCH_FILE_HEADERS = [
-  '*** Add File: ',
-  '*** Update File: ',
-  '*** Delete File: ',
-  '*** Move to: ',
-];
+const PATCH_TOOL = 'apply_patch';
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -112,22 +109,78 @@ function toInputRecord(toolArgs: unknown): Record<string, unknown> {
   return { input: toolArgs };
 }
 
-function patchTargets(input: Record<string, unknown>): string[] {
+const withoutLeadingSeparators = (path: string): string => path.replace(/^[\\/]+/, '');
+
+/** A path with `/` separators and neither a drive letter nor a leading separator. */
+function rootlessPath(path: string): string {
+  const slashed = path.replace(/\\/g, '/');
+  return withoutLeadingSeparators(/^[a-zA-Z]:/.test(slashed) ? slashed.slice(2) : slashed);
+}
+
+/**
+ * Where the runtime places an `apply_patch` path: a copy of the function every
+ * hunk path goes through in the @github/copilot 1.0.61 bundle (app.js, called
+ * with the session directory and the path the parser read). An absolute path
+ * is taken normalised; a relative path that repeats the session directory, in
+ * any letter case, is taken from that directory; any other is joined to it. A
+ * leading `~` or `@` and a `file://` URL are ordinary names to it.
+ */
+function resolvePatchPath(cwd: string, path: string): string {
+  const base = normalize(cwd);
+  const given = normalize(path);
+  if (isAbsolute(given)) return given;
+  const baseKey = rootlessPath(base);
+  const givenKey = rootlessPath(given);
+  if (baseKey !== '' && givenKey !== '') {
+    const lowerBase = baseKey.toLowerCase();
+    const lowerGiven = givenKey.toLowerCase();
+    if (
+      lowerGiven.startsWith(lowerBase) &&
+      (lowerGiven.length === lowerBase.length || lowerGiven[lowerBase.length] === '/')
+    ) {
+      const rest = withoutLeadingSeparators(givenKey.slice(baseKey.length));
+      return rest === '' ? base : join(base, rest);
+    }
+  }
+  return join(base, given);
+}
+
+/**
+ * The files an `apply_patch` call would write, delete or move to, and whether
+ * the patch has a header that could not be read. A call with no readable
+ * target at all is unreadable too.
+ *
+ * The runtime reads the patch from `input`, then `patch`, when the arguments
+ * are an object, and trims each path (1.0.61 bundle; its parser is the oracle
+ * in tool-gate.test.ts). The CLI may be the user's own and newer, so a path
+ * with space in front is named as written as well.
+ */
+function patchWriteTargets(
+  input: Record<string, unknown>,
+  cwd: string
+): { paths: string[]; unreadable: boolean } {
   const text = [input.input, input.patch].find(
     (value): value is string => typeof value === 'string'
   );
-  if (text === undefined) return [];
-  const targets = new Set<string>();
-  for (const line of text.split('\n')) {
-    const header = PATCH_FILE_HEADERS.find(prefix => line.startsWith(prefix));
-    if (header) targets.add(line.slice(header.length).trim());
+  const { targets, unreadable } =
+    text === undefined ? { targets: [], unreadable: true } : readPatchTargets(text);
+  const paths = new Set<string>();
+  for (const target of targets) {
+    paths.add(resolvePatchPath(cwd, target.trimStart()));
+    paths.add(resolvePatchPath(cwd, target));
   }
-  return [...targets];
+  return { paths: [...paths], unreadable: unreadable || paths.size === 0 };
 }
 
-function writeTargets(toolName: string, input: Record<string, unknown>): string[] {
-  if (toolName === 'apply_patch') return patchTargets(input);
-  return typeof input.path === 'string' ? [input.path] : [];
+/**
+ * The file an editor tool (`create`, `edit`, `str_replace_editor`) would write.
+ * The runtime takes an absolute path exactly as given and resolves any other
+ * against the session directory with node's `resolve` (1.0.61 bundle, the
+ * `str_replace_editor` callback all three tools go through): a leading `~` or
+ * `@` and a `file://` URL are ordinary names to it.
+ */
+function editorWriteTarget(path: string, cwd: string): string {
+  return isAbsolute(path) ? path : resolve(cwd, path);
 }
 
 /** The name the model sees for an MCP server's tools starts with the server's name. */
@@ -160,7 +213,15 @@ export function toCopilotToolAction(
   const shellText = [input.command, input.input].find(
     (value): value is string => typeof value === 'string'
   );
-  const paths = kind === 'file_write' ? writeTargets(call.toolName, input) : [];
+  let paths: string[] = [];
+  let unreadablePatch = false;
+  if (kind === 'file_write' && call.toolName === PATCH_TOOL) {
+    const patch = patchWriteTargets(input, call.cwd);
+    paths = patch.paths;
+    unreadablePatch = patch.unreadable;
+  } else if (kind === 'file_write' && typeof input.path === 'string') {
+    paths = [editorWriteTarget(input.path, call.cwd)];
+  }
   return {
     toolName: call.toolName,
     kind,
@@ -168,7 +229,8 @@ export function toCopilotToolAction(
     ...(kind === 'shell' && shellText !== undefined ? { command: shellText } : {}),
     ...(paths.length > 0 ? { paths } : {}),
     ...(kind === 'network' && typeof input.url === 'string' ? { url: input.url } : {}),
-    input,
+    // The mark goes on a copy: the gate's rules refuse a patch that carries it.
+    input: unreadablePatch ? { ...input, unreadablePatch: true } : input,
     ...(call.fromSubagent ? { fromSubagent: true } : {}),
   };
 }

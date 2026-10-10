@@ -248,9 +248,66 @@ describe('readPatchTargets', () => {
     expect(reading).toEqual({ targets: ['ok.txt'], unreadable: true });
   });
 
-  // The two parsers disagree on these characters. Codex keeps a bare carriage
-  // return inside a path (it wrote `ok\r/../../out.txt` outside the working
-  // directory) where Copilot ends the line; Codex trims U+0085 where Copilot
+  test.each([
+    ['stars spaced apart', '* * * Add File: a.txt'],
+    ['no space after the stars', '***Add File: a.txt'],
+    ['two spaces inside the marker', '*** Add  File: a.txt'],
+    ['a tab inside the marker', '*** Add\tFile: a.txt'],
+    ['a tab between the stars', '**\t* Delete File: a.txt'],
+    ['a zero-width space inside the marker', '*** Add\u200B File: a.txt'],
+  ])('a header-like line with %s makes the patch unreadable', (_label, line) => {
+    const reading = readPatchTargets(patch('*** Begin Patch', line, '+x', '*** End Patch'));
+
+    expect(reading).toEqual({ targets: [], unreadable: true });
+  });
+
+  // Codex CLI 0.157.0 drops a tab and a carriage return from anywhere in a
+  // path: `*** Add File: .\t./out.txt` wrote `../out.txt`, one directory above
+  // the working directory, and `.e\tnv` wrote `.env`. Copilot keeps the tab.
+  // What a parser does with the other invisible characters is not known for
+  // every version, so a path holding any of them is not guessed at.
+  test.each([
+    ['a tab inside a climbing path', '*** Add File: .\t./.\t./out.txt'],
+    ['a tab inside a file name', '*** Add File: .e\tnv'],
+    ['a tab right after the marker', '*** Update File: \t../out.txt'],
+    ['a tab inside a move target', '*** Move to: .\t./out.txt'],
+    ['a vertical tab inside a path', '*** Add File: a\u000Bb.txt'],
+    ['an escape character inside a path', '*** Delete File: a\u001Bb.txt'],
+    ['a delete character inside a path', '*** Add File: a\u007Fb.txt'],
+    ['a C1 control inside a path', '*** Add File: a\u009Fb.txt'],
+    ['a zero-width space inside a path', '*** Add File: .e\u200Bnv'],
+    ['a soft hyphen inside a path', '*** Add File: .e\u00ADnv'],
+    ['a right-to-left override inside a path', '*** Add File: a\u202Eb.txt'],
+  ])('%s makes the patch unreadable and names no guessed path', (_label, line) => {
+    const reading = readPatchTargets(patch('*** Begin Patch', line, '+x', '*** End Patch'));
+
+    expect(reading).toEqual({ targets: [], unreadable: true });
+  });
+
+  test('a path with ordinary and no-break spaces inside it is read as written', () => {
+    expect(
+      readPatchTargets(patch('*** Add File: docs/My Notes\u00A0v2.md', '+x', '*** End Patch'))
+    ).toEqual({ targets: ['docs/My Notes\u00A0v2.md'], unreadable: false });
+  });
+
+  test('tab-indented content that mentions three stars is not a header', () => {
+    expect(
+      readPatchTargets(
+        patch(
+          '*** Begin Patch',
+          '*** Update File: main.go',
+          '@@',
+          '+\t// *** Add File: is how a patch names a new file ***',
+          '-\tx := ***p',
+          '*** End Patch'
+        )
+      )
+    ).toEqual({ targets: ['main.go'], unreadable: false });
+  });
+
+  // The two parsers disagree on these characters. Copilot ends a line at a bare
+  // carriage return where Codex drops the character and reads on (it wrote
+  // `../out.txt` for `ok\r/../../out.txt`); Codex trims U+0085 where Copilot
   // does not, and the reverse for U+FEFF. A line that could be a header under
   // either reading is not guessed at.
   test.each([
