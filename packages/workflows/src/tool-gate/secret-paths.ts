@@ -37,6 +37,9 @@ const CREDENTIAL_FILE_SUFFIXES = [
   ...['etc/shadow', 'etc/gshadow', 'etc/sudoers'],
 ];
 
+/** The desktop login keyring. `/usr/share/keyrings` holds public package keys and is not this. */
+const DESKTOP_KEYRING = /(^|\/)\.local\/share\/keyrings\//;
+
 /** `hosts.yml` is a login store when it sits in a tool's config directory. */
 const HOSTS_FILE = /^hosts\.(yml|yaml|json)$/;
 /** A tool's config or home directory, as the user keeps it or as the engine delivers a copy. */
@@ -57,6 +60,7 @@ const SECRET_NAMES = new Set([
   'application_default_credentials.json',
   '.vault-token',
   '.my.cnf',
+  'rclone.conf',
   '.s3cfg',
   '.boto',
   '.dockercfg',
@@ -164,6 +168,7 @@ function inCredentialStore(shape: PathShape): boolean {
     return true;
   }
   const joined = segments.join('/');
+  if (DESKTOP_KEYRING.test(joined)) return true;
   if (CREDENTIAL_FILE_SUFFIXES.some(suffix => joined === suffix || joined.endsWith(`/${suffix}`))) {
     return true;
   }
@@ -248,7 +253,8 @@ export function secretPathExemption(path: string): SecretPathExemption | undefin
   if (shape === undefined) return undefined;
   // A credential directory holds nothing an agent needs, whatever the file is called.
   if (inCredentialStore(shape) || PROCESS_ENVIRONMENT.test(shape.path)) return undefined;
-  if (PUBLIC_EXTENSIONS.has(shape.extension)) return 'public_material';
+  // `.env.pub` is an env file with a suffix, not a public key.
+  if (PUBLIC_EXTENSIONS.has(shape.extension) && !isEnvFile(shape)) return 'public_material';
   if (shape.directories.some(segment => segment.startsWith('.env'))) return undefined;
   if (ENV_TEMPLATE.test(shape.name)) return 'env_template';
   if (isEnvFile(shape) || isKeyOrStore(shape)) return undefined;

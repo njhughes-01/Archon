@@ -674,6 +674,8 @@ interface Judgement {
    * change the answer: see `forgetCheckouts`.
    */
   checkouts: Map<string, Promise<Checkout | undefined>>;
+  /** Directories a `git worktree add` of this call makes: checkouts that are not on disk yet. */
+  worktrees: Set<string>;
   heads: Map<string, Promise<string | undefined>>;
   /** Where a shell request starts, which is what its provider placed the request's own paths by. */
   startCwd: string | undefined;
@@ -697,6 +699,7 @@ function newJudgement(): Judgement {
     exhausted: () => false,
     overlong: () => false,
     checkouts: new Map(),
+    worktrees: new Set(),
     heads: new Map(),
     startCwd: undefined,
   };
@@ -877,6 +880,11 @@ async function judgeWriteTarget(
   const { context, judgement } = scope;
   if (isDeviceSink(target)) return;
   if (target.dynamic) {
+    // `~root/x` is another user's home, which is never inside the checkout.
+    if (/^~[A-Za-z_]/.test(target.text)) {
+      deny(judgement, 'deny.path_outside_root');
+      return;
+    }
     // The value is unknown, but a secret-shaped name around it is still a secret.
     if (isSecretPath(target.text)) deny(judgement, 'deny.secret_write');
     signal(judgement, 'risk.opaque_shell');
@@ -1021,6 +1029,30 @@ const GIT_JUDGED: ReadonlySet<string> = new Set([
   ...['archive', 'bundle', 'format-patch', 'credential'],
 ]);
 
+/**
+ * `git -c alias.<name>="<git arguments>" <name>`: the alias is the command it
+ * expands to. A `!` alias is a shell command and is judged as one elsewhere;
+ * git never lets an alias take the name of a built-in.
+ */
+function expandAlias(line: GitCommandLine): void {
+  const name = line.primary.subcommand;
+  if (name === undefined || GIT_SUBCOMMANDS.has(name)) return;
+  for (const setting of line.configs) {
+    const match = setting.dynamic ? null : /^alias\.([^=]+)=([\s\S]*)$/i.exec(setting.text);
+    if (match?.[1]?.toLowerCase() !== name.toLowerCase()) continue;
+    const words = (match[2] ?? '').trim().split(/\s+/);
+    const [first] = words;
+    if (first === undefined || first === '' || first.startsWith('!') || first.startsWith('-')) {
+      return;
+    }
+    line.primary = {
+      subcommand: first,
+      args: [...words.slice(1).map(plainPath), ...line.primary.args],
+    };
+    return;
+  }
+}
+
 function parseGit(args: readonly Arg[]): GitCommandLine {
   const line: GitCommandLine = {
     primary: { subcommand: undefined, args: [] },
@@ -1090,6 +1122,12 @@ function findCheckout(
   judgement: Judgement
 ): Promise<Checkout | undefined> {
   if (directory === undefined) return Promise.resolve(undefined);
+  // A worktree this call adds is a checkout of its own, though nothing is there yet.
+  for (let at: string | undefined = directory; judgement.worktrees.size > 0 && at !== undefined; ) {
+    if (judgement.worktrees.has(at)) return Promise.resolve({ top: at, gitDir: join(at, '.git') });
+    const parent = dirname(at);
+    at = parent === at ? undefined : parent;
+  }
   let found = judgement.checkouts.get(directory);
   if (found === undefined) {
     found = lookUpCheckout(directory);
@@ -1223,21 +1261,49 @@ const ORIGIN = 'origin';
 const REMOTE_ROUTING_KEY =
   /^(remote\.|branch\..+\.(remote|pushremote|merge)$|url\..+\.(insteadof|pushinsteadof)$|push\.default$)/i;
 
+/** What `-c` settings in front of a push make it do that its command line does not say. */
+interface PushSettings {
+  /** `remote.<name>.mirror`: every ref is pushed and the missing ones deleted. */
+  mirror: boolean;
+  /** `push.default=matching`: every branch that exists on both ends. */
+  matching: boolean;
+  /** `remote.<name>.push`: the refspecs used when the command line names none. */
+  refspecs: Arg[];
+}
+
+function pushSettings(configs: readonly Arg[]): PushSettings {
+  const settings: PushSettings = { mirror: false, matching: false, refspecs: [] };
+  for (const config of configs) {
+    const equals = config.text.indexOf('=');
+    if (config.dynamic || equals === -1) continue;
+    const key = config.text.slice(0, equals).toLowerCase();
+    const value = config.text.slice(equals + 1);
+    if (/^remote\..+\.mirror$/.test(key) && /^(true|yes|on|1)$/i.test(value))
+      settings.mirror = true;
+    else if (key === 'push.default' && value.toLowerCase() === 'matching') settings.matching = true;
+    else if (/^remote\..+\.push$/.test(key)) settings.refspecs.push(plainPath(value));
+  }
+  return settings;
+}
+
 async function judgeGitPush(
   parsed: Options,
   scope: ShellScope,
-  gitDirectory: string | undefined
+  gitDirectory: string | undefined,
+  configs: readonly Arg[]
 ): Promise<void> {
   const { context, judgement } = scope;
-  const refspecs = parsed.positionals.slice(1);
+  const settings = pushSettings(configs);
+  const given = parsed.positionals.slice(1);
+  const refspecs = given.length === 0 && settings.refspecs.length > 0 ? settings.refspecs : given;
   const isProtected = (branch: string | undefined): boolean =>
     branch === undefined || context.protectedBranches.includes(branch);
 
   const forced = hasOption(parsed, '-f', '--force');
   // Git accepts any unambiguous prefix: `--force-w` is the lease flag.
   const lease = hasAbbreviated(parsed, '--force-with-lease', '--force-w');
-  const mirror = hasOption(parsed, '--mirror');
-  const everything = mirror || hasOption(parsed, '--all', '--branches');
+  const mirror = hasAbbreviated(parsed, '--mirror', '--mir') || settings.mirror;
+  const everything = mirror || hasOption(parsed, '--all', '--branches') || settings.matching;
 
   if (forced || refspecs.some(refspec => refspec.text.startsWith('+')) || (mirror && !lease)) {
     // A mirror push force-updates every remote ref and deletes the ones missing locally.
@@ -1259,9 +1325,10 @@ async function judgeGitPush(
   }
 
   // Deleting a branch on the remote: `--delete main`, or the refspec `:main`.
-  const deleted = hasOption(parsed, '-d', '--delete')
-    ? refspecs
-    : refspecs.filter(refspec => refspec.text.startsWith(':'));
+  const deleted =
+    hasOption(parsed, '-d') || hasAbbreviated(parsed, '--delete', '--del')
+      ? refspecs
+      : refspecs.filter(refspec => refspec.text.startsWith(':'));
   if (deleted.some(refspec => !refspec.dynamic && isProtected(pushDestination(refspec.text)))) {
     deny(judgement, 'deny.git_force_push_protected');
   }
@@ -1344,6 +1411,11 @@ function gitWriteTargets(subcommand: string, parsed: Options, context: RuleConte
   }
 }
 
+/** `--pathspec-from-file=-`: the paths arrive on stdin, which this reader cannot see. */
+function readsPathspecFromStdin(parsed: Options): boolean {
+  return valuesOf(parsed, '--pathspec-from-file').some(value => value.text === '-');
+}
+
 /**
  * Whether one of a checkout's or restore's operands is the whole working tree:
  * the repository root (or a directory holding it), git's `:/`, pathspec magic,
@@ -1379,6 +1451,11 @@ async function coversWholeTree(operands: readonly Arg[], scope: ShellScope): Pro
  */
 function hasWildcard(operands: readonly Arg[]): boolean {
   return operands.some(operand => !operand.dynamic && /[*?[]/.test(operand.text));
+}
+
+/** Whether a branch name, or a `refs/heads/` ref, names one of the protected branches. */
+function isProtectedBranch(name: string, scope: ShellScope): boolean {
+  return scope.context.protectedBranches.includes(name.replace(/^(refs\/)?heads\//, ''));
 }
 
 /** How much a path-scoped checkout or restore throws away, as far as its operands show. */
@@ -1460,7 +1537,7 @@ function gitScripts(subcommand: string, args: readonly Arg[], parsed: Options): 
     case 'filter-branch':
       return args.flatMap((arg, index) => {
         const next = args[index + 1];
-        return !arg.dynamic && /^--[a-z-]+-filter$/.test(arg.text) && next !== undefined
+        return !arg.dynamic && /^(--[a-z-]+-filter|--setup)$/.test(arg.text) && next !== undefined
           ? [next]
           : [];
       });
@@ -1504,6 +1581,8 @@ async function branchAfter(
   if (!GIT_SUBCOMMANDS.has(subcommand)) return null;
   switch (subcommand) {
     case 'checkout': {
+      // Detached: no branch is out, whatever it is detached at.
+      if (hasAbbreviated(parsed, '--detach', '--det')) return null;
       const created = valuesOf(parsed, '-b', '-B', '--orphan').at(-1);
       if (created !== undefined) return named(created);
       // `git checkout [<tree>] -- <paths>` and `git checkout <file>` stay where they are.
@@ -1515,12 +1594,15 @@ async function branchAfter(
       return where.kind === 'resolved' && where.exists ? undefined : named(first);
     }
     case 'switch': {
+      if (hasOption(parsed, '-d') || hasAbbreviated(parsed, '--detach', '--det')) return null;
       const created = valuesOf(parsed, '-c', '-C', '--create', '--force-create', '--orphan').at(-1);
       return named(created ?? positionals[0]);
     }
     case 'branch':
       // Renaming: with one name it is the current branch that takes it.
-      if (!hasOption(parsed, '-m', '-M', '--move')) return undefined;
+      if (!hasOption(parsed, '-m', '-M') && !hasAbbreviated(parsed, '--move', '--mo')) {
+        return undefined;
+      }
       return positionals.length === 1 ? named(positionals[0]) : null;
     case 'rebase':
       // `git rebase <upstream> <branch>` checks the branch out first.
@@ -1567,7 +1649,15 @@ async function judgeGitDiscard(
       discards = true;
       hint = 'unlikely';
       break;
-    case 'branch':
+    case 'branch': {
+      // A protected branch deleted here is lost to every checkout that shares the repository.
+      const deleting =
+        hasOption(parsed, '-D') ||
+        ((hasOption(parsed, '-d') || hasAbbreviated(parsed, '--delete', '--del')) &&
+          (hasOption(parsed, '-f') || hasAbbreviated(parsed, '--force', '--for')));
+      if (deleting && positionals.some(arg => !arg.dynamic && isProtectedBranch(arg.text, scope))) {
+        deny(judgement, 'deny.git_force_push_protected');
+      }
       // Deleting unmerged work, or moving a branch name onto other commits.
       discards =
         hasOption(parsed, '-D', '-M', '-C') ||
@@ -1578,6 +1668,7 @@ async function judgeGitDiscard(
           ));
       hint = 'likely';
       break;
+    }
     case 'worktree':
       discards = verb === 'remove' || verb === 'prune' || verb === 'move';
       break;
@@ -1586,7 +1677,8 @@ async function judgeGitDiscard(
       hint = 'likely';
       break;
     case 'checkout': {
-      if (hasOption(parsed, '-f', '--force') || (await coversWholeTree(positionals, scope))) {
+      const forced = hasOption(parsed, '-f') || hasAbbreviated(parsed, '--force', '--for');
+      if (forced || (await coversWholeTree(positionals, scope)) || readsPathspecFromStdin(parsed)) {
         deny(judgement, 'deny.git_discard_worktree');
       }
       // `git checkout <branch>` is ordinary; with a path it overwrites the file.
@@ -1599,7 +1691,8 @@ async function judgeGitDiscard(
         })
       );
       discards =
-        hasOption(parsed, '-f', '--force', '-p', '--patch') ||
+        forced ||
+        hasOption(parsed, '-p', '--patch') ||
         raw.some(arg => arg.text === '--') ||
         paths.includes(true);
       if (discards && hasWildcard(positionals)) deny(judgement, 'deny.git_discard_worktree');
@@ -1623,7 +1716,12 @@ async function judgeGitDiscard(
     case 'restore':
       // `--staged` alone only unstages; anything touching the worktree overwrites files.
       discards = !hasOption(parsed, '--staged', '-S') || hasOption(parsed, '--worktree', '-W');
-      if (discards && ((await coversWholeTree(positionals, scope)) || hasWildcard(positionals))) {
+      if (
+        discards &&
+        ((await coversWholeTree(positionals, scope)) ||
+          hasWildcard(positionals) ||
+          readsPathspecFromStdin(parsed))
+      ) {
         deny(judgement, 'deny.git_discard_worktree');
       }
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
@@ -1638,7 +1736,10 @@ async function judgeGitDiscard(
       }
       break;
     case 'switch':
-      discards = hasOption(parsed, '--discard-changes', '-f', '--force');
+      discards =
+        hasOption(parsed, '-f') ||
+        hasAbbreviated(parsed, '--discard-changes', '--dis') ||
+        hasAbbreviated(parsed, '--force', '--for');
       if (discards) deny(judgement, 'deny.git_discard_worktree');
       // `-C` moves an existing branch onto other commits.
       if (hasOption(parsed, '-C', '--force-create')) discards = true;
@@ -1655,16 +1756,24 @@ async function judgeGitDiscard(
       hint = 'unlikely';
       break;
     case 'checkout-index':
-      discards = hasOption(parsed, '-f', '--force');
-      if (discards && hasOption(parsed, '-a', '--all'))
+      discards = hasOption(parsed, '-f') || hasAbbreviated(parsed, '--force', '--for');
+      if (discards && (hasOption(parsed, '-a') || hasAbbreviated(parsed, '--all', '--al')))
         deny(judgement, 'deny.git_discard_worktree');
       break;
     case 'rm':
       discards = !hasOption(parsed, '--cached');
       hint = 'likely';
       break;
-    case 'read-tree':
     case 'update-ref':
+      if (
+        hasOption(parsed, '-d') &&
+        positionals.some(arg => !arg.dynamic && isProtectedBranch(arg.text, scope))
+      ) {
+        deny(judgement, 'deny.git_force_push_protected');
+      }
+      discards = true;
+      break;
+    case 'read-tree':
     case 'prune':
       discards = true;
       break;
@@ -1711,11 +1820,34 @@ async function judgeGitDiscard(
   if (discards) signal(judgement, 'risk.mutation_verb', hint);
 }
 
+/**
+ * `git worktree add <dir> [<branch>]` makes a checkout whose branch is the one
+ * named, not the branch of the checkout it was made from. Pushes made from it
+ * later in the call are judged by that branch.
+ */
+async function noteWorktree(parsed: Options, scope: ShellScope): Promise<void> {
+  const [verb, directory, commitish] = parsed.positionals;
+  if (verb?.text !== 'add' || directory === undefined || directory.dynamic) return;
+  const where = await locate(directory.text, scope.cwd, scope.context);
+  if (where.kind !== 'resolved') return;
+  const name = (arg: Arg | undefined): string | null =>
+    arg === undefined || arg.dynamic || arg.glob ? null : arg.text;
+  const created = valuesOf(parsed, '-b', '-B').at(-1);
+  let branch: string | null;
+  if (created !== undefined) branch = name(created);
+  else if (hasAbbreviated(parsed, '--detach', '--det')) branch = null;
+  // With no branch named, git makes one called after the directory.
+  else branch = commitish === undefined ? basename(where.real) : name(commitish);
+  scope.judgement.worktrees.add(where.real);
+  scope.judgement.branches.set(where.real, branch);
+}
+
 async function judgeGitSubcommand(
   invocation: GitInvocation,
   scope: ShellScope,
   gitDirectory: string | undefined,
-  mode: Mode
+  mode: Mode,
+  configs: readonly Arg[]
 ): Promise<Options | undefined> {
   const { subcommand } = invocation;
   const { context, judgement } = scope;
@@ -1755,12 +1887,13 @@ async function judgeGitSubcommand(
   if (subcommand === 'init' || subcommand === 'clone' || subcommand === 'worktree') {
     forgetCheckouts(judgement);
   }
+  if (subcommand === 'worktree') await noteWorktree(parsed, scope);
   const moved = await branchAfter(subcommand, parsed, invocation.args, scope);
   if (moved !== undefined) await noteBranchMove(gitDirectory, moved, judgement);
 
   switch (subcommand) {
     case 'push':
-      await judgeGitPush(parsed, scope, gitDirectory);
+      await judgeGitPush(parsed, scope, gitDirectory, configs);
       break;
     case 'reset':
       if (hasAbbreviated(parsed, '--hard', '--h')) deny(judgement, 'deny.git_reset_hard');
@@ -1772,7 +1905,11 @@ async function judgeGitSubcommand(
       if (hasOption(parsed, '-n') || hasAbbreviated(parsed, '--dry-run', '--d')) break;
       // Untracked files cannot be brought back. The force flag is not required
       // for the deny: `clean.requireForce=false` makes git run without it.
-      if (hasOption(parsed, '-f', '-d', '-x', '-X') || hasAbbreviated(parsed, '--force', '--f')) {
+      if (
+        hasOption(parsed, '-f', '-d', '-x', '-X') ||
+        hasAbbreviated(parsed, '--force', '--f') ||
+        configs.some(config => /^clean\.requireforce=(false|no|off|0)$/i.test(config.text))
+      ) {
         deny(judgement, 'deny.git_clean_force');
       } else {
         signal(judgement, 'risk.mutation_verb');
@@ -1795,6 +1932,7 @@ async function judgeGitSubcommand(
 async function judgeGit(view: CommandView, scope: ShellScope, mode: Mode): Promise<boolean> {
   const { context, judgement } = scope;
   const line = parseGit(view.args);
+  expandAlias(line);
   for (const setting of line.configs) {
     const equals = setting.text.indexOf('=');
     const key = equals === -1 ? setting.text : setting.text.slice(0, equals);
@@ -1838,9 +1976,9 @@ async function judgeGit(view: CommandView, scope: ShellScope, mode: Mode): Promi
   }
 
   for (const alternative of line.alternatives) {
-    await judgeGitSubcommand(alternative, scope, gitDirectory, mode);
+    await judgeGitSubcommand(alternative, scope, gitDirectory, mode, line.configs);
   }
-  const parsed = await judgeGitSubcommand(line.primary, scope, gitDirectory, mode);
+  const parsed = await judgeGitSubcommand(line.primary, scope, gitDirectory, mode, line.configs);
   const { subcommand } = line.primary;
 
   if (parsed === undefined || subcommand === undefined || !READ_ONLY_GIT.has(subcommand)) {
@@ -2160,7 +2298,10 @@ const WRITERS: Readonly<Record<string, Writer>> = {
   cp: { targets: 'last', into: TARGET_DIRECTORY },
   install: { targets: 'last', into: TARGET_DIRECTORY },
   ln: { targets: 'last', into: TARGET_DIRECTORY },
-  rsync: { targets: 'last' },
+  rsync: {
+    targets: 'last',
+    writes: ['--log-file', '--backup-dir', '--partial-dir', '--temp-dir', '-T'],
+  },
   zip: { targets: 'first' },
   patch: {
     targets: 'first',
@@ -2778,16 +2919,50 @@ function interpreterCode(view: CommandView): string[] {
   return [...flagged, ...evaluated, ...command.stdin];
 }
 
+/** The local paths a download command is pointed at with `file://` URLs. */
+function fileUrlPaths(view: CommandView): string[] {
+  return view.args.flatMap(arg => {
+    const url = arg.text.replace(/^--url=/, '');
+    if (!/^file:\/\//i.test(url)) return [];
+    // `file://localhost/path` and `file:///path` both name `/path`.
+    const path = url.replace(/^file:\/\/(localhost)?/i, '');
+    try {
+      return [decodeURIComponent(path)];
+    } catch {
+      return [path];
+    }
+  });
+}
+
 /** curl: the files a request body names with `@path`, alone or inside `name=@path`. */
 function curlUploads(parsed: Options): Arg[] {
   const always = valuesOf(parsed, '-T', '--upload-file');
+  // `-H @file` sends the file's lines as request headers.
+  const headerFiles = valuesOf(parsed, '-H', '--header', '--proxy-header')
+    .filter(value => value.text.startsWith('@'))
+    .map(value => ({ ...value, text: value.text.slice(1) }));
   const marked = valuesOf(parsed, ...CURL_BODY_FLAGS)
     .filter(value => !always.includes(value))
     .flatMap(value => {
       const at = /(?:^|=|;)[@<]([^;,]+)/.exec(value.text)?.[1];
       return at === undefined ? [] : [{ ...value, text: at }];
     });
-  return [...always, ...marked];
+  return [...always, ...headerFiles, ...marked];
+}
+
+/** Git options whose value is the name of a file the command reads. */
+const GIT_FILE_OPTIONS: Readonly<Record<string, readonly string[]>> = {
+  commit: ['-F', '--file'],
+  tag: ['-F', '--file'],
+  notes: ['-F', '--file'],
+  config: ['-f', '--file'],
+  grep: ['-f'],
+  blame: ['--contents'],
+};
+
+/** `<rev>:<path>` as the path alone. */
+function inRevision(arg: Arg): Arg {
+  return { ...arg, text: arg.text.slice(arg.text.lastIndexOf(':') + 1) };
 }
 
 /** The arguments of a git command that name files, as opposed to revisions and patterns. */
@@ -2801,13 +2976,25 @@ async function gitFileArguments(git: GitCommandLine, scope: ShellScope): Promise
     dashDash === -1 ? args : args.slice(0, dashDash),
     GIT_OPTION_SPECS[subcommand]
   );
+  // Options whose value is a file git reads: a message, a pattern list, a config file.
+  const optionFiles = [
+    ...valuesOf(parsed, ...(GIT_FILE_OPTIONS[subcommand] ?? [])),
+    // `--blob=<rev>:<path>` reads the file as committed.
+    ...(subcommand === 'config' ? valuesOf(parsed, '--blob').map(inRevision) : []),
+    // `git diff --no-index a b` compares two files, whatever the repository tracks.
+    ...(subcommand === 'diff' && hasOption(parsed, '--no-index') ? parsed.positionals : []),
+  ];
   if (GIT_PATH_SUBCOMMANDS.has(subcommand)) {
     // `git grep <pattern> [paths]`: the pattern is not a path unless -e or -f gave it.
     const patterned = subcommand === 'grep' && valuesOf(parsed, '-e', '-f').length === 0;
-    return [...(patterned ? parsed.positionals.slice(1) : parsed.positionals), ...after];
+    return [
+      ...optionFiles,
+      ...(patterned ? parsed.positionals.slice(1) : parsed.positionals),
+      ...after,
+    ];
   }
-  if (!GIT_REVISION_SUBCOMMANDS.has(subcommand)) return after;
-  const named: Arg[] = [];
+  if (!GIT_REVISION_SUBCOMMANDS.has(subcommand)) return [...optionFiles, ...after];
+  const named: Arg[] = [...optionFiles];
   for (const arg of parsed.positionals) {
     const colon = arg.text.lastIndexOf(':');
     if (colon !== -1) {
@@ -2933,6 +3120,13 @@ async function judgeReads(view: CommandView, scope: ShellScope, mode: Mode): Pro
     }
   }
   if (TEXT_ONLY.has(head) || kind === 'metadata') return;
+
+  // `curl file:///…` reads a local file as surely as `cat` does.
+  if (head === 'curl' || head === 'wget') {
+    for (const url of fileUrlPaths(view)) {
+      if (await isSecretText(url, true, scope)) deny(judgement, 'deny.secret_read');
+    }
+  }
 
   const isReader = CONTENT_READERS.has(head);
   const named = git === undefined ? fileArguments(view) : await gitFileArguments(git, scope);
@@ -3398,6 +3592,29 @@ interface Roles {
   dumps: boolean;
   runsStdin: boolean;
   leaves: boolean;
+  /** Interpreter code that prints the whole environment: see `codeDumpsEnvironment`. */
+  codeDumps: boolean;
+  /** A network client or other sender, not merely an interpreter. */
+  sends: boolean;
+}
+
+/**
+ * The whole environment named in interpreter code: `process.env` on its own,
+ * `os.environ`, Ruby's `ENV`, Perl's `%ENV`, PHP's `getenv()`. One variable
+ * read by name (`process.env.HOME`, `os.environ['HOME']`) is not a dump.
+ */
+const CODE_ENVIRONMENT_DUMP = new RegExp(
+  [
+    String.raw`\bprocess\.env\b(?!\s*(\.\s*[A-Za-z_$]|\[))`,
+    String.raw`\bos\.environ\b(?!\s*(\[|\.\s*(get|getenv|__getitem__)\b))`,
+    String.raw`\bENV\b(?!\s*(\[|\.\s*(fetch|key\?|dig|delete)\b))`,
+    String.raw`%ENV\b`,
+    String.raw`\bgetenv\s*\(\s*\)`,
+  ].join('|')
+);
+
+function codeDumpsEnvironment(view: CommandView): boolean {
+  return interpreterCode(view).some(code => CODE_ENVIRONMENT_DUMP.test(code));
 }
 
 function rolesOf(view: CommandView, context: RuleContext): Roles {
@@ -3416,6 +3633,8 @@ function rolesOf(view: CommandView, context: RuleContext): Roles {
     fetches: all.some(candidate => FETCHERS.has(candidate.command.head)),
     dumps: all.some(candidate => dumpsEnvironment(candidate) || readsEnviron(candidate)),
     runsStdin: all.some(readsProgramFromStdin),
+    codeDumps: all.some(codeDumpsEnvironment),
+    sends: all.some(sendsOut),
     leaves: all.some(
       candidate =>
         sendsOut(candidate) ||
@@ -3471,6 +3690,10 @@ function judgeAcrossCommands(
       deny(judgement, 'deny.pipe_to_shell');
     }
     if (mine.leaves && upstream.some(role => role?.dumps)) {
+      deny(judgement, 'deny.secret_exfiltration');
+    }
+    // Code is a dump only for a client that sends it: `| python3 -m json.tool` just formats it.
+    if (mine.sends && upstream.some(role => role?.codeDumps)) {
       deny(judgement, 'deny.secret_exfiltration');
     }
     // A dump sent straight to a host: `env > /dev/tcp/host/port`.

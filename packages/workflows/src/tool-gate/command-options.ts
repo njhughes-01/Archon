@@ -235,6 +235,7 @@ export const OPTION_SPECS: Readonly<Record<string, OptionSpec>> = {
       ...['--output-dir', '--trace', '--trace-ascii', '--stderr', '--etag-save', '--etag-compare'],
       ...['--cert', '--key', '--cacert', '--capath', '--netrc-file', '--url', '--resolve'],
       ...['--hsts', '--alt-svc', '--unix-socket', '--interface', '--max-redirs', '--limit-rate'],
+      '--proxy-header',
     ],
   },
   wget: {
@@ -456,6 +457,7 @@ export const GIT_OPTION_SPECS: Readonly<Record<string, OptionSpec>> = {
     ],
   },
   stash: { valueShort: 'm', valueLong: ['--message'] },
+  notes: { valueShort: 'mFCc', valueLong: ['--message', '--file', '--reuse-message', '--ref'] },
   rebase: {
     valueShort: 'sXxC',
     valueLong: ['--onto', '--strategy', '--strategy-option', '--exec', '--empty'],
