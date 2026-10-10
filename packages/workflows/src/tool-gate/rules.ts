@@ -1304,8 +1304,9 @@ function gitWriteTargets(subcommand: string, parsed: Options, context: RuleConte
 async function coversWholeTree(operands: readonly Arg[], scope: ShellScope): Promise<boolean> {
   for (const operand of operands) {
     if (operand.dynamic) continue;
-    // `:/` is the top of the tree; `:(glob)**` and the rest of the magic are not read here.
-    if (operand.text.startsWith(':/') || operand.text.startsWith(':(')) return true;
+    // `:/` is the top of the tree, and `:!x` or `:^x` is everything but `x`;
+    // `:(glob)**` and the rest of the magic are not read here.
+    if (/^:[/(!^]/.test(operand.text)) return true;
     let text = operand.text;
     const wildcard = text.search(/[*?[]/);
     if (wildcard !== -1) {

@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  MAX_SCRIPT_ITEMS,
   MAX_WRAPPER_DEPTH,
   parseArgv,
   parseShell,
@@ -465,6 +466,12 @@ describe('parseShell: wrappers', () => {
     const command = only(`${'nice '.repeat(20)}git status`);
     expect(command.head).toBe('git');
     expect(command.wrappers).toHaveLength(20);
+  });
+
+  test('a run of empty substitutions is not free: each script read costs one item of the budget', () => {
+    const empty = '$()';
+    expect(parseShell(`echo "${empty.repeat(100)}"`).overBudget).toBe(false);
+    expect(parseShell(`echo "${empty.repeat(MAX_SCRIPT_ITEMS + 1)}"`).overBudget).toBe(true);
   });
 
   test('a chain longer than is peeled puts the script over its reading budget, never hides the command', () => {
