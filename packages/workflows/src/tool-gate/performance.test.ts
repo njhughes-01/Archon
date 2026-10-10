@@ -151,6 +151,63 @@ describe.skipIf(process.platform === 'win32')('rules stay within their time budg
   });
 });
 
+/** Shapes the final attack round reported as over 50 ms, at its sizes and at 100 KiB. */
+const REPORTED_SHAPES: readonly (readonly [string, string])[] = [
+  ...[10_240, 51_200, 102_400].map((size): readonly [string, string] => [
+    `a ${String(size)}-byte slash path`,
+    `cat ${'a/'.repeat(Math.ceil(size / 2)).slice(0, size - 5)}z`,
+  ]),
+  ...[51_200, 102_400].map((size): readonly [string, string] => [
+    `a ${String(size)}-byte credential-shaped dotted name`,
+    `cat ${'credentials.'.repeat(Math.ceil(size / 12)).slice(0, size - 7)}txt`,
+  ]),
+  ['nested arithmetic at 1 KiB', `echo $((${'1+('.repeat(338).slice(0, 1013)}1))`],
+  ['nested arithmetic at 100 KiB', `echo $((${'1+('.repeat(34_000).slice(0, 100_000)}1))`],
+];
+
+describe.skipIf(process.platform === 'win32')(
+  'shapes the final attack round reported as slow',
+  () => {
+    test.each(REPORTED_SHAPES)('%s', async (name, command) => {
+      const context = makeContext();
+      await evaluateRules(shell('ls', context.repoRoot), context);
+      const elapsed = await timed(() => evaluateRules(shell(command, context.repoRoot), context));
+      console.log(
+        `tool-gate timing: ${name}: ${String(command.length)} chars, ${elapsed.toFixed(1)} ms`
+      );
+      expect(elapsed).toBeLessThan(CEILING_MS);
+    });
+
+    test.each([160, 390])(
+      '%d chained pushes of the checked-out branch from 48 levels down',
+      async count => {
+        const context = makeContext();
+        const deep = join(context.repoRoot, ...Array.from({ length: 48 }, () => 'nested'));
+        mkdirSync(deep, { recursive: true });
+        const command = Array.from({ length: count }, () => 'git push origin HEAD').join(' && ');
+        await evaluateRules(shell('ls', deep), context);
+        const started = performance.now();
+        const outcome = await evaluateRules(shell(command, deep), context);
+        const elapsed = performance.now() - started;
+        console.log(
+          `tool-gate timing: ${String(count)} deep pushes: ${String(command.length)} chars, ${elapsed.toFixed(1)} ms`
+        );
+        expect(outcome.outcome).toBe('allow');
+        expect(elapsed).toBeLessThan(CEILING_MS);
+      }
+    );
+
+    test('a path over the longest one Linux allows is denied without being walked', async () => {
+      const context = makeContext();
+      const outcome = await evaluateRules(
+        shell(`cat ${'a/'.repeat(3_000)}z`, context.repoRoot),
+        context
+      );
+      expect(outcome).toMatchObject({ outcome: 'deny', ruleId: 'deny.path_unresolvable' });
+    });
+  }
+);
+
 describe.skipIf(process.platform === 'win32')('the reading budget', () => {
   const context = makeContext();
 

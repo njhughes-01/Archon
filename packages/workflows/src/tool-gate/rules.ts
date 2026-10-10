@@ -665,6 +665,16 @@ interface Judgement {
   environment: Set<string>;
   /** Whether the call named more paths than were placed: set by `evaluateRules`. */
   exhausted: () => boolean;
+  /** Whether the call named a path no Linux lookup accepts: set by `evaluateRules`. */
+  overlong: () => boolean;
+  /**
+   * What this call has read of the checkouts on disk: where `.git` was found from
+   * a directory, and what a `HEAD` file said. A chain of pushes asks the same
+   * question again and again. Forgotten whenever a command of the call could
+   * change the answer: see `forgetCheckouts`.
+   */
+  checkouts: Map<string, Promise<Checkout | undefined>>;
+  heads: Map<string, Promise<string | undefined>>;
   /** Where a shell request starts, which is what its provider placed the request's own paths by. */
   startCwd: string | undefined;
 }
@@ -685,6 +695,9 @@ function newJudgement(): Judgement {
     pushRelied: undefined,
     environment: new Set(),
     exhausted: () => false,
+    overlong: () => false,
+    checkouts: new Map(),
+    heads: new Map(),
     startCwd: undefined,
   };
 }
@@ -771,6 +784,8 @@ interface Evaluation {
   unplaceable: boolean;
   /** More paths were named than one call is placed for: see `MAX_PLACED_PATHS`. */
   exhausted: boolean;
+  /** A path was longer than any Linux lookup accepts: it was not walked. */
+  overlong: boolean;
 }
 
 /**
@@ -790,7 +805,10 @@ async function place(
   evaluation: Evaluation | undefined
 ): Promise<Where> {
   const resolved = await resolveRealPath(text, cwd ?? context.repoRoot, evaluation?.entries);
-  if (!resolved.ok) return { kind: 'failed' };
+  if (!resolved.ok) {
+    if (resolved.code === 'ENAMETOOLONG' && evaluation !== undefined) evaluation.overlong = true;
+    return { kind: 'failed' };
+  }
   const real = resolved.path;
   const { exists } = resolved;
   // A link of unknown name may stand anywhere inside the roots: a path that
@@ -1060,8 +1078,28 @@ interface Checkout {
   gitDir: string;
 }
 
+/** Drops what the call has read of the checkouts: a command of it may have moved one. */
+function forgetCheckouts(judgement: Judgement): void {
+  judgement.checkouts.clear();
+  judgement.heads.clear();
+}
+
+/** The checkout `directory` is in, read once per call until `forgetCheckouts`. */
+function findCheckout(
+  directory: string | undefined,
+  judgement: Judgement
+): Promise<Checkout | undefined> {
+  if (directory === undefined) return Promise.resolve(undefined);
+  let found = judgement.checkouts.get(directory);
+  if (found === undefined) {
+    found = lookUpCheckout(directory);
+    judgement.checkouts.set(directory, found);
+  }
+  return found;
+}
+
 /** The checkout `directory` is in: the nearest directory at or above it with a `.git`. */
-async function findCheckout(directory: string | undefined): Promise<Checkout | undefined> {
+async function lookUpCheckout(directory: string | undefined): Promise<Checkout | undefined> {
   let at = directory;
   while (at !== undefined) {
     const dotGit = join(at, '.git');
@@ -1090,12 +1128,21 @@ async function currentBranch(
   judgement: Judgement
 ): Promise<string | undefined> {
   if (judgement.gitRelocated) return undefined;
-  const checkout = await findCheckout(directory);
+  const checkout = await findCheckout(directory, judgement);
   if (checkout === undefined) return undefined;
   const moved = judgement.branches.get(checkout.top);
   if (moved !== undefined) return moved ?? undefined;
+  let read = judgement.heads.get(checkout.gitDir);
+  if (read === undefined) {
+    read = readHead(checkout.gitDir);
+    judgement.heads.set(checkout.gitDir, read);
+  }
+  return read;
+}
+
+async function readHead(gitDir: string): Promise<string | undefined> {
   try {
-    const head = await readFile(join(checkout.gitDir, 'HEAD'), 'utf8');
+    const head = await readFile(join(gitDir, 'HEAD'), 'utf8');
     return /^ref:\s*refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim();
   } catch {
     return undefined;
@@ -1108,6 +1155,7 @@ async function currentBranch(
  * the order the commands are written in proves nothing.
  */
 function branchNoLongerKnown(judgement: Judgement): void {
+  forgetCheckouts(judgement);
   if (judgement.pushRelied === 'lease') deny(judgement, 'deny.git_force_push_protected');
   if (judgement.pushRelied === 'plain') signal(judgement, 'risk.mutation_verb', 'unlikely');
 }
@@ -1119,7 +1167,7 @@ async function noteBranchMove(
   judgement: Judgement
 ): Promise<void> {
   branchNoLongerKnown(judgement);
-  const checkout = judgement.gitRelocated ? undefined : await findCheckout(directory);
+  const checkout = judgement.gitRelocated ? undefined : await findCheckout(directory, judgement);
   if (checkout === undefined) judgement.gitRelocated = true;
   else judgement.branches.set(checkout.top, branch);
 }
@@ -1702,6 +1750,10 @@ async function judgeGitSubcommand(
     for (const script of scripts) {
       await judgeScript(parseShell(script.text), scope.cwd, context, judgement, inner);
     }
+  }
+  // These make a checkout that a directory read earlier in the call did not have.
+  if (subcommand === 'init' || subcommand === 'clone' || subcommand === 'worktree') {
+    forgetCheckouts(judgement);
   }
   const moved = await branchAfter(subcommand, parsed, invocation.args, scope);
   if (moved !== undefined) await noteBranchMove(gitDirectory, moved, judgement);
@@ -3390,6 +3442,9 @@ function literalWord(text: string): ShellWord {
   return { parts: [{ kind: 'literal', text }], nested: [] };
 }
 
+/** How many pipelines or groups may sit inside each other before a script is refused. */
+const MAX_PIPELINE_DEPTH = 64;
+
 /** Judges one script. Returns whether every command in it matched the read-only allow rule. */
 async function judgeScript(
   parsed: ParsedShell,
@@ -3401,6 +3456,12 @@ async function judgeScript(
   // Past the reading budget nothing more is read, so nothing is judged: a long
   // tail must not be able to carry a command past the rules unseen.
   if (parsed.overBudget) {
+    deny(judgement, 'deny.command_too_large');
+    return false;
+  }
+  // Comparing pipelines costs about the cube of how deeply they nest. No real
+  // command nests pipelines this far, so a script that does is not read.
+  if (parsed.commands.some(command => command.pipelinePath.length > MAX_PIPELINE_DEPTH)) {
     deny(judgement, 'deny.command_too_large');
     return false;
   }
@@ -3490,6 +3551,7 @@ function denied(ruleId: DenyRuleId): RuleOutcome {
 function conclude(judgement: Judgement, allowRule: AllowRuleId, cwdInside: boolean): RuleOutcome {
   if (judgement.deny !== undefined) return denied(judgement.deny);
   if (judgement.exhausted()) return denied('deny.command_too_large');
+  if (judgement.overlong()) return denied('deny.path_unresolvable');
   const signals = RISK_RULE_IDS.filter(ruleId => judgement.signals.has(ruleId));
   const [strongest] = signals;
   if (strongest === undefined) return { outcome: 'allow', ruleId: allowRule };
@@ -3560,9 +3622,11 @@ export async function evaluateRules(
     entries: new Map(),
     unplaceable: false,
     exhausted: false,
+    overlong: false,
   });
   const judgement = newJudgement();
   judgement.exhausted = (): boolean => EVALUATIONS.get(context)?.exhausted === true;
+  judgement.overlong = (): boolean => EVALUATIONS.get(context)?.overlong === true;
   const input: Record<string, unknown> =
     typeof request.input === 'object' && request.input !== null ? request.input : {};
   const paths = [

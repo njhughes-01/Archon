@@ -111,12 +111,28 @@ function readEntry(candidate: string, cache: PathEntryCache | undefined): Entry 
   return entry;
 }
 
+/** Linux PATH_MAX and NAME_MAX: no lookup can succeed on a longer path or segment. */
+const MAX_PATH_BYTES = 4096;
+const MAX_SEGMENT_BYTES = 255;
+
+/**
+ * Whether the kernel would refuse `path` outright. Checked before the walk, so
+ * a path of hundreds of kilobytes is never walked segment by segment.
+ */
+export function exceedsPathLimits(path: string): boolean {
+  // UTF-8 is at most three bytes per UTF-16 unit, so short text needs no count.
+  if (path.length * 3 <= MAX_PATH_BYTES) return false;
+  if (Buffer.byteLength(path) > MAX_PATH_BYTES) return true;
+  return path.split(SEPARATORS).some(segment => Buffer.byteLength(segment) > MAX_SEGMENT_BYTES);
+}
+
 export async function resolveRealPath(
   target: string,
   baseDir: string,
   cache?: PathEntryCache
 ): Promise<ResolvedPath> {
   if (!isAbsolute(baseDir)) return { ok: false, code: 'ERELATIVE' };
+  if (exceedsPathLimits(target)) return { ok: false, code: 'ENAMETOOLONG' };
   const start = isAbsolute(target) ? target : `${baseDir}${sep}${target}`;
   if (isProcessRelative(start)) return { ok: false, code: 'EPROCESS' };
   const { root } = parse(start);

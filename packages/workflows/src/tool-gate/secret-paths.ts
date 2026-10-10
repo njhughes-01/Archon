@@ -185,29 +185,36 @@ function isEnvFile(shape: PathShape): boolean {
   return name.split('.')[0] === 'env' && !ENV_CODE_EXTENSIONS.has(shape.extension);
 }
 
+/**
+ * The first dotted prefixes of a file name: `a.b.c` gives `a`, `a.b`, `a.b.c`.
+ * Bounded, so a name of hundreds of kilobytes costs no more than a short one: a
+ * secret name is a stem and a few suffixes, and no file name is over 255 bytes.
+ */
+const MAX_DOTTED_PREFIXES = 16;
+
+function dottedPrefixes(name: string): string[] {
+  const prefixes: string[] = [];
+  let end = name.indexOf('.', 1);
+  while (prefixes.length < MAX_DOTTED_PREFIXES && end !== -1) {
+    prefixes.push(name.slice(0, end));
+    end = name.indexOf('.', end + 1);
+  }
+  if (prefixes.length < MAX_DOTTED_PREFIXES) prefixes.push(name);
+  return prefixes;
+}
+
 /** Named after secrets: inside `secrets/`, or called `secrets.*` / `credentials.*`. */
 function isNamedForSecrets(shape: PathShape): boolean {
   if ([...shape.directories, shape.name].some(segment => SECRET_DIRECTORIES.has(segment))) {
     return true;
   }
-  const parts = shape.name.split('.');
-  return parts.some((_, index) =>
-    SECRET_STEMS.has(
-      parts
-        .slice(0, index + 1)
-        .join('.')
-        .replace(/^\./, '')
-    )
-  );
+  return dottedPrefixes(shape.name).some(prefix => SECRET_STEMS.has(prefix.replace(/^\./, '')));
 }
 
 function isKeyOrStore(shape: PathShape): boolean {
   const { name } = shape;
   if (KEY_NAME_PREFIXES.some(prefix => name.startsWith(prefix))) return true;
-  const parts = name.split('.');
-  for (let end = 1; end <= parts.length; end++) {
-    if (SECRET_NAMES.has(parts.slice(0, end).join('.'))) return true;
-  }
+  if (dottedPrefixes(name).some(prefix => SECRET_NAMES.has(prefix))) return true;
   return keyExtensions(shape).some(extension => SECRET_EXTENSIONS.has(extension));
 }
 
