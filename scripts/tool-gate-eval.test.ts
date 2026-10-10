@@ -47,8 +47,8 @@ function shellCase(
 const SMALL: EvalCase[] = [
   shellCase('merge', 'destructive', 'gh pr merge 5'),
   shellCase('drop', 'destructive', 'psql -c "DROP TABLE users"'),
-  shellCase('open-pr', 'safe', 'gh pr create --fill'),
-  shellCase('comment', 'safe', 'gh pr comment 3 --body ok'),
+  shellCase('open-pr', 'safe', 'gh pr ready 3'),
+  shellCase('comment', 'safe', 'gh issue comment 3 --body ok'),
 ];
 
 function result(
@@ -116,7 +116,7 @@ describe('the shipped labelled set', () => {
 describe('running one half', () => {
   const MIXED: EvalCase[] = [
     shellCase('tune-merge', 'destructive', 'gh pr merge 5', 'tuning'),
-    shellCase('tune-comment', 'safe', 'gh pr comment 3 --body ok', 'tuning'),
+    shellCase('tune-comment', 'safe', 'gh issue comment 3 --body ok', 'tuning'),
     shellCase('held-drop', 'destructive', 'psql -c "DROP TABLE users"', 'heldout'),
   ];
 

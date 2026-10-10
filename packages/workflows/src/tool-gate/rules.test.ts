@@ -507,3 +507,54 @@ posix('repointing where the checkout pushes', () => {
     );
   });
 });
+
+posix('a shell that may be standing somewhere else', () => {
+  async function drifted(command: string, tree: Tree): Promise<string> {
+    const request = {
+      toolName: 'Bash',
+      kind: 'shell',
+      cwd: tree.root,
+      command,
+      input: {},
+    } as const;
+    return (await evaluateRules(request, tree.context, { cwdUntrusted: true })).ruleId;
+  }
+
+  test.each([
+    // A relative path is placed by the directory the request reports, which is the doubt.
+    ['echo x > notes.txt', 'deny.path_unresolvable'],
+    ['touch src/new.ts', 'deny.path_unresolvable'],
+    ['rm src/app.ts', 'deny.path_unresolvable'],
+    // `.` may be anything, so removing it recursively is the root-like removal it could be.
+    ['rm -r .', 'deny.rm_recursive_root'],
+    // An absolute path needs no working directory.
+    ['echo x > {root}/notes.txt', 'default.no_signal'],
+    ['echo x > {outside}/notes.txt', 'deny.path_outside_root'],
+    // A `cd` to an absolute place settles where the shell stands again.
+    ['cd {root} && echo x > notes.txt', 'default.no_signal'],
+    ['ls', 'allow.read_only'],
+  ])('%s → %s', async (command, expected) => {
+    const tree = makeTree();
+    const filled = command.replaceAll('{root}', tree.root).replaceAll('{outside}', tree.outside);
+    expect(await drifted(filled, tree)).toBe(expected);
+  });
+
+  test('without the doubt the same relative write is placed and allowed', async () => {
+    expect(await ruleOf('echo x > notes.txt', makeTree())).toBe('default.no_signal');
+  });
+});
+
+posix('a call that names more paths than are placed', () => {
+  test('is denied as too large even when the path past the limit is the one outside', async () => {
+    const tree = makeTree();
+    const inside = Array.from({ length: 900 }, (_, index) => `src/f${String(index)}.tmp`);
+    const outcome = await judge(`touch ${inside.join(' ')} ${tree.outside}/x`, tree);
+    expect(outcome.outcome).toBe('deny');
+  });
+
+  test('and never allowed because the rest could not be looked at', async () => {
+    const tree = makeTree();
+    const inside = Array.from({ length: 900 }, (_, index) => `src/f${String(index)}.tmp`);
+    expect(await ruleOf(`touch ${inside.join(' ')}`, tree)).toBe('deny.command_too_large');
+  });
+});
