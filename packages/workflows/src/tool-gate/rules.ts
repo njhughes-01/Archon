@@ -2564,17 +2564,62 @@ interface CodeString {
   end: number;
 }
 
+/** How a language writes comments: line markers, and a block's opener and closer. */
+interface CommentSyntax {
+  line: readonly string[];
+  block?: readonly [string, string];
+}
+
+const HASH_COMMENTS: CommentSyntax = { line: ['#'] };
+const C_COMMENTS: CommentSyntax = { line: ['//'], block: ['/*', '*/'] };
+const COMMENT_SYNTAX: Readonly<Record<string, CommentSyntax>> = {
+  ...Object.fromEntries(
+    ['python', 'python2', 'python3', 'perl', 'ruby', 'Rscript', 'tclsh'].map(head => [
+      head,
+      HASH_COMMENTS,
+    ])
+  ),
+  ...Object.fromEntries(['node', 'nodejs', 'bun', 'deno', 'tsx'].map(head => [head, C_COMMENTS])),
+  php: { line: ['//', '#'], block: ['/*', '*/'] },
+  lua: { line: ['--'], block: ['--[[', ']]'] },
+  luajit: { line: ['--'], block: ['--[[', ']]'] },
+};
+
 /**
- * The quoted strings of a program, in one pass. An unterminated quote ends the
- * scan: nothing after it can be told from the inside of that string.
+ * The quoted strings of a program, in one pass, and the program with its
+ * comments blanked out (same length, so offsets agree). A comment is text the
+ * interpreter never runs: a command written in one is not a command. An
+ * unterminated quote ends the scan: nothing after it can be told from the
+ * inside of that string.
  */
-function scanCodeStrings(code: string): { strings: CodeString[]; complete: boolean } {
+function scanCodeStrings(
+  code: string,
+  syntax: CommentSyntax | undefined
+): { strings: CodeString[]; complete: boolean; masked: string } {
   const strings: CodeString[] = [];
+  let masked = '';
+  let kept = 0;
+  const blank = (from: number, to: number): void => {
+    masked += code.slice(kept, from) + code.slice(from, to).replace(/[^\n]/g, ' ');
+    kept = to;
+  };
+  const finish = (
+    complete: boolean
+  ): { strings: CodeString[]; complete: boolean; masked: string } => {
+    masked += code.slice(kept);
+    return { strings, complete, masked };
+  };
   let i = 0;
   while (i < code.length) {
     const quote = code[i] ?? '';
     if (quote !== "'" && quote !== '"' && quote !== '`') {
-      i++;
+      const comment = syntax === undefined ? undefined : commentAt(code, i, syntax);
+      if (comment === undefined) {
+        i++;
+      } else {
+        blank(i, comment);
+        i = comment;
+      }
       continue;
     }
     let text = '';
@@ -2584,13 +2629,55 @@ function scanCodeStrings(code: string): { strings: CodeString[]; complete: boole
       text += code[escaped ? j + 1 : j] ?? '';
       j += escaped ? 2 : 1;
     }
-    if (j >= code.length) return { strings, complete: false };
+    if (j >= code.length) return finish(false);
     strings.push({ text, quote, start: i, end: j + 1 });
-    if (strings.length > MAX_CODE_STRINGS) return { strings, complete: false };
+    if (strings.length > MAX_CODE_STRINGS) return finish(false);
     i = j + 1;
   }
-  return { strings, complete: true };
+  return finish(true);
 }
+
+/**
+ * Where the comment that starts at `at` ends, or `undefined` when none starts
+ * there. A marker after a backslash or a `$` is part of something else (`\//`
+ * ends a regular-expression literal, `$#list` is a Perl length).
+ */
+function commentAt(code: string, at: number, syntax: CommentSyntax): number | undefined {
+  const before = code[at - 1];
+  if (before === '\\' || before === '$') return undefined;
+  const [open, close] = syntax.block ?? [];
+  if (open !== undefined && close !== undefined && code.startsWith(open, at)) {
+    const end = code.indexOf(close, at + open.length);
+    return end === -1 ? code.length : end + close.length;
+  }
+  if (!syntax.line.some(marker => code.startsWith(marker, at))) return undefined;
+  const newline = code.indexOf('\n', at);
+  return newline === -1 ? code.length : newline;
+}
+
+/** Names the program defines as functions of its own: a call to one is not a call to a library. */
+const OWN_FUNCTION_DEFINITIONS = [
+  /\b(?:function\s*\*?|def|sub|fn)\s+([A-Za-z_$][\w$]*)/g,
+  /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function\b|\([^)]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)/g,
+];
+
+function ownFunctions(code: string): Set<string> {
+  const names = new Set<string>();
+  for (const pattern of OWN_FUNCTION_DEFINITIONS) {
+    for (const match of code.matchAll(pattern)) {
+      if (match[1] !== undefined) names.add(match[1]);
+    }
+  }
+  return names;
+}
+
+/** The name called at the end of `before`, when it is a bare name and not a method of something. */
+function bareCallee(before: string): string | undefined {
+  return /(?:^|[^\w$.:>@])([A-Za-z_$][\w$]*)\s*\(?\s*(?:\[\s*)?$/.exec(before)?.[1];
+}
+
+/** `/pattern/.exec(` is a regular expression matching its argument, whatever `exec` means elsewhere. */
+const REGEX_EXEC = /\/[a-z]*\.exec\s*\(\s*$/;
 
 /** Calls that hand their argument to a shell or run it as a command. */
 const EXEC_CALL =
@@ -2631,15 +2718,23 @@ async function judgeCode(
   const { judgement, context } = scope;
   const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
   const code = source.slice(0, MAX_CODE_CHARS);
-  const { strings, complete } = scanCodeStrings(code);
+  const { strings, complete, masked } = scanCodeStrings(
+    code,
+    COMMENT_SYNTAX[head] ?? COMMENT_SYNTAX[SPEC_ALIASES[head] ?? head]
+  );
+  const own = ownFunctions(masked);
   // What was not read may hold anything.
   if (!complete || source.length > MAX_CODE_CHARS) signal(judgement, 'risk.opaque_shell');
   // A command that is put together at run time cannot be read off the code.
-  if (COMPUTED_EXEC.test(code)) signal(judgement, 'risk.opaque_shell');
+  if (COMPUTED_EXEC.test(masked)) signal(judgement, 'risk.opaque_shell');
 
   for (const [index, string] of strings.entries()) {
-    const before = code.slice(Math.max(0, string.start - CALL_LOOKBEHIND), string.start);
-    const call = EXEC_CALL.exec(before);
+    const before = masked.slice(Math.max(0, string.start - CALL_LOOKBEHIND), string.start);
+    const callee = bareCallee(before);
+    const call =
+      REGEX_EXEC.test(before) || (callee !== undefined && own.has(callee))
+        ? null
+        : EXEC_CALL.exec(before);
     const runs = call !== null || (string.quote === '`' && BACKTICK_RUNS.has(head));
     if (runs) {
       // An argv list: the strings that follow, separated by nothing but commas.
@@ -2648,7 +2743,7 @@ async function judgeCode(
       let script = string.text;
       if (call !== null && !/\s/.test(string.text)) {
         for (let next = index + 1; next < strings.length; next++) {
-          const between = code.slice(strings[next - 1]?.end, strings[next]?.start);
+          const between = masked.slice(strings[next - 1]?.end, strings[next]?.start);
           if (!/^\s*,\s*\[?\s*$/.test(between)) break;
           script += ` ${strings[next]?.text ?? ''}`;
         }
