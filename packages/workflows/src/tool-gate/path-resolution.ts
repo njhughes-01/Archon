@@ -7,7 +7,7 @@
  * the kernel walks it, following each symlink, until a segment is missing; what
  * remains cannot contain a symlink and is appended as written.
  */
-import { lstat, readlink } from 'node:fs/promises';
+import { lstatSync, readlinkSync } from 'node:fs';
 import { dirname, isAbsolute, join, parse, resolve, sep } from 'node:path';
 
 export type ResolvedPath =
@@ -72,13 +72,20 @@ type Entry = { kind: 'plain' } | { kind: 'link'; target: string } | { kind: 'err
  */
 export type PathEntryCache = Map<string, Entry>;
 
-async function readEntry(candidate: string, cache: PathEntryCache | undefined): Promise<Entry> {
+/**
+ * Reads one entry with the synchronous calls, on purpose. A call can name
+ * hundreds of paths and each is one `lstat` of a local directory entry: a few
+ * microseconds done in place, against tens of microseconds of scheduling each
+ * when handed to the thread pool, which is what made such a call slow. The
+ * number of entries one call may read is bounded by its caller.
+ */
+function readEntry(candidate: string, cache: PathEntryCache | undefined): Entry {
   const known = cache?.get(candidate);
   if (known !== undefined) return known;
   let entry: Entry;
   try {
-    entry = (await lstat(candidate)).isSymbolicLink()
-      ? { kind: 'link', target: await readlink(candidate) }
+    entry = lstatSync(candidate).isSymbolicLink()
+      ? { kind: 'link', target: readlinkSync(candidate) }
       : { kind: 'plain' };
   } catch (error) {
     entry = { kind: 'error', code: errorCode(error) };
@@ -109,7 +116,7 @@ export async function resolveRealPath(
     }
     const candidate = join(current, segment);
     if (PROCESS_RELATIVE.test(candidate)) return { ok: false, code: 'EPROCESS' };
-    const entry = await readEntry(candidate, cache);
+    const entry = readEntry(candidate, cache);
     if (entry.kind === 'error') {
       if (entry.code !== 'ENOENT') return { ok: false, code: entry.code };
       return { ok: true, path: resolve(candidate, ...pending), exists: false };

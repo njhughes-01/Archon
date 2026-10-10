@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+  MAX_WRAPPER_DEPTH,
   parseArgv,
   parseShell,
   renderWord,
@@ -460,10 +461,15 @@ describe('parseShell: arithmetic is one word, not a redirection', () => {
 });
 
 describe('parseShell: wrappers', () => {
-  test('any number of nested wrappers is stripped', () => {
-    const command = only(`${'nice '.repeat(40)}git status`);
+  test('a long chain of nested wrappers is stripped to the command behind it', () => {
+    const command = only(`${'nice '.repeat(20)}git status`);
     expect(command.head).toBe('git');
-    expect(command.wrappers).toHaveLength(40);
+    expect(command.wrappers).toHaveLength(20);
+  });
+
+  test('a chain longer than is peeled puts the script over its reading budget, never hides the command', () => {
+    expect(parseShell(`${'nice '.repeat(MAX_WRAPPER_DEPTH)}git status`).overBudget).toBe(false);
+    expect(parseShell(`${'nice '.repeat(MAX_WRAPPER_DEPTH + 1)}git status`).overBudget).toBe(true);
   });
 
   test('a value attached to a wrapper option or ending a cluster is consumed', () => {

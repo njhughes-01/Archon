@@ -203,6 +203,8 @@ export const MAX_SCRIPT_CHARS = 262_144;
 export const MAX_SCRIPT_ITEMS = 3_000;
 export const MAX_SCRIPT_COMMANDS = 400;
 export const MAX_GROUP_OPERATORS = 400;
+/** Wrappers in front of one command (`sudo env nice timeout …`). Real chains are two or three long. */
+export const MAX_WRAPPER_DEPTH = 24;
 /** An arithmetic command longer than this is read as subshells, which only costs it a signal. */
 const MAX_ARITHMETIC_CHARS = 4_096;
 
@@ -1105,6 +1107,8 @@ interface Normalised {
   scripts: string[];
   /** Commands this one runs given as words: what follows `find -exec`. */
   wordCommands: WordItem[][];
+  /** More wrappers stood in front of the command than are peeled: it was not reached. */
+  tooDeep: boolean;
 }
 
 function normalise(words: WordItem[], redirections: ShellRedirection[]): Normalised | undefined {
@@ -1141,13 +1145,20 @@ function normalise(words: WordItem[], redirections: ShellRedirection[]): Normali
     }
     return cached;
   };
-  // No cap on depth: every pass removes at least the wrapper's own word, so this
-  // ends, and a cap would be a place to hide a command behind.
+  // Each wrapper peeled looks at every word after it, so a long chain costs the
+  // square of its length. Past the cap the command is not reached, which the
+  // caller counts as over the reading budget: a cap that only stopped here would
+  // be a place to hide a command behind.
+  let tooDeep = false;
   for (;;) {
     const name = rest[0] === undefined ? undefined : literalText(rest[0].word);
     const wrapper = name === undefined ? undefined : baseName(name);
     const spec = wrapper === undefined ? undefined : WRAPPERS[wrapper];
     if (wrapper === undefined || spec === undefined) break;
+    if (wrappers.length >= MAX_WRAPPER_DEPTH) {
+      tooDeep = true;
+      break;
+    }
     const following = rest.slice(1).map(itemWord);
     if (spec.lookup?.includes(following[0]?.text ?? '')) break;
 
@@ -1259,6 +1270,7 @@ function normalise(words: WordItem[], redirections: ShellRedirection[]): Normali
     },
     scripts,
     wordCommands,
+    tooDeep,
   };
 }
 
@@ -1337,6 +1349,7 @@ function addCommand(
     if (brace?.bare && literalText(brace.word) === '{') headWords = headWords.slice(1);
   }
   const normalised = normalise(headWords, redirections);
+  if (normalised?.tooDeep === true) state.overBudget = true;
   let index = place.owner;
   if (normalised !== undefined) {
     index = state.commands.length;
@@ -1397,7 +1410,8 @@ function parseInto(
 ): void {
   if (state.overBudget) return;
   const { items, unterminated, overBudget } = scan(text);
-  state.items += items.length;
+  // Every script read costs one item of its own, so a run of empty ones is not free.
+  state.items += items.length + 1;
   if (overBudget || state.items > MAX_SCRIPT_ITEMS) {
     state.overBudget = true;
     return;

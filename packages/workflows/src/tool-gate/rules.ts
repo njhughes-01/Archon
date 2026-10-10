@@ -663,6 +663,8 @@ interface Judgement {
   pushRelied: 'lease' | 'plain' | undefined;
   /** Variables the call sets for the commands after it: exported, or assigned on a line of their own. */
   environment: Set<string>;
+  /** Whether the call named more paths than were placed: set by `evaluateRules`. */
+  exhausted: () => boolean;
 }
 
 function newJudgement(): Judgement {
@@ -680,6 +682,7 @@ function newJudgement(): Judgement {
     gitRelocated: false,
     pushRelied: undefined,
     environment: new Set(),
+    exhausted: () => false,
   };
 }
 
@@ -764,7 +767,16 @@ interface Evaluation {
   links: Map<string, string | undefined>;
   /** A command made a link whose own name could not be read: no relative path can be trusted. */
   unplaceable: boolean;
+  /** More paths were named than one call is placed for: see `MAX_PLACED_PATHS`. */
+  exhausted: boolean;
 }
+
+/**
+ * How many different paths one call has placed on the filesystem before the
+ * rest are left unread. Each costs a look at the disk; past this the call is
+ * denied as too large, since a path nobody placed may be anywhere.
+ */
+const MAX_PLACED_PATHS = 800;
 
 /** Keyed by the context object `evaluateRules` makes for one call, so it ends with the call. */
 const EVALUATIONS = new WeakMap<RuleContext, Evaluation>();
@@ -799,6 +811,10 @@ async function locate(text: string, cwd: string | undefined, context: RuleContex
   const key = `${cwd ?? ''}\0${text}`;
   let found = evaluation?.located.get(key);
   if (found === undefined) {
+    if (evaluation !== undefined && evaluation.located.size >= MAX_PLACED_PATHS) {
+      evaluation.exhausted = true;
+      return { kind: 'unknown' };
+    }
     found = place(text, cwd, context, evaluation);
     evaluation?.located.set(key, found);
   }
@@ -3337,6 +3353,7 @@ function denied(ruleId: DenyRuleId): RuleOutcome {
 
 function conclude(judgement: Judgement, allowRule: AllowRuleId, cwdInside: boolean): RuleOutcome {
   if (judgement.deny !== undefined) return denied(judgement.deny);
+  if (judgement.exhausted()) return denied('deny.command_too_large');
   const signals = RISK_RULE_IDS.filter(ruleId => judgement.signals.has(ruleId));
   const [strongest] = signals;
   if (strongest === undefined) return { outcome: 'allow', ruleId: allowRule };
@@ -3407,8 +3424,10 @@ export async function evaluateRules(
     entries: new Map(),
     links: new Map(),
     unplaceable: false,
+    exhausted: false,
   });
   const judgement = newJudgement();
+  judgement.exhausted = (): boolean => EVALUATIONS.get(context)?.exhausted === true;
   const input: Record<string, unknown> =
     typeof request.input === 'object' && request.input !== null ? request.input : {};
   const paths = [
