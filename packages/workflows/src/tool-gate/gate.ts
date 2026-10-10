@@ -8,11 +8,16 @@
  *
  * The classifier can add a denial and never remove one. A rule's deny is
  * returned without asking it, and its confidence is recorded but not used.
+ *
+ * One gate is one attempt of a step: it holds that attempt's denial count and
+ * whether its shell may have left the root. A caller builds a new gate for a
+ * retry or a loop iteration and shares only the classifier cache between them.
  */
 import { createHash } from 'node:crypto';
 import { realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { createLogger } from '@archon/paths';
 import type {
   AgentRequestOptions,
   ToolActionDecision,
@@ -42,6 +47,13 @@ import {
 
 export type ToolGate = NonNullable<AgentRequestOptions['toolGate']>;
 
+/** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  if (!cachedLog) cachedLog = createLogger('workflow.tool-gate');
+  return cachedLog;
+}
+
 /**
  * The classifier's score scale, low to high. The score is a 0-based,
  * probability-weighted mean over these levels, so it can be fractional.
@@ -69,9 +81,11 @@ export const NOUL_THRESHOLD_BOUNDS = { min: 0, max: 1 } as const;
 /** Deny at or above this likelihood that the call modifies production or external state. */
 export const DEFAULT_NOUL_THRESHOLD = (NOUL_THRESHOLD_BOUNDS.min + NOUL_THRESHOLD_BOUNDS.max) / 2;
 
-/** Denials one node may collect before every further denial tells the agent to stop. */
+/** Denials one attempt of a node may collect before every further denial tells the agent to stop. */
 export const DEFAULT_MAX_DENIALS_PER_NODE = 3;
 export const REPEATED_DENIALS_RULE_ID = 'guard.repeated_denials';
+/** Names the denial of a call whose decision the audit sink did not take. It is in no record. */
+export const UNRECORDED_DECISION_RULE_ID = 'guard.unrecorded_decision';
 
 /** What the classifier is asked about: redacted, truncated, and nothing else. */
 export interface ToolGateEscalationRequest {
@@ -179,9 +193,10 @@ export interface ToolGateOptions {
   escalate: ToolGateEscalator;
   /**
    * Receives exactly one event per decision. It may return a promise, which the
-   * gate waits for before it answers the call. A throw or a rejection fails the
-   * call: the gate's promise rejects, which every provider treats as a denial.
-   * A decision that could not be recorded is never handed out as an allow.
+   * gate waits for before it answers the call. A throw or a rejection denies
+   * the call: a decision that could not be recorded is never handed out as an
+   * allow. The agent is told only that; the failure is logged here, once, by
+   * the name of the error, and the sink is not asked again for that decision.
    * Typed `unknown` so a sink may return whatever its last statement returns;
    * only a promise is looked at.
    */
@@ -195,6 +210,7 @@ export interface ToolGateOptions {
   /** What `~` and `$HOME` stand for. Default: the engine's own home directory. */
   homeDir?: string;
   thresholds?: { score?: number; noul?: number };
+  /** Denials this gate hands out before each further one tells the agent to stop. */
   maxDenialsPerNode?: number;
   /**
    * One sentence added to what the agent is told when a call is denied for
@@ -222,6 +238,19 @@ const NO_ANSWER_DENIAL =
   'This call carries a risk signal and the action classifier gave no usable answer, so it needs human approval.';
 /** Recorded when the escalator hands back something that is not a result at all. */
 const MALFORMED_ESCALATION = 'malformed_escalation';
+/** The whole of what the agent is told. What the sink threw is named in the log and nowhere else. */
+const UNRECORDED_DENIAL =
+  'The decision for this call could not be recorded, and a call with no audit record may not run.';
+const UNRECORDED_ALTERNATIVES: readonly string[] = [
+  'Report the work as blocked in your output and say that the tool gate could not record its decisions.',
+];
+
+type Denied = Extract<ToolActionDecision, { action: 'deny' }>;
+interface Refusal {
+  needsApproval: boolean;
+  reason: string;
+  alternatives: readonly string[];
+}
 
 /** Every kind the contract names. A request with any other value cannot be judged. */
 const TOOL_ACTION_KINDS = {
@@ -234,6 +263,77 @@ const TOOL_ACTION_KINDS = {
 
 function isToolActionKind(kind: unknown): kind is ToolActionKind {
   return typeof kind === 'string' && Object.hasOwn(TOOL_ACTION_KINDS, kind);
+}
+
+type FieldCheck = (value: unknown) => boolean;
+const isText: FieldCheck = value => typeof value === 'string';
+const isOptionalText: FieldCheck = value => value === undefined || isText(value);
+const isOptionalTextList: FieldCheck = value =>
+  value === undefined || (Array.isArray(value) && value.every(isText));
+const isRecord: FieldCheck = value =>
+  typeof value === 'object' && value !== null && !Array.isArray(value);
+
+/**
+ * How each field the gate reads has to arrive. The request type promises this
+ * shape, but a request is built by a provider from what a model and an SDK sent,
+ * and nothing checks it at runtime before here. `kind` is checked on its own,
+ * since a request that is sound apart from its kind can still be described.
+ * The gate never reads the two fields left out.
+ */
+const REQUEST_SHAPE = {
+  toolName: isText,
+  cwd: isText,
+  command: isOptionalText,
+  paths: isOptionalTextList,
+  url: isOptionalText,
+  input: isRecord,
+  parsedCommands: isOptionalTextList,
+} as const satisfies Record<
+  Exclude<keyof ToolActionRequest, 'kind' | 'toolCallId' | 'fromSubagent'>,
+  FieldCheck
+>;
+
+/** Names a call in its record when the request does not say which tool it is. */
+const UNNAMED_TOOL = 'unknown';
+
+/** All that is kept of a request that did not arrive in the contract's shape. */
+interface UnreadableRequest {
+  /** The tool's name when the request has one, redacted and capped. */
+  tool: string;
+  /** Stands in for the hash of the raw request, which may not be serialisable. */
+  commandHash: string;
+}
+
+function typeName(value: unknown): string {
+  if (value === null) return 'null';
+  return Array.isArray(value) ? 'array' : typeof value;
+}
+
+/**
+ * `undefined` for a request in the contract's shape. Otherwise what its record
+ * may hold: the tool's name, and a hash over that name and the type of each
+ * field, so the same malformed call from one tool hashes the same. No field's
+ * value is read beyond its type, and nothing here can throw: a request whose
+ * properties cannot even be read is the unnamed one.
+ */
+function unreadableRequest(
+  request: unknown,
+  redaction: RedactOptions
+): UnreadableRequest | undefined {
+  let tool = UNNAMED_TOOL;
+  let shape: string = typeName(request);
+  try {
+    if (typeof request === 'object' && request !== null) {
+      const fields = request as Record<string, unknown>;
+      const checks = Object.entries(REQUEST_SHAPE);
+      if (checks.every(([name, fits]) => fits(fields[name]))) return undefined;
+      if (typeof fields.toolName === 'string') tool = redactText(fields.toolName, redaction);
+      shape = checks.map(([name]) => `${name}:${typeName(fields[name])}`).join(',');
+    }
+  } catch {
+    tool = UNNAMED_TOOL;
+  }
+  return { tool, commandHash: sha256(JSON.stringify(['unreadable request', tool, shape])) };
 }
 
 /**
@@ -376,9 +476,9 @@ function realPaths(name: string, paths: readonly string[] | undefined): string[]
 }
 
 /**
- * Builds the gate for one node. Throws on a configuration the gate could not
- * honour, so a bad threshold or root fails at dispatch instead of at the first
- * tool call.
+ * Builds the gate for one attempt of one node. Throws on a configuration the
+ * gate could not honour, so a bad threshold or root fails at dispatch instead
+ * of at the first tool call.
  */
 export function createToolGate(options: ToolGateOptions): ToolGate {
   if (!isAbsolute(options.repoRoot)) {
@@ -427,6 +527,41 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
   const cache = options.cache ?? createToolGateCache();
   const now = options.now ?? ((): number => performance.now());
   let denials = 0;
+  // Set once a shell call that left the root was allowed. A provider whose
+  // shell keeps its working directory between calls may be standing there from
+  // then on, while each request still reports the directory the step started
+  // in, so the rules are told not to place relative paths by it. This is
+  // conservative for a provider whose shell starts afresh on every call, and it
+  // is the only handling there is: the gate reads each call's text and cannot
+  // observe where a persistent shell stands. It lasts as long as this gate.
+  let cwdUntrusted = false;
+
+  /** Counts a denial and words it, or tells the agent to stop once there were too many. */
+  const refuse = (refusal: Refusal, ruleId: string): Denied => {
+    denials++;
+    if (denials > maxDenials) {
+      // The loop guard: the agent kept asking after being told no.
+      return {
+        action: 'deny',
+        needsApproval: refusal.needsApproval,
+        reason:
+          `Stop calling tools that get denied: ${String(maxDenials)} calls were already ` +
+          `denied in this step, the latest by ${ruleId}. Report the work as blocked in ` +
+          'your output and end the step.',
+        alternatives: [
+          'End the step now and list the denied actions in your output so a human can decide.',
+        ],
+        ruleId: REPEATED_DENIALS_RULE_ID,
+      };
+    }
+    return {
+      action: 'deny',
+      needsApproval: refusal.needsApproval,
+      reason: `${refusal.reason} ${DENIAL_GUIDANCE}`,
+      alternatives: [...refusal.alternatives],
+      ruleId,
+    };
+  };
 
   /** An escalator that fails by throwing is the same as one that reports a failure. */
   const ask = async (request: ToolGateEscalationRequest): Promise<ToolGateEscalationResult> => {
@@ -454,88 +589,85 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
 
   const decide = async (
     request: ToolActionRequest,
+    unreadable: UnreadableRequest | undefined,
     commandHash: string,
     batch: Batch
   ): Promise<ToolActionDecision> => {
     const started = now();
-    const redactedPreview = previewOf(request, forPreview);
-    const knownKind = isToolActionKind(request.kind);
+    const tool = unreadable === undefined ? request.toolName : unreadable.tool;
+    const knownKind = unreadable === undefined && isToolActionKind(request.kind);
+    const redactedPreview =
+      unreadable === undefined
+        ? previewOf(request, forPreview)
+        : redactText(`${unreadable.tool} [unreadable request]`, forPreview);
 
     const finish = async (
-      verdict:
-        | { action: 'allow' }
-        | {
-            action: 'deny';
-            needsApproval: boolean;
-            reason: string;
-            alternatives: readonly string[];
-          },
+      verdict: { action: 'allow' } | ({ action: 'deny' } & Refusal),
       source: ToolGateDecisionSource,
       ruleId: AllowRuleId | DenyRuleId | RiskRuleId,
       answer?: ToolGateClassifierAnswer,
       classifierFailure?: string
     ): Promise<ToolActionDecision> => {
       let decision: ToolActionDecision;
-      let recordedRule: ToolGateDecisionEvent['ruleId'] = ruleId;
       if (verdict.action === 'allow') {
         decision = verdict;
       } else {
-        denials++;
-        if (denials > maxDenials) {
-          // The loop guard: the agent kept asking after being told no.
-          recordedRule = REPEATED_DENIALS_RULE_ID;
-          decision = {
-            action: 'deny',
-            needsApproval: verdict.needsApproval,
-            reason:
-              `Stop calling tools that get denied: ${String(maxDenials)} calls were already ` +
-              `denied in this step, the latest by ${ruleId}. Report the work as blocked in ` +
-              'your output and end the step.',
-            alternatives: [
-              'End the step now and list the denied actions in your output so a human can decide.',
-            ],
-            ruleId: REPEATED_DENIALS_RULE_ID,
-          };
-        } else {
-          const advised =
-            options.outsideRootAdvice !== undefined &&
-            (ruleId === 'deny.path_outside_root' || verdict.needsApproval);
-          const advice = advised ? ` ${String(options.outsideRootAdvice)}` : '';
-          decision = {
-            action: 'deny',
-            needsApproval: verdict.needsApproval,
-            reason: `${verdict.reason}${advice} ${DENIAL_GUIDANCE}`,
-            alternatives: [...verdict.alternatives],
-            ruleId,
-          };
-        }
+        const advised =
+          options.outsideRootAdvice !== undefined &&
+          (ruleId === 'deny.path_outside_root' || verdict.needsApproval);
+        const advice = advised ? ` ${String(options.outsideRootAdvice)}` : '';
+        decision = refuse({ ...verdict, reason: `${verdict.reason}${advice}` }, ruleId);
       }
+      const stopped = decision.action === 'deny' && decision.ruleId === REPEATED_DENIALS_RULE_ID;
       close(commandHash, batch);
-      await options.record({
-        tool: request.toolName,
-        // The record's vocabulary is the contract's: a value outside it is not copied in.
-        kind: knownKind ? request.kind : 'other',
-        decision: decision.action,
-        needsApproval: decision.action === 'deny' && decision.needsApproval,
-        source,
-        ruleId: recordedRule,
-        ...(answer !== undefined && {
-          score: answer.score,
-          noul: answer.noul,
-          confidence: answer.confidence,
-        }),
-        ...(classifierFailure !== undefined && { classifierFailure }),
-        count: batch.callers,
-        latencyMs: now() - started,
-        commandHash,
-        redactedPreview,
-      });
+      try {
+        await options.record({
+          tool,
+          // The record's vocabulary is the contract's: a value outside it is not copied in.
+          kind: knownKind ? request.kind : 'other',
+          decision: decision.action,
+          needsApproval: decision.action === 'deny' && decision.needsApproval,
+          source,
+          ruleId: stopped ? REPEATED_DENIALS_RULE_ID : ruleId,
+          ...(answer !== undefined && {
+            score: answer.score,
+            noul: answer.noul,
+            confidence: answer.confidence,
+          }),
+          ...(classifierFailure !== undefined && { classifierFailure }),
+          count: batch.callers,
+          latencyMs: now() - started,
+          commandHash,
+          redactedPreview,
+        });
+      } catch (error) {
+        // The error's message and stack may quote the row that was not written,
+        // and the event holds the preview: neither is logged. The hash is the
+        // one any other record of the same call carries.
+        getLog().error(
+          {
+            errorName: error instanceof Error ? error.name : typeof error,
+            decision: decision.action,
+            ruleId,
+            commandHash,
+          },
+          'tool_gate.decision_record_failed'
+        );
+        // A denial stays the denial it was, already counted. An allow that
+        // nobody can audit is not handed out: it needs a human instead.
+        if (decision.action === 'deny') return decision;
+        return refuse(
+          { needsApproval: true, reason: UNRECORDED_DENIAL, alternatives: UNRECORDED_ALTERNATIVES },
+          UNRECORDED_DECISION_RULE_ID
+        );
+      }
       return decision;
     };
 
     if (!knownKind) {
-      // The rules switch on the kind. A value they do not know must not fall
-      // through them unjudged, whatever the rest of the request says.
+      // The rules read these fields and switch on the kind. A request that is
+      // not in that shape, or a kind they do not know, must not fall through
+      // them unjudged, whatever the rest of it says.
       const rule = DENY_RULES['deny.unreadable_request'];
       return finish(
         {
@@ -549,7 +681,10 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
       );
     }
 
-    const outcome = await evaluateRules(request, context);
+    const isShell = request.kind === 'shell';
+    const outcome = await evaluateRules(request, context, {
+      cwdUntrusted: isShell && cwdUntrusted,
+    });
     if (outcome.outcome === 'allow') return finish({ action: 'allow' }, 'rule', outcome.ruleId);
     if (outcome.outcome === 'deny') {
       // A fixed rule refused it: no approval path in this version, so not "needs approval".
@@ -561,11 +696,21 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
       );
     }
 
+    // Whoever lets the call through, it then runs: see `cwdUntrusted`. An allow
+    // that could not be recorded was turned into a denial and changes nothing.
+    const leavesRoot = isShell && outcome.signals.includes('risk.cwd_outside_root');
+    const allow = async (
+      source: ToolGateDecisionSource,
+      answer?: ToolGateClassifierAnswer
+    ): Promise<ToolActionDecision> => {
+      const decision = await finish({ action: 'allow' }, source, outcome.ruleId, answer);
+      if (leavesRoot && decision.action === 'allow') cwdUntrusted = true;
+      return decision;
+    };
+
     // Escalation band. With no classifier configured the rules are the whole
     // gate: the call goes ahead and the record says no one judged it.
-    if (!options.classifierConfigured) {
-      return finish({ action: 'allow' }, 'fallback', outcome.ruleId);
-    }
+    if (!options.classifierConfigured) return allow('fallback');
 
     const escalation: ToolGateEscalationRequest = {
       tool: request.toolName,
@@ -618,11 +763,14 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
         answer
       );
     }
-    return finish({ action: 'allow' }, 'jev', outcome.ruleId, answer);
+    return allow('jev', answer);
   };
 
   return async (request: ToolActionRequest): Promise<ToolActionDecision> => {
-    const commandHash = hashRequest(request);
+    // Before anything reads the request: hashing or previewing one that is not
+    // in the contract's shape would throw, and the call would leave no record.
+    const unreadable = unreadableRequest(request, forPreview);
+    const commandHash = unreadable === undefined ? hashRequest(request) : unreadable.commandHash;
     const running = inFlight.get(commandHash);
     if (running?.decision !== undefined) {
       running.callers++;
@@ -631,7 +779,7 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
     const batch: Batch = { callers: 1, decision: undefined };
     // Registered before the judgement starts, which may reach its record at once.
     inFlight.set(commandHash, batch);
-    batch.decision = decide(request, commandHash, batch).finally(() => {
+    batch.decision = decide(request, unreadable, commandHash, batch).finally(() => {
       close(commandHash, batch);
     });
     return batch.decision;

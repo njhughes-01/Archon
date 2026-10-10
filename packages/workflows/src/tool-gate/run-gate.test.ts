@@ -7,12 +7,12 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { trackTempRoots } from '@archon/paths/test-utils';
+import { captureLogLines, trackTempRoots } from '@archon/paths/test-utils';
 import type { ToolActionRequest } from '@archon/providers/types';
 import type { Fetch } from '../jev/jev-client';
-import type { ObservabilityEventInput } from '../store';
+import type { WorkflowEventInput } from '../store';
 import type { ToolGateConfig } from './config';
-import type { ToolGateDecisionEvent } from './gate';
+import { UNRECORDED_DECISION_RULE_ID, type ToolGateDecisionEvent } from './gate';
 import {
   assertProviderHonoursToolGate,
   createRunToolGate,
@@ -63,7 +63,9 @@ function harness(overrides: Partial<RunToolGateInput> = {}): Harness {
       env: {},
       repoRoot: root,
       credentialValues: [],
-      record: (event, step) => records.push({ event, step }),
+      record: (event, step) => {
+        records.push({ event, step });
+      },
       ...overrides,
     },
   };
@@ -218,6 +220,51 @@ describe('per step and per run', () => {
     expect(h.records.at(-1)?.event.ruleId).toBe('guard.repeated_denials');
     await run?.forStep('b')(shell('git reset --hard', h.root));
     expect(h.records.at(-1)?.event.ruleId).toBe('deny.git_reset_hard');
+  });
+
+  // The call the executor makes for each loop iteration and each retry attempt:
+  // `forStep` again, with the same step name.
+  test('asking for the same step again starts a new attempt: a fresh denial count on the same classifier answers', async () => {
+    const { fetch, calls } = jevFetch(3, 1);
+    const h = harness({ fetch, env: { JEV_API_KEY: 'k' } });
+    const run = createRunToolGate(h.input);
+    const firstAttempt = run?.forStep('iterate');
+    await firstAttempt?.(shell(ESCALATED, h.root));
+    for (let i = 0; i < 6; i++) await firstAttempt?.(shell('git reset --hard', h.root));
+    expect(h.records.at(-1)?.event.ruleId).toBe('guard.repeated_denials');
+
+    const nextAttempt = run?.forStep('iterate');
+    await nextAttempt?.(shell('git reset --hard', h.root));
+    expect(h.records.at(-1)).toMatchObject({
+      step: 'iterate',
+      event: { ruleId: 'deny.git_reset_hard' },
+    });
+    await nextAttempt?.(shell(ESCALATED, h.root));
+    expect(h.records.at(-1)?.event).toMatchObject({ decision: 'deny', source: 'jev' });
+    expect(calls()).toBe(1);
+  });
+
+  test('a sink that returns a promise is waited for, and one that rejects denies the call', async () => {
+    const order: string[] = [];
+    let fail = false;
+    const h = harness({
+      record: async () => {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        if (fail) throw new Error('db down');
+        order.push('recorded');
+      },
+    });
+    const gate = createRunToolGate(h.input)?.forStep('a');
+    expect(await gate?.(shell('git status', h.root))).toEqual({ action: 'allow' });
+    order.push('answered');
+    expect(order).toEqual(['recorded', 'answered']);
+
+    fail = true;
+    expect(await gate?.(shell('git status', h.root))).toMatchObject({
+      action: 'deny',
+      needsApproval: true,
+      ruleId: UNRECORDED_DECISION_RULE_ID,
+    });
   });
 });
 
@@ -439,18 +486,18 @@ describe('workflowToolGateRecorder', () => {
     redactedPreview: 'gh pr merge 5',
   };
 
-  test('writes one tool_gate_decision event carrying exactly the decision fields', () => {
-    const written: ObservabilityEventInput[] = [];
+  test('writes one tool_gate_decision event carrying exactly the decision fields', async () => {
+    const written: WorkflowEventInput[] = [];
     const record = workflowToolGateRecorder(
       {
-        createWorkflowEvent: event => {
+        persistWorkflowEvent: event => {
           written.push(event);
           return Promise.resolve();
         },
       },
       'run-1'
     );
-    record(EVENT, 'group.implement');
+    await record(EVENT, 'group.implement');
     expect(written).toEqual([
       {
         workflow_run_id: 'run-1',
@@ -461,20 +508,67 @@ describe('workflowToolGateRecorder', () => {
     ]);
   });
 
-  test('a store that cannot write does not fail the tool call', async () => {
+  test('the write is waited for: the sink settles when the store has taken the event', async () => {
+    let stored = false;
     const record = workflowToolGateRecorder(
-      { createWorkflowEvent: () => Promise.reject(new Error('db down')) },
+      {
+        persistWorkflowEvent: async () => {
+          await new Promise(resolve => setTimeout(resolve, 10));
+          stored = true;
+        },
+      },
       'run-1'
     );
-    expect(() => {
-      record(EVENT, 'implement');
-    }).not.toThrow();
-    // Let the rejection settle: an unhandled one would fail the test run.
-    await new Promise(resolve => setTimeout(resolve, 5));
+    await record(EVENT, 'implement');
+    expect(stored).toBe(true);
+  });
+
+  test('a store that cannot write fails the sink, so the gate can refuse the call', async () => {
+    const record = workflowToolGateRecorder(
+      { persistWorkflowEvent: () => Promise.reject(new Error('db down')) },
+      'run-1'
+    );
+    await expect(Promise.resolve(record(EVENT, 'implement'))).rejects.toThrow('db down');
+  });
+
+  test('in a run, a decision the store could not take is a denial, logged once without the error text', async () => {
+    const root = makeRoot();
+    const run = createRunToolGate({
+      config: ON,
+      env: {},
+      repoRoot: root,
+      credentialValues: [],
+      record: workflowToolGateRecorder(
+        { persistWorkflowEvent: () => Promise.reject(new TypeError('db down: planted-row-text')) },
+        'run-3'
+      ),
+    });
+    const logs = captureLogLines();
+    try {
+      const decision = await run?.forStep('implement')(shell('git status', root));
+      expect(decision).toMatchObject({
+        action: 'deny',
+        needsApproval: true,
+        ruleId: UNRECORDED_DECISION_RULE_ID,
+      });
+      expect(JSON.stringify(decision)).not.toContain('db down');
+      // Let anything fired and forgotten settle: a second log line would come from there.
+      await new Promise(resolve => setTimeout(resolve, 10));
+      const failures = logs.lines.filter(line => line.level === 50);
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({
+        msg: 'tool_gate.decision_record_failed',
+        errorName: 'TypeError',
+      });
+      expect(JSON.stringify(logs.lines)).not.toContain('planted-row-text');
+      expect(JSON.stringify(logs.lines)).not.toContain('git status');
+    } finally {
+      logs.restore();
+    }
   });
 
   test('what a real gate records holds no raw command text beyond the redacted preview', async () => {
-    const written: ObservabilityEventInput[] = [];
+    const written: WorkflowEventInput[] = [];
     const root = makeRoot();
     const run = createRunToolGate({
       config: ON,
@@ -483,7 +577,7 @@ describe('workflowToolGateRecorder', () => {
       credentialValues: [],
       record: workflowToolGateRecorder(
         {
-          createWorkflowEvent: event => {
+          persistWorkflowEvent: event => {
             written.push(event);
             return Promise.resolve();
           },

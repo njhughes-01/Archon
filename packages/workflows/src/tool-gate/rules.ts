@@ -33,9 +33,10 @@ import {
   targetHost,
   type EscalationFacts,
 } from './escalation-facts';
-import { isInside, resolveRealPath } from './path-resolution';
+import { isInside, resolveRealPath, type PathEntryCache } from './path-resolution';
 import { isSecretPath } from './secret-paths';
 import {
+  CODE_INTERPRETERS,
   parseArgv,
   parseShell,
   resolveWord,
@@ -155,6 +156,14 @@ export const DENY_RULES = {
       'Check that the file or a variable exists (test -f, ls) without opening it.',
     ],
   },
+  'deny.command_too_large': {
+    reason:
+      'The command is too large or too deeply nested for the gate to read within its time budget, so it was not judged.',
+    alternatives: [
+      'Split it into smaller commands.',
+      'Write long content with the file-writing tool, or pass it as a heredoc to a command that only stores it.',
+    ],
+  },
   'deny.unreadable_request': {
     reason:
       'The tool call reached the gate without the command text, write target, known kind or absolute working directory needed to judge it.',
@@ -170,6 +179,7 @@ export const RISK_RULE_IDS = [
   'risk.network_request',
   'risk.kind_network',
   'risk.kind_mcp',
+  'risk.kind_other',
   'risk.environment_dump',
   'risk.secret_path_argument',
   'risk.cwd_outside_root',
@@ -218,6 +228,12 @@ export interface RuleContext {
   extraWriteRoots?: readonly string[];
   /** Real paths no call may write, move or remove, inside a write root or not. */
   protectedPaths?: readonly string[];
+  /**
+   * Variables whose values the engine knows because it exports them to the
+   * step itself (`ARTIFACTS_DIR` and the other run directories). `$NAME` and
+   * `${NAME}` of one of these are read as the value, like `$HOME`.
+   */
+  variables?: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ['main', 'master'];
@@ -336,13 +352,11 @@ const COMMON_OUTPUT_FLAGS: readonly string[] = [
 ];
 
 /** Programs that run code given on their command line or stdin. */
-const INTERPRETERS: ReadonlySet<string> = new Set([
-  ...['python', 'python2', 'python3', 'perl', 'ruby', 'node', 'nodejs', 'php', 'deno', 'bun'],
-  ...['pwsh', 'powershell', 'tclsh', 'wish', 'lua', 'luajit', 'Rscript', 'osascript'],
-]);
+const INTERPRETERS = CODE_INTERPRETERS;
 /** Options that carry the program, so it is not read from stdin. */
 const CODE_FLAGS: readonly string[] = [
   ...['-c', '-e', '-E', '-p', '-r', '-m', '--eval', '--print', '--command', '-Command', '-File'],
+  ...['-command', '-file'],
 ];
 const STDIN_PATHS: ReadonlySet<string> = new Set([
   ...['-', '/dev/stdin', '/dev/fd/0', '/proc/self/fd/0'],
@@ -532,6 +546,18 @@ interface Judgement {
   facts: EscalationFacts;
   /** Commands whose own mutation verb is already settled: removing build output is not a risk. */
   settled: Set<ShellCommand>;
+  /** The directory the request reports cannot be trusted: see `RuleOptions.cwdUntrusted`. */
+  cwdUntrusted: boolean;
+  /**
+   * Where an earlier command of this call left a checkout, by its top
+   * directory: the branch it switched to, or `null` when that cannot be read.
+   * The `HEAD` file still names the branch that was out before the call.
+   */
+  branches: Map<string, string | null>;
+  /** A command moved a checkout this gate could not identify, or set where git looks for one. */
+  gitRelocated: boolean;
+  /** A push in this call was judged by the branch that was checked out: with the lease flag, or plain. */
+  pushRelied: 'lease' | 'plain' | undefined;
 }
 
 function newJudgement(): Judgement {
@@ -544,6 +570,10 @@ function newJudgement(): Judgement {
     unplaced: false,
     facts: {},
     settled: new Set(),
+    cwdUntrusted: false,
+    branches: new Map(),
+    gitRelocated: false,
+    pushRelied: undefined,
   };
 }
 
@@ -572,8 +602,17 @@ interface Arg extends ResolvedWord {
 
 type Options = ParsedOptions<Arg>;
 
+/** `$(mktemp)`, `$(mktemp -d)`: a new path in the temporary directory, wherever that is. */
+const MKTEMP = /^\$\(\s*mktemp(\s+-[A-Za-z]+)*\s*\)$/;
+
 function toArg(word: ShellWord, context: RuleContext): Arg {
-  return { ...resolveWord(word, context.homeDir), nested: word.nested };
+  const resolved = resolveWord(word, context.homeDir, context.variables);
+  if (resolved.dynamic && MKTEMP.test(resolved.text)) {
+    // The name is random but the directory is not, and the directory is what is judged.
+    const directory = context.variables?.TMPDIR ?? '/tmp';
+    return { text: join(directory, 'mktemp'), dynamic: false, glob: false, nested: [] };
+  }
+  return { ...resolved, nested: word.nested };
 }
 
 function plainPath(text: string): Arg {
@@ -603,16 +642,55 @@ type Where =
   | { kind: 'unknown' }
   | { kind: 'failed' };
 
+/**
+ * What one evaluation has learned about the filesystem. A command can name
+ * thousands of paths in a handful of directories, and each is asked about by
+ * several rules: without this every question walks the path again.
+ */
+interface Evaluation {
+  located: Map<string, Promise<Where>>;
+  entries: PathEntryCache;
+  /**
+   * Symlinks an earlier command of the same call creates: real path of the
+   * link to where it will point (`undefined` when that cannot be read). They do
+   * not exist yet when a later command's target is resolved, so the filesystem
+   * cannot answer for them.
+   */
+  links: Map<string, string | undefined>;
+}
+
+/** Keyed by the context object `evaluateRules` makes for one call, so it ends with the call. */
+const EVALUATIONS = new WeakMap<RuleContext, Evaluation>();
+
+async function place(
+  text: string,
+  cwd: string | undefined,
+  context: RuleContext,
+  evaluation: Evaluation | undefined
+): Promise<Where> {
+  const resolved = await resolveRealPath(text, cwd ?? context.repoRoot, evaluation?.entries);
+  if (!resolved.ok) return { kind: 'failed' };
+  let real = resolved.path;
+  let { exists } = resolved;
+  for (const [link, target] of evaluation?.links ?? []) {
+    if (real !== link && !real.startsWith(`${link}/`)) continue;
+    if (target === undefined) return { kind: 'unknown' };
+    real = `${target}${real.slice(link.length)}`;
+    exists = false;
+  }
+  return { kind: 'resolved', real, exists, inside: isInside(context.repoRoot, real) };
+}
+
 async function locate(text: string, cwd: string | undefined, context: RuleContext): Promise<Where> {
   if (!isAbsolute(text) && cwd === undefined) return { kind: 'unknown' };
-  const resolved = await resolveRealPath(text, cwd ?? context.repoRoot);
-  if (!resolved.ok) return { kind: 'failed' };
-  return {
-    kind: 'resolved',
-    real: resolved.path,
-    exists: resolved.exists,
-    inside: isInside(context.repoRoot, resolved.path),
-  };
+  const evaluation = EVALUATIONS.get(context);
+  const key = `${cwd ?? ''}\0${text}`;
+  let found = evaluation?.located.get(key);
+  if (found === undefined) {
+    found = place(text, cwd, context, evaluation);
+    evaluation?.located.set(key, found);
+  }
+  return found;
 }
 
 /** The write root `path` lies in: the repository first, then an extra root. */
@@ -674,6 +752,9 @@ async function judgeWriteTarget(
   }
   const where = await locate(text, scope.cwd, context);
   if (where.kind === 'unknown') {
+    // After a step's shell has stood outside the roots, an unplaced write is
+    // not a question for a classifier: nobody can say where it lands.
+    if (judgement.cwdUntrusted) deny(judgement, 'deny.path_unresolvable');
     signal(judgement, 'risk.opaque_shell');
     judgement.unplaced = true;
     judgement.targets.add(target.text);
@@ -686,6 +767,11 @@ async function judgeWriteTarget(
   if (writeRootOf(where.real, context) === undefined) {
     deny(judgement, 'deny.path_outside_root');
     return;
+  }
+  // Git's own data: a hook or a config line written there runs on the next git command.
+  const inRepository = relative(context.repoRoot, where.real);
+  if (inRepository === '.git' || inRepository.startsWith('.git/')) {
+    signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
   if (
     isProtectedPath(where.real, context) ||
@@ -724,6 +810,8 @@ async function isSecretArgument(arg: ResolvedWord, scope: ShellScope): Promise<b
 // ---------------------------------------------------------------------------
 
 interface CommandView {
+  /** Commands this one runs given as words (`find -exec`), judged as commands of their own. */
+  execChildren: CommandView[];
   command: ShellCommand;
   args: Arg[];
 }
@@ -744,7 +832,7 @@ interface Mode {
 const MAX_SCRIPT_NESTING = 3;
 
 function toView(command: ShellCommand, context: RuleContext): CommandView {
-  return { command, args: command.args.map(word => toArg(word, context)) };
+  return { command, args: command.args.map(word => toArg(word, context)), execChildren: [] };
 }
 
 // --- git -------------------------------------------------------------------
@@ -1739,34 +1827,110 @@ function dumpsEnvironment(view: CommandView): boolean {
 
 // --- reads -----------------------------------------------------------------
 
-/** Quoted strings inside program text: `'...'` and `"..."`. */
-const CODE_STRING = /'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"/g;
-/** A list of quoted strings, as an argv: `["git", "reset", "--hard"]`. */
-const CODE_STRING_LIST = /\[\s*(?:(?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\s*,?\s*){2,}\]/g;
+/** How much program text is read, and how many of its strings are judged. */
+const MAX_CODE_CHARS = 32_768;
+const MAX_CODE_STRINGS = 64;
 
-function codeStrings(code: string): string[] {
-  return [...code.matchAll(CODE_STRING)].map(match => match[1] ?? match[2] ?? '');
+interface CodeString {
+  text: string;
+  quote: string;
+  start: number;
+  end: number;
 }
 
 /**
- * Looks inside interpreter code for what the gate can recognise there: a
- * quoted shell command (`os.system('rm -rf /')`), an argv list
- * (`subprocess.run(["git", "reset", "--hard"])`) and a quoted secret path
- * (`open('.env')`). Everything else in the program is invisible.
+ * The quoted strings of a program, in one pass. An unterminated quote ends the
+ * scan: nothing after it can be told from the inside of that string.
  */
-async function judgeCode(code: string, scope: ShellScope, mode: Mode): Promise<void> {
-  if (mode.nesting >= MAX_SCRIPT_NESTING) return;
-  const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
-  const scripts = [
-    ...codeStrings(code).filter(text => /\s/.test(text)),
-    ...[...code.matchAll(CODE_STRING_LIST)].map(match => codeStrings(match[0]).join(' ')),
-  ];
-  for (const script of scripts) {
-    await judgeScript(parseShell(script), scope.cwd, scope.context, scope.judgement, inner);
+function scanCodeStrings(code: string): { strings: CodeString[]; complete: boolean } {
+  const strings: CodeString[] = [];
+  let i = 0;
+  while (i < code.length) {
+    const quote = code[i] ?? '';
+    if (quote !== "'" && quote !== '"' && quote !== '`') {
+      i++;
+      continue;
+    }
+    let text = '';
+    let j = i + 1;
+    while (j < code.length && code[j] !== quote) {
+      const escaped = code[j] === '\\' && j + 1 < code.length;
+      text += code[escaped ? j + 1 : j] ?? '';
+      j += escaped ? 2 : 1;
+    }
+    if (j >= code.length) return { strings, complete: false };
+    strings.push({ text, quote, start: i, end: j + 1 });
+    if (strings.length > MAX_CODE_STRINGS) return { strings, complete: false };
+    i = j + 1;
   }
-  for (const text of codeStrings(code)) {
-    if (/\s/.test(text)) continue;
-    if (await isSecretText(text, true, scope)) deny(scope.judgement, 'deny.secret_read');
+  return { strings, complete: true };
+}
+
+/** Calls that hand their argument to a shell or run it as a command. */
+const EXEC_CALL =
+  /(?:\b(?:system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|exec|execSync|execFile|execFileSync|spawn|spawnSync|shell_exec|passthru|proc_open|sh|shell|cmd|subprocess|child_process)|[$`])\s*\(?\s*(\[\s*)?$/;
+/** Calls that open the file their argument names. */
+const READ_CALL =
+  /\b(?:open|fopen|readFileSync|readFile|createReadStream|read_text|read_bytes|read|file_get_contents|load_dotenv|dotenv_values|config|Path|slurp)\s*\(\s*$/;
+/** Interpreters in which a backtick string is itself a command. */
+const BACKTICK_RUNS: ReadonlySet<string> = new Set(['ruby', 'perl', 'php']);
+/** How far back from a string its callee is looked for. */
+const CALL_LOOKBEHIND = 48;
+
+/**
+ * Looks inside interpreter code for what the gate can recognise there.
+ *
+ * A string handed to a call that runs commands (`os.system('…')`,
+ * `execSync('…')`, `subprocess.run(["git", "reset", "…"])`) is judged as that
+ * command, and a secret path handed to a call that opens files is a secret
+ * read. Any other string is only text as far as this reader can tell — a test
+ * name, a message, a JSON value — so a destructive command or a secret path
+ * found there raises a signal and never a denial. Everything else in the
+ * program is invisible.
+ */
+async function judgeCode(
+  source: string,
+  head: string,
+  scope: ShellScope,
+  mode: Mode
+): Promise<void> {
+  if (mode.nesting >= MAX_SCRIPT_NESTING) return;
+  const { judgement, context } = scope;
+  const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
+  const code = source.slice(0, MAX_CODE_CHARS);
+  const { strings, complete } = scanCodeStrings(code);
+  // What was not read may hold anything.
+  if (!complete || source.length > MAX_CODE_CHARS) signal(judgement, 'risk.opaque_shell');
+
+  for (const [index, string] of strings.entries()) {
+    const before = code.slice(Math.max(0, string.start - CALL_LOOKBEHIND), string.start);
+    const call = EXEC_CALL.exec(before);
+    const runs = call !== null || (string.quote === '`' && BACKTICK_RUNS.has(head));
+    if (runs) {
+      // An argv list: the strings that follow, separated by nothing but commas.
+      let script = string.text;
+      if (call?.[1] !== undefined) {
+        for (let next = index + 1; next < strings.length; next++) {
+          const between = code.slice(strings[next - 1]?.end, strings[next]?.start);
+          if (!/^\s*,\s*$/.test(between)) break;
+          script += ` ${strings[next]?.text ?? ''}`;
+        }
+      }
+      await judgeScript(parseShell(script), scope.cwd, context, judgement, inner);
+      continue;
+    }
+    if (/\s/.test(string.text)) {
+      // Text that reads like a command: judged on the side, and a denial there is only a signal here.
+      const aside = newJudgement();
+      await judgeScript(parseShell(string.text), scope.cwd, context, aside, inner);
+      if (aside.deny !== undefined) signal(judgement, 'risk.opaque_shell');
+      continue;
+    }
+    const pathLike = /[/.~]/.test(string.text) && !string.text.includes('://');
+    if (pathLike && isSecretPath(literalView(string.text, context))) {
+      if (READ_CALL.test(before)) deny(judgement, 'deny.secret_read');
+      else signal(judgement, 'risk.secret_path_argument');
+    }
   }
 }
 
@@ -1894,7 +2058,19 @@ async function judgeReads(view: CommandView, scope: ShellScope, mode: Mode): Pro
 
   if (printsToken(view)) deny(judgement, 'deny.secret_read');
   if (dumpsEnvironment(view)) signal(judgement, 'risk.environment_dump');
-  for (const code of interpreterCode(view)) await judgeCode(code, scope, mode);
+  for (const code of interpreterCode(view)) {
+    if (head === 'pwsh' || head === 'powershell') {
+      // PowerShell code is command text. It is not POSIX shell, so it is read for
+      // what it shares with it and never taken as understood.
+      signal(judgement, 'risk.opaque_shell');
+      if (mode.nesting < MAX_SCRIPT_NESTING) {
+        const inner: Mode = { nesting: mode.nesting + 1, speculative: mode.speculative };
+        await judgeScript(parseShell(code), scope.cwd, context, judgement, inner);
+      }
+    } else {
+      await judgeCode(code, head, scope, mode);
+    }
+  }
 
   const git = head === 'git' ? parseGit(view.args) : undefined;
   const kind = readKind(view, git);
@@ -2013,15 +2189,58 @@ function runsItsArguments(view: CommandView): boolean {
  * (`watch 'git reset --hard'`).
  */
 function embeddedScripts(view: CommandView): ParsedShell[] {
+  const cached = EMBEDDED.get(view);
+  if (cached !== undefined) return cached;
+  const scripts = findEmbeddedScripts(view);
+  EMBEDDED.set(view, scripts);
+  return scripts;
+}
+
+/** A command's embedded scripts are asked for by several rules: read them once. */
+const EMBEDDED = new WeakMap<CommandView, ParsedShell[]>();
+
+/** How many of each kind of embedded script one command is read for. */
+const MAX_EMBEDDED_SCRIPTS = 6;
+
+/**
+ * Short options whose value is text in the tools that have them: a test name
+ * filter, a title, a message. Their value is never read as a command. Options
+ * that hand over a command (`-c`, `-x`, `--exec`, `--command`, `--run`) are
+ * deliberately not here.
+ */
+const TEXT_SHORT_FLAGS: ReadonlySet<string> = new Set(['-g', '-t', '-e', '-m', '-k']);
+
+function isTextFlag(text: string): boolean {
+  const name = text.split('=')[0] ?? text;
+  return TEXT_SHORT_FLAGS.has(name) || TEXT_VALUE_FLAGS.has(name);
+}
+
+function findEmbeddedScripts(view: CommandView): ParsedShell[] {
   if (!runsItsArguments(view)) return [];
   const scripts: ParsedShell[] = [];
+  let suffixes = 0;
+  let quoted = 0;
+  let unread = false;
   view.args.forEach((arg, index) => {
+    const previous = view.args[index - 1];
+    // The value of a text option is a name or a message, whatever it says.
+    if (previous !== undefined && !previous.dynamic && isTextFlag(previous.text)) return;
+    if (!arg.dynamic && arg.text.startsWith('-') && isTextFlag(arg.text)) return;
     const name = arg.text.slice(arg.text.lastIndexOf('/') + 1);
     if (!arg.dynamic && EMBEDDED_HEADS.has(name)) {
-      scripts.push(parseArgv(view.command.args.slice(index)));
+      if (suffixes++ < MAX_EMBEDDED_SCRIPTS)
+        scripts.push(parseArgv(view.command.args.slice(index)));
+      else unread = true;
     }
-    if (/\s/.test(arg.text.trim())) scripts.push(parseShell(arg.text));
+    if (/\s/.test(arg.text.trim())) {
+      if (quoted++ < MAX_EMBEDDED_SCRIPTS) scripts.push(parseShell(arg.text));
+      else unread = true;
+    }
   });
+  // More candidates than the budget reads: say so rather than pass them unread.
+  if (unread) {
+    scripts.push({ commands: [], opaque: ['nesting_limit'], scopeParents: [], overBudget: false });
+  }
   return scripts;
 }
 
@@ -2218,16 +2437,29 @@ function judgeAcrossCommands(
   judgement: Judgement
 ): void {
   const roles = views.map(view => rolesOf(view, context));
+  // Members of each pipeline, so a command is compared with its own pipelines only.
+  const members = new Map<number, number[]>();
+  views.forEach((view, index) => {
+    for (const stage of view.command.pipelinePath) {
+      members.set(stage.id, [...(members.get(stage.id) ?? []), index]);
+    }
+  });
   views.forEach((later, index) => {
     const mine = roles[index];
     if (mine === undefined) return;
-    const upstream = views
-      .map((earlier, at) => ({ earlier, at }))
-      .filter(
-        ({ earlier, at }) =>
-          at < index && feeds(earlier.command.pipelinePath, later.command.pipelinePath)
-      )
-      .map(({ at }) => roles[at]);
+    const sharing = new Set(
+      later.command.pipelinePath.flatMap(stage => members.get(stage.id) ?? [])
+    );
+    const upstream = [...sharing]
+      .filter(at => {
+        const earlier = views[at];
+        return (
+          at < index &&
+          earlier !== undefined &&
+          feeds(earlier.command.pipelinePath, later.command.pipelinePath)
+        );
+      })
+      .map(at => roles[at]);
 
     if (mine.runsStdin && upstream.some(role => role?.fetches)) {
       deny(judgement, 'deny.pipe_to_shell');
@@ -2300,6 +2532,12 @@ async function judgeScript(
   judgement: Judgement,
   mode: Mode = { nesting: 0, speculative: false }
 ): Promise<boolean> {
+  // Past the reading budget nothing more is read, so nothing is judged: a long
+  // tail must not be able to carry a command past the rules unseen.
+  if (parsed.overBudget) {
+    deny(judgement, 'deny.command_too_large');
+    return false;
+  }
   if (parsed.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
 
   const views: CommandView[] = parsed.commands.map(command => toView(command, context));
@@ -2370,12 +2608,64 @@ function conclude(judgement: Judgement, allowRule: AllowRuleId, cwdInside: boole
 }
 
 /** Judges one tool call by the fixed rules. No shell is run and nothing is written. */
+export interface RuleOptions {
+  /**
+   * An earlier shell call in the same step changed directory to somewhere
+   * outside the write roots and was allowed. A provider with a persistent shell
+   * may still be standing there, so the directory this request reports cannot
+   * be trusted: a relative path in it is judged as one that cannot be placed.
+   */
+  cwdUntrusted?: boolean;
+}
+
+/** Input fields that name the file an unlisted tool acts on. */
+const PATH_FIELDS: readonly string[] = [
+  ...['file_path', 'filePath', 'path', 'filename', 'notebook_path', 'target_file', 'destination'],
+];
+const PATH_LIST_FIELDS: readonly string[] = ['paths', 'files'];
+
+/** The files an unlisted tool names in its input, as far as the usual field names show. */
+function inputPaths(input: Record<string, unknown>): string[] {
+  const single = PATH_FIELDS.map(field => input[field]).filter(
+    (value): value is string => typeof value === 'string' && value !== ''
+  );
+  const lists = PATH_LIST_FIELDS.flatMap(field => {
+    const value = input[field];
+    return Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === 'string')
+      : [];
+  });
+  return [...single, ...lists];
+}
+
+/**
+ * A path a file tool was given in a form only that tool can resolve: a leading
+ * `~` or `@`, or a URL. The provider is meant to hand over the path the tool
+ * will really write; one that still looks like this cannot be placed.
+ */
+function isUnplaceableForm(path: string): boolean {
+  return path.startsWith('~') || path.startsWith('@') || /^[a-z][a-z0-9+.-]*:\/\//i.test(path);
+}
+
+/** Tool names of shells this reader does not speak: their text is never taken as understood. */
+const FOREIGN_SHELL_TOOL = /powershell|pwsh|(^|[^a-z])cmd([^a-z]|$)|batch/i;
+
 export async function evaluateRules(
   request: ToolActionRequest,
-  context: RuleContext
+  given: RuleContext,
+  options: RuleOptions = {}
 ): Promise<RuleOutcome> {
+  // One evaluation, one view of the filesystem: see `Evaluation`.
+  const context: RuleContext = { ...given };
+  EVALUATIONS.set(context, { located: new Map(), entries: new Map(), links: new Map() });
   const judgement = newJudgement();
-  const paths = request.paths ?? [];
+  const input: Record<string, unknown> =
+    typeof request.input === 'object' && request.input !== null ? request.input : {};
+  const paths = [
+    ...(request.paths ?? []),
+    // A tool no table lists: whatever its input names as a file is judged as one.
+    ...(request.kind === 'other' ? inputPaths(input) : []),
+  ];
 
   if (request.kind === 'mcp') {
     signal(judgement, 'risk.kind_mcp');
@@ -2399,17 +2689,25 @@ export async function evaluateRules(
   }
 
   const scope: ShellScope = { context, judgement, cwd };
-  for (const path of paths) await judgeWriteTarget(plainPath(path), scope);
+  for (const path of paths) {
+    if (isUnplaceableForm(path)) deny(judgement, 'deny.path_unresolvable');
+    else await judgeWriteTarget(plainPath(path), scope);
+  }
 
   switch (request.kind) {
     case 'file_write':
-      if (paths.length === 0) return denied('deny.unreadable_request');
+      // The provider could not read every header of a patch: what it writes is unknown.
+      if (paths.length === 0 || input.unreadablePatch === true) {
+        return denied('deny.unreadable_request');
+      }
       return conclude(judgement, 'allow.write_in_root', cwdInside);
     case 'network':
       signal(judgement, 'risk.kind_network');
       if (request.url !== undefined) judgement.targets.add(request.url);
       return conclude(judgement, 'default.no_signal', false);
     case 'other':
+      // Nothing is known about what the tool does, so it is never allowed by rule.
+      signal(judgement, 'risk.kind_other');
       return conclude(judgement, 'default.no_signal', cwdInside);
     case 'shell': {
       const texts = [request.command, ...(request.parsedCommands ?? [])].filter(
@@ -2417,9 +2715,13 @@ export async function evaluateRules(
       );
       if (texts.length === 0) return denied('deny.unreadable_request');
       if (!cwdInside) signal(judgement, 'risk.cwd_outside_root');
+      if (FOREIGN_SHELL_TOOL.test(request.toolName)) signal(judgement, 'risk.opaque_shell');
+      // A persistent shell may stand somewhere this request does not say.
+      judgement.cwdUntrusted = options.cwdUntrusted === true;
+      const start = judgement.cwdUntrusted ? undefined : cwd;
       let allReadOnly = true;
       for (const text of texts) {
-        if (!(await judgeScript(parseShell(text), cwd, context, judgement))) allReadOnly = false;
+        if (!(await judgeScript(parseShell(text), start, context, judgement))) allReadOnly = false;
       }
       return conclude(judgement, allReadOnly ? 'allow.read_only' : 'default.no_signal', cwdInside);
     }

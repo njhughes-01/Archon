@@ -8,8 +8,9 @@
  * the function name for other local tools. Hosted tools (web search) never
  * reach a hook.
  */
-import { isAbsolute, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import type { ToolActionDecision, ToolActionRequest } from '../types';
+import { pathLikeInputTargets, readPatchTargets } from '../shared/tool-gate';
 
 /** The Codex stream item a hooked tool call shows up as; `other` has no item. */
 export type CodexToolCategory = 'command' | 'file_change' | 'mcp' | 'other';
@@ -49,29 +50,50 @@ function categoryOf(toolName: string): CodexToolCategory {
   return 'other';
 }
 
-const PATCH_TARGET_HEADERS = [
-  '*** Add File: ',
-  '*** Update File: ',
-  '*** Delete File: ',
-  '*** Move to: ',
-] as const;
+/** Codex applies nothing without this line, in an `apply_patch` call or piped in the shell. */
+const PATCH_BEGIN = '*** Begin Patch';
+
+/** The shell tool's own argument for the directory a command runs in. */
+const SHELL_DIRECTORY_FIELDS = ['workdir', 'cwd'] as const;
 
 /**
- * The files an `apply_patch` call would write, delete or move to, as absolute
- * paths. Header lines start in column 0; patch content is always prefixed with
- * `+`, `-` or a space, so content cannot pose as a header.
+ * The files an `apply_patch` envelope would write, delete or move to, as
+ * absolute paths, and whether it has a header that could not be read.
+ *
+ * Codex resolves a patch path against the working directory as it is written:
+ * no `~` expansion, and the space between a marker and its path is part of the
+ * file name (CLI 0.157.0 wrote `   a.txt` for `*** Add File:    a.txt`). The
+ * CLI is the user's own and may be newer than the one this was run against, so
+ * a path with such space is named in both spellings.
  */
-export function parseApplyPatchTargets(patch: string, cwd: string): string[] {
-  const targets = new Set<string>();
-  for (const rawLine of patch.split('\n')) {
-    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
-    const header = PATCH_TARGET_HEADERS.find(prefix => line.startsWith(prefix));
-    if (header === undefined) continue;
-    const target = line.slice(header.length).trim();
-    if (target === '') continue;
-    targets.add(isAbsolute(target) ? resolve(target) : resolve(cwd, target));
+export function readApplyPatch(
+  patch: string,
+  cwd: string
+): { paths: string[]; unreadable: boolean } {
+  const { targets, unreadable } = readPatchTargets(patch);
+  const paths = new Set<string>();
+  for (const target of targets) {
+    paths.add(resolve(cwd, target));
+    paths.add(resolve(cwd, target.trimStart()));
   }
-  return [...targets];
+  return { paths: [...paths], unreadable };
+}
+
+/**
+ * The directory a shell call runs in: the one the model set on the call, when
+ * the payload carries it, resolved against the hook's own. `undefined` when the
+ * field holds something that is not a directory name.
+ *
+ * The payloads seen in real runs (CLI 0.157.0 and 0.159.3) carry only
+ * `command`, so whether Codex ever sends this field is not established.
+ */
+function shellCallCwd(input: Record<string, unknown>, cwd: string): string | undefined {
+  for (const field of SHELL_DIRECTORY_FIELDS) {
+    const value = input[field];
+    if (value === undefined || value === null || value === '') continue;
+    return typeof value === 'string' ? resolve(cwd, value) : undefined;
+  }
+  return cwd;
 }
 
 /** Maps one PreToolUse hook payload to what the gate should be asked, if anything. */
@@ -106,34 +128,64 @@ export function translateCodexHookCall(payload: unknown): CodexHookTranslation {
     if (typeof command !== 'string' || command.trim() === '') {
       return { outcome: 'deny', category, reason: UNREADABLE_CALL };
     }
+    const callCwd = shellCallCwd(input, cwd);
+    if (callCwd === undefined) return { outcome: 'deny', category, reason: UNREADABLE_CALL };
     // Codex applies a patch piped to `apply_patch` in the shell itself, as a
     // file edit. Naming its targets lets the gate's path rules see them too.
-    const patchTargets = parseApplyPatchTargets(command, cwd);
+    const patch = command.includes(PATCH_BEGIN)
+      ? readApplyPatch(command, callCwd)
+      : { paths: [], unreadable: false };
     return {
       outcome: 'ask',
       category,
       request: {
         ...base,
+        cwd: callCwd,
+        ...(patch.unreadable ? { input: { ...input, unreadablePatch: true } } : {}),
         kind: 'shell',
         command,
-        ...(patchTargets.length > 0 ? { paths: patchTargets } : {}),
+        ...(patch.paths.length > 0 ? { paths: patch.paths } : {}),
       },
     };
   }
 
   if (category === 'file_change') {
-    const patch = input.command;
-    const paths = typeof patch === 'string' ? parseApplyPatchTargets(patch, cwd) : [];
-    // A patch with no readable target cannot be judged; asking the gate with an
+    const patch =
+      typeof input.command === 'string'
+        ? readApplyPatch(input.command, cwd)
+        : { paths: [], unreadable: false };
+    // A header that could not be read goes to the gate marked, with the
+    // targets that could: the gate refuses the mark and records the refusal.
+    if (patch.unreadable) {
+      return {
+        outcome: 'ask',
+        category,
+        request: {
+          ...base,
+          input: { ...input, unreadablePatch: true },
+          kind: 'file_write',
+          ...(patch.paths.length > 0 ? { paths: patch.paths } : {}),
+        },
+      };
+    }
+    // A patch with no target at all cannot be judged; asking the gate with an
     // empty path list would describe a write to nowhere.
-    if (paths.length === 0) return { outcome: 'deny', category, reason: UNREADABLE_CALL };
-    return { outcome: 'ask', category, request: { ...base, kind: 'file_write', paths } };
+    if (patch.paths.length === 0) return { outcome: 'deny', category, reason: UNREADABLE_CALL };
+    return {
+      outcome: 'ask',
+      category,
+      request: { ...base, kind: 'file_write', paths: patch.paths },
+    };
   }
 
+  if (category === 'mcp') return { outcome: 'ask', category, request: { ...base, kind: 'mcp' } };
+
+  // A tool this table does not know may still name the file it writes.
+  const paths = pathLikeInputTargets(input);
   return {
     outcome: 'ask',
     category,
-    request: { ...base, kind: category === 'mcp' ? 'mcp' : 'other' },
+    request: { ...base, kind: 'other', ...(paths.length > 0 ? { paths } : {}) },
   };
 }
 

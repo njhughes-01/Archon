@@ -183,7 +183,7 @@
 {"id":"allow-find-in-pwd","tool":"Bash","kind":"shell","command":"find \"$PWD/src\" -name '*.ts'","cwd":"{root}","expect":"allow","ruleId":"allow.read_only"}
 {"id":"allow-git-diff-variable-ref","tool":"Bash","kind":"shell","command":"git diff \"$BASE\"...HEAD --stat","cwd":"{root}","expect":"allow","ruleId":"allow.read_only"}
 {"id":"allow-curl-get-url-with-secrets-segment","tool":"Bash","kind":"shell","command":"curl -s https://api.example.com/v1/secrets/list","cwd":"{root}","expect":"allow","ruleId":"default.no_signal"}
-{"id":"allow-other-kind","tool":"TodoWrite","kind":"other","cwd":"{root}","input":{"todos":[]},"expect":"allow","ruleId":"default.no_signal"}
+{"id":"escalate-other-kind","tool":"TodoWrite","kind":"other","cwd":"{root}","input":{"todos":[]},"expect":"escalate","ruleId":"risk.kind_other"}
 {"id":"escalate-bash-c-variable","tool":"Bash","kind":"shell","command":"bash -c \"$CMD\"","cwd":"{root}","expect":"escalate","ruleId":"risk.opaque_shell"}
 {"id":"escalate-gh-pr-merge","tool":"Bash","kind":"shell","command":"gh pr merge 5","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}
 {"id":"escalate-psql-drop-table","tool":"Bash","kind":"shell","command":"psql -c \"DROP TABLE users\"","cwd":"{root}","expect":"escalate","ruleId":"risk.mutation_verb"}

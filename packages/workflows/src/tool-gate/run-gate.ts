@@ -4,13 +4,12 @@
  *
  * This is the only place that reads the switch and the classifier settings,
  * so the workflow executor and direct chat turn the same config and
- * environment into the same gate. A run holds one classifier cache; a step
- * holds its own denial count.
+ * environment into the same gate. A run holds one classifier cache; each
+ * attempt of a step holds its own denial count.
  */
 import { access, chmod, mkdtemp, realpath } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { createLogger } from '@archon/paths';
 import type { ProviderCapabilities } from '@archon/providers/types';
 import { MANAGED_PROVIDER_CREDENTIAL_RELATIVE_PATHS, type WorkflowConfig } from '../deps';
 import type { Fetch } from '../jev/jev-client';
@@ -26,13 +25,6 @@ import {
 } from './gate';
 import { collectCredentialValues } from './credential-values';
 import { DEFAULT_PROTECTED_BRANCHES, DEFAULT_VERIFICATION_COMMANDS } from './rules';
-
-/** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
-let cachedLog: ReturnType<typeof createLogger> | undefined;
-function getLog(): ReturnType<typeof createLogger> {
-  if (!cachedLog) cachedLog = createLogger('workflow.tool-gate');
-  return cachedLog;
-}
 
 /**
  * How an operator turns the gate off. There is one switch for the install and
@@ -61,14 +53,24 @@ export interface RunToolGateInput {
   inContainer?: boolean;
   /** See `ToolGateOptions.outsideRootAdvice`. */
   outsideRootAdvice?: string;
-  /** Receives every decision with the step it was made for. A throw fails the tool call. */
-  record: (event: ToolGateDecisionEvent, step: string) => void;
+  /**
+   * Receives every decision with the step it was made for. A promise it returns
+   * is waited for before the call is answered; a throw or a rejection denies
+   * the call. See `ToolGateOptions.record`.
+   */
+  record: (event: ToolGateDecisionEvent, step: string) => void | Promise<void>;
   /** Replaces the network for the classifier. Tests inject it. */
   fetch?: Fetch;
 }
 
 export interface RunToolGate {
-  /** The callback for one step: its own denial count, the run's shared classifier cache. */
+  /**
+   * A new callback for one attempt of a step, on the run's shared classifier
+   * cache. Each call starts a denial count at zero and trusts the working
+   * directory its requests report, so the caller asks again for every retry
+   * attempt and every loop iteration: what one attempt was refused, or where
+   * its shell went, says nothing about the next.
+   */
   forStep(step: string): ToolGate;
 }
 
@@ -128,9 +130,8 @@ export function createRunToolGate(input: RunToolGateInput): RunToolGate | undefi
       protectedPaths: input.protectedPaths,
       classifierConfigured: jev.status === 'on',
       escalate,
-      record: event => {
-        input.record(event, step);
-      },
+      // Returned, not only called: the gate waits for a sink that is still writing.
+      record: event => input.record(event, step),
       protectedBranches,
       verificationCommands,
       credentialValues: input.credentialValues,
@@ -217,29 +218,25 @@ export function assertProviderHonoursToolGate(
  * The audit sink for a workflow run: one `tool_gate_decision` event per
  * decision, on the step that asked, carrying the decision record as it is.
  *
- * The write is best-effort like every other observability event. A store that
- * cannot take it is logged with the decision's own fields, so the record is
- * not lost with the write.
+ * Unlike the run's other observability events this write is not best-effort:
+ * a call may not run without its record. So it goes through the store's
+ * `persistWorkflowEvent`, which reports a failed write, and never through
+ * `createWorkflowEvent`, which by contract swallows one. The write's promise is
+ * handed back for the gate to wait on; when it rejects the gate denies the
+ * call and logs the failure. Nothing is caught or logged here, which would
+ * hide the failure from the gate and log it twice.
  */
 export function workflowToolGateRecorder(
-  store: Pick<IWorkflowStore, 'createWorkflowEvent'>,
+  store: Pick<IWorkflowStore, 'persistWorkflowEvent'>,
   workflowRunId: string
 ): RunToolGateInput['record'] {
-  return (event, step) => {
-    store
-      .createWorkflowEvent({
-        workflow_run_id: workflowRunId,
-        event_type: 'tool_gate_decision',
-        step_name: step,
-        data: { ...event },
-      })
-      .catch((err: unknown) => {
-        getLog().error(
-          { err, workflowRunId, step, eventType: 'tool_gate_decision', decision: event },
-          'workflow_event_persist_failed'
-        );
-      });
-  };
+  return (event, step) =>
+    store.persistWorkflowEvent({
+      workflow_run_id: workflowRunId,
+      event_type: 'tool_gate_decision',
+      step_name: step,
+      data: { ...event },
+    });
 }
 
 export interface WorkflowRunToolGateInput {
@@ -247,7 +244,7 @@ export interface WorkflowRunToolGateInput {
     WorkflowConfig,
     'toolGate' | 'envVars' | 'protectedEnvKeys' | 'protectedCredentialValues'
   >;
-  store: Pick<IWorkflowStore, 'createWorkflowEvent'>;
+  store: Pick<IWorkflowStore, 'persistWorkflowEvent'>;
   workflowRunId: string;
   /** The checkout the run's nodes work in. */
   cwd: string;

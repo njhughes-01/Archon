@@ -2272,6 +2272,8 @@ async function executeNodeInternal(
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
     ...(shouldForkSession ? { forkSession: true } : {}),
+    // Built here, once per call of this function, which is once per retry
+    // attempt: each attempt starts its own denial count.
     ...(ctx.toolGateRun && { toolGate: ctx.toolGateRun.forStep(stepName) }),
   };
   let nodeIdleTimedOut = false;
@@ -5626,8 +5628,6 @@ async function executeLoopNode(
   // ('' → node.id at top level, #2090). The loop's own per-iteration number lives in
   // each event's data (`iteration`), so no separate iteration param is threaded here.
   const stepName = stepNamePrefix + node.id;
-  // One gate for the whole loop node, so its denial count spans the iterations.
-  const loopToolGate = ctx.toolGateRun?.forStep(stepName);
 
   // A bare approval completes the captured execution without starting another attempt.
   // Feedback continues the invocation with a new attempt and the currently resolved binding.
@@ -5992,6 +5992,10 @@ async function executeLoopNode(
     };
 
     iterationAttempt: for (let iterRetry = 0; ; iterRetry++) {
+      // A new gate for each iteration and each transient retry of one, like the
+      // one a plain AI node gets per attempt: what an earlier iteration was
+      // denied must not count against this one.
+      const iterationToolGate = ctx.toolGateRun?.forStep(stepName);
       let iterationAbortController = new AbortController();
       // Mid-stream cancel-check throttle (see the check inside the stream loop).
       // The between-iteration status check just ran, so start the clock at the
@@ -6105,7 +6109,7 @@ async function executeLoopNode(
           const iterationOptions: SendQueryOptions | undefined = {
             ...resolvedOptions,
             abortSignal: iterationAbortController.signal,
-            ...(loopToolGate && { toolGate: loopToolGate }),
+            ...(iterationToolGate && { toolGate: iterationToolGate }),
           };
 
           // Reask attempts start a FRESH session (mirrors runStreamPass in

@@ -28,6 +28,16 @@ const SHAPE_SCAN_LIMIT = 64_000;
 /** How deep `redactInput` walks before it stops describing a value. */
 const MAX_INPUT_DEPTH = 6;
 
+/** The fields that hold the name in a name/value pair, in lower case. */
+const PAIR_LABEL_FIELDS = new Set(['name', 'key']);
+
+/** How many leading arguments of a list are read as its command: `sudo -E gh secret set NAME`. */
+const ARGUMENT_COMMAND_WORDS = 8;
+/** No command word or flag is longer than this; a longer argument is a value and is not read as either. */
+const ARGUMENT_WORD_CAP = 64;
+/** How much of an argument the flag rules are shown: enough for any flag and the start of its value. */
+const ARGUMENT_PROBE_CAP = 256;
+
 export interface RedactOptions {
   /** Exact values to mask wherever they appear. */
   credentialValues: readonly string[];
@@ -35,13 +45,26 @@ export interface RedactOptions {
   cap: number;
 }
 
-/** Words that mark a name as secret wherever they stand in it: `SECRET_KEY_BASE`, `apiToken`. */
-const SECRET_WORDS = new Set([
+/**
+ * Words that mark a name as secret wherever they stand in it, alone or as the
+ * end of a longer word: `SECRET_KEY_BASE`, `apiToken`, `PGPASSWORD`, `authtoken`.
+ * No everyday word ends in one of them, which is why the end of a word is enough.
+ */
+const SECRET_WORDS = [
   ...['secret', 'secrets', 'token', 'password', 'passwd', 'passphrase'],
   ...['credential', 'credentials', 'apikey'],
+];
+/** Words that mark a name as secret only as its last word: `Pwd`, `SMTP_PASS`, `REGISTRY_AUTH`. */
+const SECRET_LAST_WORDS = new Set(['pwd', 'pass', 'auth']);
+/**
+ * `key` marks a name as secret as the end of its last word: `API_KEY`, `SSHKEY`.
+ * Unlike the words above it also ends everyday words, and those are named here
+ * so that a name nobody listed is masked rather than shown.
+ */
+const EVERYDAY_WORDS_ENDING_IN_KEY = new Set([
+  ...['monkey', 'donkey', 'turkey', 'hockey', 'jockey', 'whiskey', 'lackey'],
+  ...['hotkey', 'turnkey', 'latchkey', 'lowkey', 'malarkey'],
 ]);
-/** Words that mark a name as secret only as its last word: `API_KEY`, `Pwd`, `SMTP_PASS`, `REGISTRY_AUTH`. */
-const SECRET_LAST_WORDS = new Set(['key', 'pwd', 'pass', 'auth']);
 /** Word pairs that mark a name as secret wherever they stand: `PRIVATE_KEY_PEM`, `accessKeyId`. */
 const SECRET_WORD_PAIRS = new Set(['api key', 'access key', 'private key', 'secret key']);
 const SECRET_KEY_NAMES = new Set([
@@ -63,22 +86,39 @@ function nameWords(name: string): string[] {
 }
 
 /**
- * Whether a variable, flag, header or JSON key names a secret. Whole words
- * only: `MAX_TOKENS` and `TOKENIZERS_PARALLELISM` are settings, and a caller
- * that masks the values of secret-named variables must not mask theirs.
+ * Whether a variable, flag, header or JSON key names a secret. A secret word
+ * counts as a whole word or as the end of one, never as its start or middle:
+ * `MAX_TOKENS` and `TOKENIZERS_PARALLELISM` are settings, and a caller that
+ * masks the values of secret-named variables must not mask theirs.
  */
 export function isSecretKey(name: string): boolean {
   if (SECRET_KEY_NAMES.has(name.toLowerCase())) return true;
   const words = nameWords(name);
+  const last = words.at(-1) ?? '';
   return (
-    words.some(word => SECRET_WORDS.has(word)) ||
-    SECRET_LAST_WORDS.has(words.at(-1) ?? '') ||
+    words.some(word => SECRET_WORDS.some(secret => word.endsWith(secret))) ||
+    SECRET_LAST_WORDS.has(last) ||
+    (last.endsWith('key') && !EVERYDAY_WORDS_ENDING_IN_KEY.has(last)) ||
     words.some((word, index) => SECRET_WORD_PAIRS.has(`${word} ${words[index + 1] ?? ''}`))
   );
 }
 
-/** A value: double-quoted (escapes kept), single-quoted, or a run up to the next space or quote. */
-const VALUE = String.raw`"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"']+`;
+/**
+ * A value, in the order the forms are tried:
+ * - `\"…\"`, a quoted value inside a quoted argument, as JSON in `-d "{…}"`.
+ *   It ends at a quote with the same backslashes or none. A quote with more
+ *   is one level deeper, inside the value.
+ * - double-quoted (escapes kept) and single-quoted;
+ * - a quote that never closes, up to the next space or quote;
+ * - a run up to the next space or quote.
+ */
+const VALUE = [
+  String.raw`(?<escape>\\{1,8})(?<quote>["'])[^]*?(?<!\\)(?:\k<escape>)?\k<quote>`,
+  String.raw`"(?:[^"\\]|\\.)*"`,
+  String.raw`'[^']*'`,
+  String.raw`\\{0,8}["'][^\s"']+`,
+  String.raw`[^\s"']+`,
+].join('|');
 
 const PEM_BLOCK = /-----BEGIN [A-Z0-9 ]+-----[\s\S]*?(?:-----END [A-Z0-9 ]+-----|$)/g;
 const CREDENTIAL_HEADER =
@@ -88,22 +128,45 @@ const BEARER_TOKEN = /\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi;
 const URL_USER_PASSWORD = /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^\s/:@]*:\S{0,512}@/gi;
 /** `scheme://token@host`. */
 const URL_USER_ONLY = /(?<![a-z0-9+.-])([a-z][a-z0-9+.-]*:\/\/)[^\s/@]+@/gi;
-/** The name and separator of `NAME=value`, `name: value` or `"name": "value"`. */
-const ASSIGNMENT_NAME = /(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]*)(["']?\s*[=:]\s*)/g;
+/** The name and separator of `NAME=value`, `name: value`, `"name": "value"` or `\"name\": \"value\"`. */
+const ASSIGNMENT_NAME =
+  /(?<![A-Za-z0-9_.-])([A-Za-z_][A-Za-z0-9_.-]*)((?:\\{0,8}["'])?\s*[=:]\s*)/g;
 const VALUE_HERE = new RegExp(VALUE, 'y');
 /** `--password value` and `--password=value`. */
 const SECRET_FLAG = new RegExp(
   String.raw`(?<![A-Za-z0-9-])(--?[A-Za-z0-9-]*(?:token|key|secret|password|passwd|passphrase|credentials?|pwd|pass|auth))(=|\s+(?!-))(?:${VALUE})`,
   'gi'
 );
-/** `-u user:password` and `--user user:password`: the part after the colon. */
-const USER_PASSWORD_FLAG = /(?<![A-Za-z0-9-])(-u|--user)(=|\s+)(["']?[^\s:"']+):[^\s"']+/g;
+/** `-u user:password`, `--user` and curl's `-U`/`--proxy-user`: the part after the colon. */
+const USER_PASSWORD_FLAG =
+  /(?<![A-Za-z0-9-])(-u|-U|--user|--proxy-user)(=|\s+)(["']?[^\s:"']+):[^\s"']+/g;
+/**
+ * The value of a flag that is secret only for one command, found up to 400
+ * characters after the command and before the next `;`, `|`, `&` or line.
+ * The command must stand as its own word, so that `out.zip -P dir` is not `zip`.
+ */
+function commandPasswordFlag(command: string, flag: string): RegExp {
+  return new RegExp(
+    String.raw`((?<![A-Za-z0-9_.-])(?:${command})(?![A-Za-z0-9_-])[^\n;|&]{0,400}?\s(?:${flag}))(?:${VALUE})\S*`,
+    'g'
+  );
+}
 /** Password flags that only mean a password for these commands. */
 const COMMAND_PASSWORD_FLAGS: readonly RegExp[] = [
   /(\b(?:mysql|mysqldump|mysqladmin|mariadb)\b[^\n;|&]{0,400}?\s-p)[^\s-]\S*/g,
   /(\bsshpass\b[^\n;|&]{0,400}?\s-p\s*)\S+/g,
   /(\b(?:docker|podman|helm|npm)\s+login\b[^\n;|&]{0,400}?\s-p[=\s]*)\S+/g,
   /(\bredis-cli\b[^\n;|&]{0,400}?\s(?:-a|--pass)\s+)\S+/g,
+  commandPasswordFlag('az', String.raw`-p(?:=|\s+)`),
+  commandPasswordFlag('zip|unzip', String.raw`-P\s*`),
+  // 7z takes the password attached; a bare `-p` asks for it at a prompt.
+  commandPasswordFlag('7z[arz]?', '-p'),
+  commandPasswordFlag('ldap[a-z]{2,8}', String.raw`-w\s*`),
+  // One rule per flag: `-P old -N new` carries both, and a rule masks one value per command.
+  commandPasswordFlag('ssh-keygen', String.raw`-N\s*`),
+  commandPasswordFlag('ssh-keygen', String.raw`-P\s*`),
+  // `gh variable set --body` is not a secret, and neither is the body of a comment.
+  commandPasswordFlag(String.raw`gh\s+secret\s+set`, String.raw`--body(?:=|\s+)|-b[=\s]*`),
 ];
 const TOKEN_SHAPES = new RegExp(
   [
@@ -174,18 +237,25 @@ function maskAssignments(text: string): string {
   return masked + text.slice(copied);
 }
 
-function maskShapes(text: string): string {
+/** Masks the values that command-line flags carry. */
+function maskFlagValues(text: string): string {
   let masked = text
+    .replace(SECRET_FLAG, `$1$2${REDACTED}`)
+    .replace(USER_PASSWORD_FLAG, `$1$2$3:${REDACTED}`);
+  for (const flag of COMMAND_PASSWORD_FLAGS) masked = masked.replace(flag, `$1${REDACTED}`);
+  return masked;
+}
+
+function maskShapes(text: string): string {
+  const masked = text
     .replace(PEM_BLOCK, `${REDACTED} PEM block`)
     .replace(CREDENTIAL_HEADER, `$1$2${REDACTED}`)
     .replace(BEARER_TOKEN, `$1 ${REDACTED}`)
     .replace(URL_USER_PASSWORD, `$1${REDACTED}@`)
     .replace(URL_USER_ONLY, `$1${REDACTED}@`);
-  masked = maskAssignments(masked)
-    .replace(SECRET_FLAG, `$1$2${REDACTED}`)
-    .replace(USER_PASSWORD_FLAG, `$1$2$3:${REDACTED}`);
-  for (const flag of COMMAND_PASSWORD_FLAGS) masked = masked.replace(flag, `$1${REDACTED}`);
-  return masked.replace(TOKEN_SHAPES, REDACTED).replace(AWS_SECRET_KEY, REDACTED);
+  return maskFlagValues(maskAssignments(masked))
+    .replace(TOKEN_SHAPES, REDACTED)
+    .replace(AWS_SECRET_KEY, REDACTED);
 }
 
 /** Exact values, then shapes, over at most `SHAPE_SCAN_LIMIT` characters. */
@@ -206,10 +276,59 @@ export function redactText(text: string, options: RedactOptions): string {
   return `${masked.text.slice(0, options.cap)}… [truncated ${String(dropped)} chars]`;
 }
 
-/** `{ name: 'DB_PASSWORD', value: '…' }`: a pair whose name field is secret. */
-function isSecretPair(value: Record<string, unknown>): boolean {
-  const label = value.name ?? value.key;
-  return typeof label === 'string' && isSecretKey(label) && 'value' in value;
+/**
+ * `{ name: 'DB_PASSWORD', value: '…' }`, `{ Key: …, Value: … }`: whether the
+ * name field of a pair is secret. Field names are compared in lower case.
+ */
+function hasSecretLabel(record: Record<string, unknown>): boolean {
+  return Object.entries(record).some(
+    ([field, label]) =>
+      PAIR_LABEL_FIELDS.has(field.toLowerCase()) && typeof label === 'string' && isSecretKey(label)
+  );
+}
+
+/** An argument as one bare word of the same length, the way the flag rules meet it in a command. */
+function asBareWord(argument: string): string {
+  return argument.replace(/[\s"']/g, '_');
+}
+
+/**
+ * Where the secret part of an argument starts, or null when it holds none:
+ * 0 for the value after `--token` or after `-p` of a command that takes a
+ * password there, 2 for `-pVALUE`, past the colon for `user:password`.
+ *
+ * The flag rules decide, read over the command words, the argument before
+ * this one and this one, so a list and a command line cannot disagree about
+ * which flags are secret. An argument list keeps a value whole, so the rest of
+ * the argument is the secret even where a command line would split it.
+ */
+function secretStartInArgument(args: readonly unknown[], index: number): number | null {
+  const word = asBareWord(String(args[index]).slice(0, ARGUMENT_PROBE_CAP));
+  const previous = args[index - 1];
+  // Every flag rule needs a flag: in this argument or in the one before it.
+  if (!word.startsWith('-') && !(typeof previous === 'string' && previous.startsWith('-'))) {
+    return null;
+  }
+  const before = [...Array(Math.min(index, ARGUMENT_COMMAND_WORDS)).keys()];
+  if (index > ARGUMENT_COMMAND_WORDS) before.push(index - 1);
+  const words = before
+    .map(position => args[position])
+    .filter((arg): arg is string => typeof arg === 'string' && arg.length <= ARGUMENT_WORD_CAP)
+    .map(asBareWord);
+  const masked = maskFlagValues([...words, word].join(' '));
+  const last = masked.slice(masked.lastIndexOf(' ') + 1);
+  if (last === word) return null;
+  const kept = last.endsWith(REDACTED) ? last.slice(0, -REDACTED.length) : '';
+  return word.startsWith(kept) ? kept.length : 0;
+}
+
+function maskArguments(args: readonly unknown[], mask: (item: unknown) => unknown): unknown[] {
+  return args.map((item, index) => {
+    if (typeof item !== 'string' && typeof item !== 'number') return mask(item);
+    const start = secretStartInArgument(args, index);
+    if (start === null) return mask(item);
+    return `${String(mask(String(item).slice(0, start)))}${REDACTED}`;
+  });
 }
 
 function maskInput(value: unknown, credentialValues: readonly string[], depth: number): unknown {
@@ -220,14 +339,14 @@ function maskInput(value: unknown, credentialValues: readonly string[], depth: n
   if (value === null || typeof value !== 'object') return value;
   if (depth >= MAX_INPUT_DEPTH) return '[nested]';
   if (Array.isArray(value)) {
-    return value.map(item => maskInput(item, credentialValues, depth + 1));
+    return maskArguments(value, item => maskInput(item, credentialValues, depth + 1));
   }
   const record = value as Record<string, unknown>;
-  const pair = isSecretPair(record);
+  const pair = hasSecretLabel(record);
   const masked: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(record)) {
     masked[key] =
-      isSecretKey(key) || (pair && key === 'value')
+      isSecretKey(key) || (pair && key.toLowerCase() === 'value')
         ? REDACTED
         : maskInput(item, credentialValues, depth + 1);
   }

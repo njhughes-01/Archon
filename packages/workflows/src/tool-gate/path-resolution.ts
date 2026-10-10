@@ -62,7 +62,36 @@ function errorCode(error: unknown): string {
  * that is a file, a directory that cannot be read — is returned as a failure
  * for the caller to refuse, never guessed around.
  */
-export async function resolveRealPath(target: string, baseDir: string): Promise<ResolvedPath> {
+/** What one directory entry was found to be: a link and where it points, or a failure code. */
+type Entry = { kind: 'plain' } | { kind: 'link'; target: string } | { kind: 'error'; code: string };
+
+/**
+ * What the walk has already learned about entries, for a caller that resolves
+ * many paths in one go (every operand of one command). It must not outlive the
+ * call it was made for: the filesystem moves on.
+ */
+export type PathEntryCache = Map<string, Entry>;
+
+async function readEntry(candidate: string, cache: PathEntryCache | undefined): Promise<Entry> {
+  const known = cache?.get(candidate);
+  if (known !== undefined) return known;
+  let entry: Entry;
+  try {
+    entry = (await lstat(candidate)).isSymbolicLink()
+      ? { kind: 'link', target: await readlink(candidate) }
+      : { kind: 'plain' };
+  } catch (error) {
+    entry = { kind: 'error', code: errorCode(error) };
+  }
+  cache?.set(candidate, entry);
+  return entry;
+}
+
+export async function resolveRealPath(
+  target: string,
+  baseDir: string,
+  cache?: PathEntryCache
+): Promise<ResolvedPath> {
   if (!isAbsolute(baseDir)) return { ok: false, code: 'ERELATIVE' };
   const start = isAbsolute(target) ? target : `${baseDir}${sep}${target}`;
   if (isProcessRelative(start)) return { ok: false, code: 'EPROCESS' };
@@ -80,26 +109,18 @@ export async function resolveRealPath(target: string, baseDir: string): Promise<
     }
     const candidate = join(current, segment);
     if (PROCESS_RELATIVE.test(candidate)) return { ok: false, code: 'EPROCESS' };
-    let isLink: boolean;
-    try {
-      isLink = (await lstat(candidate)).isSymbolicLink();
-    } catch (error) {
-      const code = errorCode(error);
-      if (code !== 'ENOENT') return { ok: false, code };
+    const entry = await readEntry(candidate, cache);
+    if (entry.kind === 'error') {
+      if (entry.code !== 'ENOENT') return { ok: false, code: entry.code };
       return { ok: true, path: resolve(candidate, ...pending), exists: false };
     }
-    if (!isLink) {
+    if (entry.kind === 'plain') {
       current = candidate;
       continue;
     }
     hops++;
     if (hops > MAX_SYMLINK_HOPS) return { ok: false, code: 'ELOOP' };
-    let link: string;
-    try {
-      link = await readlink(candidate);
-    } catch (error) {
-      return { ok: false, code: errorCode(error) };
-    }
+    const link = entry.target;
     if (isAbsolute(link)) {
       const linkRoot = parse(link).root;
       current = linkRoot;

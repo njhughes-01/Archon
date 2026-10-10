@@ -218,8 +218,14 @@ describe('parseShell: redirections', () => {
     expect(commands[0]?.opaque).toEqual([]);
   });
 
-  test('a heredoc fed to an interpreter is opaque', () => {
-    expect(only('python3 <<EOF\nprint(1)\nEOF').opaque).toContain('heredoc');
+  test('a program handed to an interpreter on a heredoc is left for the rules to read, like `-c` code', () => {
+    const command = only('python3 <<EOF\nprint(1)\nEOF');
+    expect(command.opaque).not.toContain('heredoc');
+    expect(command.stdin.join('')).toContain('print(1)');
+  });
+
+  test('a heredoc fed to a command that is neither a sink nor an interpreter is opaque', () => {
+    expect(only('mytool <<EOF\nprint(1)\nEOF').opaque).toContain('heredoc');
   });
 
   test('a heredoc fed to a shell is opaque and its body is parsed as commands', () => {

@@ -1,6 +1,12 @@
 import { describe, expect, mock, test } from 'bun:test';
 import type { ToolActionDecision, ToolActionRequest } from '../types';
-import { askToolGate, formatToolGateDenial, toolGateFailure } from './tool-gate';
+import {
+  askToolGate,
+  formatToolGateDenial,
+  pathLikeInputTargets,
+  readPatchTargets,
+  toolGateFailure,
+} from './tool-gate';
 
 const REQUEST: ToolActionRequest = {
   toolName: 'Bash',
@@ -101,5 +107,184 @@ describe('formatToolGateDenial', () => {
     expect(formatToolGateDenial({ ...toolGateFailure('The gate failed.'), alternatives: [] })).toBe(
       'Blocked by the tool gate: The gate failed.'
     );
+  });
+});
+
+describe('pathLikeInputTargets', () => {
+  test('reads every field an unknown tool commonly names a file in', () => {
+    expect(
+      pathLikeInputTargets({
+        file_path: '/a',
+        path: 'b',
+        filePath: 'c',
+        filename: 'd',
+        notebook_path: 'e.ipynb',
+        target_file: 'f',
+        destination: '../g',
+        paths: ['h', 'i'],
+        files: ['j'],
+      })
+    ).toEqual(['/a', 'b', 'c', 'd', 'e.ipynb', 'f', '../g', 'h', 'i', 'j']);
+  });
+
+  test('a MultiEdit-shaped input names its target', () => {
+    expect(pathLikeInputTargets({ file_path: '/etc/hosts', edits: [{ old_string: 'a' }] })).toEqual(
+      ['/etc/hosts']
+    );
+  });
+
+  test('skips values that are not text and names each target once', () => {
+    expect(
+      pathLikeInputTargets({
+        path: 7,
+        file_path: '',
+        filename: null,
+        destination: { nested: 'x' },
+        paths: ['a', 3, null, 'a', ''],
+        files: 'not-a-list',
+        content: 'path: /etc/hosts',
+      })
+    ).toEqual(['a']);
+  });
+
+  test('an input with no such field names nothing', () => {
+    expect(pathLikeInputTargets({ prompt: 'do it' })).toEqual([]);
+  });
+});
+
+describe('readPatchTargets', () => {
+  const patch = (...lines: string[]): string => lines.join('\n');
+
+  test('reads add, update, move and delete headers', () => {
+    expect(
+      readPatchTargets(
+        patch(
+          '*** Begin Patch',
+          '*** Add File: src/new.ts',
+          '+export {};',
+          '*** Update File: src/old.ts',
+          '*** Move to: src/renamed.ts',
+          '@@',
+          '-a',
+          '+b',
+          '*** Delete File: /abs/gone.ts',
+          '*** End Patch'
+        )
+      )
+    ).toEqual({
+      targets: ['src/new.ts', 'src/old.ts', 'src/renamed.ts', '/abs/gone.ts'],
+      unreadable: false,
+    });
+  });
+
+  // Both real parsers trim a header line before matching it: Codex 0.157.0
+  // wrote `../out.txt` for exactly this patch, and Copilot's parser reads the
+  // same target (see the oracle in community/copilot/tool-gate.test.ts).
+  test('an indented header after another hunk is a target', () => {
+    expect(
+      readPatchTargets(
+        patch(
+          '*** Begin Patch',
+          '*** Delete File: d.txt',
+          '  *** Add File: ../out.txt',
+          '+hi',
+          '*** End Patch'
+        )
+      )
+    ).toEqual({ targets: ['d.txt', '../out.txt'], unreadable: false });
+  });
+
+  test('tab and no-break-space indentation is trimmed like plain spaces', () => {
+    expect(
+      readPatchTargets(
+        patch('*** Begin Patch', '\t*** Add File: a.txt', '+x', '\u00A0*** Delete File: b.txt')
+      ).targets
+    ).toEqual(['a.txt', 'b.txt']);
+  });
+
+  test('CRLF line ends are not part of the path', () => {
+    expect(
+      readPatchTargets(
+        '*** Begin Patch\r\n*** Update File: a.ts\r\n*** Move to: b.ts\r\n@@\r\n-x\r\n+y\r\n*** End Patch\r\n'
+      )
+    ).toEqual({ targets: ['a.ts', 'b.ts'], unreadable: false });
+  });
+
+  test('trailing space is dropped and leading space after the marker is kept', () => {
+    // Codex keeps the leading space as part of the file name; Copilot trims
+    // it. Each provider settles that spelling itself.
+    expect(readPatchTargets(patch('*** Add File:    a.txt   ', '+x')).targets).toEqual([
+      '   a.txt',
+    ]);
+  });
+
+  test('added and removed content is never a header', () => {
+    expect(
+      readPatchTargets(
+        patch(
+          '*** Begin Patch',
+          '*** Update File: notes.md',
+          '@@',
+          '+*** Add File: decoy.md',
+          '-*** Delete File: decoy.md',
+          '*** End Patch'
+        )
+      )
+    ).toEqual({ targets: ['notes.md'], unreadable: false });
+  });
+
+  test.each([
+    ['a header with no path', '*** Add File:'],
+    ['a header with no space before the path', '*** Add File:a.txt'],
+    ['a header in another letter case', '*** add file: a.txt'],
+    ['a move header in another letter case', '*** Move To: a.txt'],
+    ['an indented near-miss', '   *** DELETE FILE: a.txt'],
+    ['an environment header', '*** Environment ID: other-machine'],
+  ])('%s makes the patch unreadable', (_label, line) => {
+    const reading = readPatchTargets(
+      patch('*** Begin Patch', '*** Add File: ok.txt', '+x', line, '*** End Patch')
+    );
+
+    expect(reading).toEqual({ targets: ['ok.txt'], unreadable: true });
+  });
+
+  // The two parsers disagree on these characters. Codex keeps a bare carriage
+  // return inside a path (it wrote `ok\r/../../out.txt` outside the working
+  // directory) where Copilot ends the line; Codex trims U+0085 where Copilot
+  // does not, and the reverse for U+FEFF. A line that could be a header under
+  // either reading is not guessed at.
+  test.each([
+    ['a bare carriage return inside a path', '*** Add File: ok\r/../../out.txt'],
+    ['a bare carriage return before a header', '+hi\r*** Add File: ../out.txt'],
+    ['a next-line character before a header', '\u0085*** Add File: a.txt'],
+    ['a byte-order mark before a header', '\uFEFF*** Add File: a.txt'],
+    ['a line separator before a header', '+hi\u2028*** Add File: ../out.txt'],
+    ['a null byte in a path', '*** Add File: a\0.txt'],
+  ])('%s makes the patch unreadable and names no guessed path', (_label, line) => {
+    const reading = readPatchTargets(patch('*** Begin Patch', line, '+x', '*** End Patch'));
+
+    expect(reading).toEqual({ targets: [], unreadable: true });
+  });
+
+  test('markdown emphasis and rules in content do not make a patch unreadable', () => {
+    expect(
+      readPatchTargets(
+        patch(
+          '*** Begin Patch',
+          '*** Update File: README.md',
+          '@@',
+          ' ***',
+          ' ***bold and italic***',
+          '-old',
+          '+new',
+          '*** End of File',
+          '*** End Patch'
+        )
+      )
+    ).toEqual({ targets: ['README.md'], unreadable: false });
+  });
+
+  test('text that is not a patch names nothing and is not unreadable', () => {
+    expect(readPatchTargets('echo hi')).toEqual({ targets: [], unreadable: false });
   });
 });

@@ -18,6 +18,7 @@ export {
   NOUL_THRESHOLD_BOUNDS,
   REPEATED_DENIALS_RULE_ID,
   SCORE_THRESHOLD_BOUNDS,
+  UNRECORDED_DECISION_RULE_ID,
 } from './gate';
 export type {
   EscalationLevel,

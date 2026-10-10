@@ -228,8 +228,27 @@ describe('redactText: the scan limit', () => {
 
   test('stays fast on text built to make the rules backtrack', () => {
     const started = performance.now();
-    for (const unit of ['a://a:', 'mysql ', 'x=', 'note: ', '-u a:']) {
+    for (const unit of [
+      ...['a://a:', 'mysql ', 'x=', 'note: ', '-u a:'],
+      // The prefix of every later rule, each a start the rule has to give up on.
+      ...[String.raw`password:\"`, String.raw`password:\"x `, String.raw`{\"a\":`, '\\', '\\"'],
+      ...[String.raw`password:\\\'`, 'password:"', 'pgpassword=', 'authtoken '],
+      ...['gh secret set ', 'gh secret set x --body', '--body ', ' -b '],
+      ...['--proxy-user a:', '-U a:', 'az ', 'az -p', 'zip ', 'unzip -P', '7z ', '7z -p '],
+      ...['ldapsearch ', 'ldapsearch -w', 'ssh-keygen ', 'ssh-keygen -N', ' -N ', ' -P ', ' -w '],
+    ]) {
       redactText(unit.repeat(20_000), { credentialValues: [], cap: 200 });
+    }
+    expect(performance.now() - started).toBeLessThan(3_000);
+  });
+
+  test('stays fast on a huge argument list', () => {
+    const started = performance.now();
+    for (const unit of [['-p'], ['--token'], ['az', '-p'], ['-u', 'a:'], ['--body=', '-b']]) {
+      redactInput(
+        { args: Array.from({ length: 20_000 }, (_, index) => unit[index % unit.length]) },
+        { credentialValues: [], cap: 200 }
+      );
     }
     expect(performance.now() - started).toBeLessThan(3_000);
   });
@@ -283,5 +302,298 @@ describe('isSecretKey', () => {
     ...['author', 'OAUTH_CALLBACK_URL', 'bypass_cache', 'passenger_count', 'PORT'],
   ])('%s does not', name => {
     expect(isSecretKey(name)).toBe(false);
+  });
+
+  test.each([
+    ...['PGPASSWORD', 'pgpassword', 'authtoken', 'MYSECRET', 'mysecret', 'DBPASSWORD'],
+    ...['NPM_AUTHTOKEN', 'dbpasswd', 'gcpcredentials', 'myapikey', 'PGPASSWORD_FILE'],
+    ...['SSHKEY', 'sshkey', 'STRIPEKEY', 'DEPLOY_SIGNINGKEY', 'licensekey'],
+  ])('item 2: %s runs its words together and still names a secret', name => {
+    expect(isSecretKey(name)).toBe(true);
+  });
+
+  test.each([
+    ...['turkey', 'hockey', 'whiskey', 'donkey', 'jockey', 'hotkey', 'HOTKEY', 'MONKEY'],
+    ...['tokens', 'PASSWORDLESS_LOGIN', 'secretary', 'SSHKEY_COUNT', 'compass', 'OAUTH'],
+  ])('item 2: %s only resembles one', name => {
+    expect(isSecretKey(name)).toBe(false);
+  });
+});
+
+describe('item 1: JSON with backslash-escaped quotes', () => {
+  test.each([
+    [String.raw`curl -d "{\"password\":\"escaped-json-1\"}" https://api.example.com`, 'json-1'],
+    [String.raw`curl -d "{\"user\":\"sam\",\"apiKey\": \"escaped-json-2\"}" u`, 'json-2'],
+    [String.raw`curl -d "{\"password\":\"two words-3\"}" u`, 'words-3'],
+    [String.raw`curl -d "{\"password\":\"two words-3\"}" u`, 'two'],
+    [String.raw`curl -d "{\"password\":\"inner\\\"quote-4\"}" u`, 'quote-4'],
+    [String.raw`curl -d "{\"retries\":0,\"token\":escaped5bare}" u`, 'escaped5bare'],
+    [String.raw`echo "{\\\"password\\\":\\\"twice-escaped-6\\\"}"`, 'escaped-6'],
+    [String.raw`python -c 'print({\'password\': \'single-escaped-7\'})'`, 'escaped-7'],
+    [String.raw`{\"password\":\"cut-off-8`, 'cut-off-8'],
+    ['{"password": "cut-off-9', 'cut-off-9'],
+  ])('%s', (text, secret) => {
+    const out = redact(text);
+    expect(out).not.toContain(secret);
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('masks only the value and keeps what follows it', () => {
+    const out = redact(
+      String.raw`curl -d "{\"password\":\"escaped-json-10\",\"user\":\"sam\"}" https://api.example.com`
+    );
+    expect(out).toBe(
+      String.raw`curl -d "{\"password\":[REDACTED],\"user\":\"sam\"}" https://api.example.com`
+    );
+  });
+
+  test('an escaped quote left open ends where the argument around it ends', () => {
+    const out = redact(
+      String.raw`echo "{\"password\":\"cut-off-12" && curl -d "{\"user\":\"sam\"}" https://api.example.com`
+    );
+    expect(out).not.toContain('cut-off-12');
+    expect(out).toContain(String.raw`&& curl -d "{\"user\":\"sam\"}" https://api.example.com`);
+  });
+
+  test('a harmless escaped key is left alone', () => {
+    const text = String.raw`curl -d "{\"user\":\"sam\",\"retries\":3}" https://api.example.com`;
+    expect(redact(text)).toBe(text);
+  });
+
+  test('redactInput masks it inside a command string', () => {
+    const out = redactInput(
+      { command: String.raw`curl -d "{\"password\":\"escaped-json-11\"}" https://api.example.com` },
+      WIDE
+    );
+    expect(out).not.toContain('escaped-json-11');
+    expect(out).toContain('api.example.com');
+  });
+});
+
+describe('item 2: secret names that run their words together', () => {
+  test.each([
+    ['PGPASSWORD=run-together-1 psql -h db app', 'run-together-1'],
+    ['pgpassword=run-together-2', 'run-together-2'],
+    ['authtoken: run-together-3', 'run-together-3'],
+    ['MYSECRET=run-together-4 ./deploy', 'run-together-4'],
+    ['DBPASSWORD="run together-5"', 'together-5'],
+    ['SSHKEY=run-together-6', 'run-together-6'],
+    ['{"authtoken": "run-together-7"}', 'run-together-7'],
+  ])('%s', (text, secret) => {
+    const out = redact(text);
+    expect(out).not.toContain(secret);
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test.each(['monkey=banana', 'hotkey: ctrl+k', 'MAX_TOKENS=4096', 'TOKENIZERS_PARALLELISM=false'])(
+    'leaves %s alone',
+    text => {
+      expect(redact(text)).toBe(text);
+    }
+  );
+});
+
+describe('item 3: the body of gh secret set', () => {
+  test.each([
+    ['gh secret set DEPLOY --body gh-body-1', 'gh-body-1'],
+    ['gh secret set DEPLOY --body "gh body-2"', 'body-2'],
+    ['gh secret set DEPLOY --body=gh-body-3', 'gh-body-3'],
+    ['gh secret set DEPLOY -b gh-body-4 --repo acme/app', 'gh-body-4'],
+    ['gh secret set DEPLOY -bgh-body-5', 'gh-body-5'],
+    ['gh secret set DEPLOY --org acme --visibility all --body gh-body-6', 'gh-body-6'],
+    ['gh  secret   set DEPLOY -b"gh body-7"', 'body-7'],
+  ])('%s', (text, secret) => {
+    expect(redact(text)).not.toContain(secret);
+  });
+
+  test('keeps the secret name and the flags after the body', () => {
+    expect(redact('gh secret set DEPLOY -b gh-body-8 --repo acme/app')).toBe(
+      'gh secret set DEPLOY -b [REDACTED] --repo acme/app'
+    );
+  });
+
+  test.each([
+    'gh variable set REGION --body us-east-1',
+    'gh variable set REGION -b us-east-1',
+    'gh pr create --title fix --body "plain text"',
+    'gh issue comment 12 -b "plain text"',
+    'gh secret list; gh pr comment 3 --body done',
+  ])('leaves %s alone', text => {
+    expect(redact(text)).toBe(text);
+  });
+});
+
+describe('item 4: proxy credentials', () => {
+  test.each([
+    ['curl --proxy-user proxy:proxy-pass-1 https://api.example.com', 'proxy-pass-1'],
+    ['curl --proxy-user=proxy:proxy-pass-2 https://api.example.com', 'proxy-pass-2'],
+    ['curl -U proxy:proxy-pass-3 -x http://proxy.internal:8080 u', 'proxy-pass-3'],
+  ])('%s', (text, secret) => {
+    expect(redact(text)).not.toContain(secret);
+  });
+
+  test('masks the part after the colon, as -u does', () => {
+    expect(redact('curl --proxy-user proxy:proxy-pass-4 https://api.example.com')).toBe(
+      'curl --proxy-user proxy:[REDACTED] https://api.example.com'
+    );
+  });
+
+  test('a -U flag without a colon is left alone', () => {
+    expect(redact('psql -U postgres -h db app')).toBe('psql -U postgres -h db app');
+    expect(redact('pip install -U requests')).toBe('pip install -U requests');
+  });
+});
+
+describe('item 5: password flags that belong to one command', () => {
+  test.each([
+    ['az login --service-principal -u app-id -p az-pass-1 --tenant t', 'az-pass-1'],
+    ['az login -u me --password az-pass-2', 'az-pass-2'],
+    ['az acr login -n registry -p "az pass-3"', 'pass-3'],
+    ['/usr/bin/az login -u me -p=az-pass-4', 'az-pass-4'],
+    ['zip -P zip-pass-5 -r out.zip dir', 'zip-pass-5'],
+    ['zip -r -P "zip pass-6" out.zip dir', 'pass-6'],
+    ['unzip -P zip-pass-7 out.zip', 'zip-pass-7'],
+    ['7z a -p7z-pass-8 out.7z dir', '7z-pass-8'],
+    ['7za x out.7z -p7z-pass-9 -o/tmp/out', '7z-pass-9'],
+    ['7z a -p"7z pass-10" out.7z dir', 'pass-10'],
+    ['ldapsearch -x -D cn=admin,dc=example -w ldap-pass-11 -b dc=example', 'ldap-pass-11'],
+    ['ldapmodify -D cn=admin -w ldap-pass-12 -f change.ldif', 'ldap-pass-12'],
+    ['ssh-keygen -t ed25519 -N keygen-pass-13 -f id', 'keygen-pass-13'],
+    ['ssh-keygen -p -P keygen-old-14 -N keygen-new-15 -f id', 'keygen-old-14'],
+    ['ssh-keygen -p -P keygen-old-14 -N keygen-new-15 -f id', 'keygen-new-15'],
+    ['ssh-keygen -p -N keygen-new-16 -P keygen-old-17 -f id', 'keygen-new-16'],
+    ['ssh-keygen -p -N keygen-new-16 -P keygen-old-17 -f id', 'keygen-old-17'],
+    ["ssh-keygen -N 'keygen pass-18' -f id", 'pass-18'],
+  ])('%s', (text, secret) => {
+    const out = redact(text);
+    expect(out).not.toContain(secret);
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('keeps the arguments around the password', () => {
+    expect(redact('az login -u app-id -p az-pass-19 --tenant t')).toBe(
+      'az login -u app-id -p [REDACTED] --tenant t'
+    );
+    expect(redact('zip -P zip-pass-20 -r out.zip dir')).toBe('zip -P [REDACTED] -r out.zip dir');
+    expect(redact('7z a -p7z-pass-21 out.7z dir')).toBe('7z a -p[REDACTED] out.7z dir');
+    expect(redact('ldapsearch -w ldap-pass-22 -b dc=example')).toBe(
+      'ldapsearch -w [REDACTED] -b dc=example'
+    );
+    expect(redact('ssh-keygen -N keygen-pass-23 -f id')).toBe('ssh-keygen -N [REDACTED] -f id');
+  });
+
+  test.each([
+    'ssh -p 22 host',
+    'wget -P downloads https://example.com/a',
+    'wget https://example.com/out.zip -P downloads',
+    'zip -r out.zip dir && wget -P downloads https://example.com/a',
+    'zip -r out.zip dir; cp -P a b',
+    'az group list | xargs mkdir -p out',
+    'gzip -9 file\nmkdir -p build/out',
+    'az group list\nmkdir -p build/out',
+    'azcopy copy src dst -p 8',
+    'grep -w word file',
+    'tar -N 2024-01-01 -cf out.tar dir',
+    'ssh-keygen -l -f id.pub',
+    '7z a -p out.7z dir',
+    'scp -P 2222 file host:',
+    'ldapsearch -W -x -b dc=example',
+  ])('leaves %s alone', text => {
+    expect(redact(text)).toBe(text);
+  });
+});
+
+describe('item 6: name/value pairs in another letter case', () => {
+  test('the pair is found whatever the case of its field names', () => {
+    const out = redactInput(
+      {
+        env: [
+          { Name: 'DB_PASSWORD', Value: 'pair-case-1' },
+          { KEY: 'API_TOKEN', VALUE: 'pair-case-2' },
+          { Key: 'SMTP_PASS', value: 'pair-case-3' },
+          { Name: 'PORT', Value: '8080' },
+          { KEY: 'REGION', VALUE: 'us-east-1' },
+        ],
+      },
+      WIDE
+    );
+    for (const secret of ['pair-case-1', 'pair-case-2', 'pair-case-3']) {
+      expect(out).not.toContain(secret);
+    }
+    expect(out).toContain('DB_PASSWORD');
+    expect(out).toContain('8080');
+    expect(out).toContain('us-east-1');
+  });
+});
+
+describe('item 7: argument lists', () => {
+  function redactArgs(args: unknown[]): string {
+    return redactInput({ args }, WIDE);
+  }
+
+  test.each<[unknown[], string]>([
+    [['--token', 'array-value-1', '--verbose'], 'array-value-1'],
+    [['tool', '--api-key', 'array value-2'], 'value-2'],
+    [['tool', '--api-key', 'array value-2'], 'array'],
+    [['az', 'login', '-u', 'app-id', '-p', 'array-value-3'], 'array-value-3'],
+    [['docker', 'login', '-p', 'array-value-4', 'registry.example.com'], 'array-value-4'],
+    [['sshpass', '-p', 'array-value-5', 'ssh', '-p', '22', 'host'], 'array-value-5'],
+    [['gh', 'secret', 'set', 'DEPLOY', '--body', 'array value-6'], 'value-6'],
+    [['sudo', '-E', 'gh', 'secret', 'set', 'DEPLOY', '--body', 'array-value-16'], 'array-value-16'],
+    [
+      ['az', 'acr', 'login', '-n', 'registry', '-u', 'me', '-g', 'rg', '-p', 'array-value-17'],
+      '17',
+    ],
+    [['curl', '-u', 'deploy:array-value-7', 'https://api.example.com'], 'array-value-7'],
+    [['curl', '--proxy-user', 'proxy:array value-8'], 'value-8'],
+    [['mysql', '-uroot', '-parray-value-9', 'app'], 'array-value-9'],
+    [['7z', 'a', '-parray value-10', 'out.7z'], 'value-10'],
+    [['tool', '--password=array value-11'], 'value-11'],
+    [['zip', '-P', 'array-value-12', 'out.zip'], 'array-value-12'],
+    [['ssh-keygen', '-N', 'array-value-13', '-P', 'array-value-14'], 'array-value-13'],
+    [['ssh-keygen', '-N', 'array-value-13', '-P', 'array-value-14'], 'array-value-14'],
+    [['ldapsearch', '-x', '-w', 'array-value-15'], 'array-value-15'],
+    [['tool', '--pin-token', 15_161_718], '15161718'],
+    [[['nested', '--secret', 'array-value-19']], 'array-value-19'],
+  ])('%j', (args, secret) => {
+    const out = redactArgs(args);
+    expect(out).not.toContain(secret);
+    expect(out).toContain('[REDACTED]');
+  });
+
+  test('keeps the arguments around the secret', () => {
+    expect(redactArgs(['--token', 'array-value-20', '--verbose'])).toBe(
+      '{"args":["--token","[REDACTED]","--verbose"]}'
+    );
+    expect(redactArgs(['sshpass', '-p', 'array-value-21', 'ssh', '-p', '22', 'host'])).toBe(
+      '{"args":["sshpass","-p","[REDACTED]","ssh","-p","22","host"]}'
+    );
+    expect(redactArgs(['curl', '-u', 'deploy:array-value-22', 'https://api.example.com'])).toBe(
+      '{"args":["curl","-u","deploy:[REDACTED]","https://api.example.com"]}'
+    );
+    expect(redactArgs(['mysql', '-uroot', '-parray-value-23', 'app'])).toBe(
+      '{"args":["mysql","-uroot","-p[REDACTED]","app"]}'
+    );
+  });
+
+  test.each<[unknown[]]>([
+    [['mkdir', '-p', 'build/out']],
+    [['ssh', '-p', '22', 'host']],
+    [['wget', '-P', 'downloads', 'https://example.com/a']],
+    [['git', 'push', '-u', 'origin', 'feature/login']],
+    [['grep', '-w', 'word', 'file']],
+    [['tool', '--verbose', 'plain-word']],
+    [['gh', 'variable', 'set', 'REGION', '--body', 'us-east-1']],
+    [['- first line', 'second line']],
+    [['tool', '--port', 8080]],
+  ])('leaves %j alone', args => {
+    expect(redactArgs(args)).toBe(JSON.stringify({ args }));
+  });
+
+  test('a flag after a secret flag is kept, as the text rule keeps it', () => {
+    expect(redact('tool --no-auth --force')).toBe('tool --no-auth --force');
+    expect(redactArgs(['tool', '--no-auth', '--force'])).toBe(
+      '{"args":["tool","--no-auth","--force"]}'
+    );
   });
 });

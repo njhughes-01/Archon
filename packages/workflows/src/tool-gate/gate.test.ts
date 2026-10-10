@@ -6,12 +6,13 @@ import { describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { trackTempRoots } from '@archon/paths/test-utils';
+import { captureLogLines, trackTempRoots } from '@archon/paths/test-utils';
 import type { ToolActionRequest } from '@archon/providers/types';
 import {
   createToolGate,
   createToolGateCache,
   DEFAULT_MAX_DENIALS_PER_NODE,
+  DENY_RULES,
   DEFAULT_NOUL_THRESHOLD,
   DEFAULT_SCORE_THRESHOLD,
   ESCALATION_LEVELS,
@@ -20,6 +21,7 @@ import {
   NOUL_THRESHOLD_BOUNDS,
   REPEATED_DENIALS_RULE_ID,
   SCORE_THRESHOLD_BOUNDS,
+  UNRECORDED_DECISION_RULE_ID,
   type ToolGate,
   type ToolGateDecisionEvent,
   type ToolGateEscalationRequest,
@@ -493,6 +495,27 @@ describe('repeated denials in one node', () => {
     });
   });
 
+  test('a new attempt of the same step is a new gate: its count starts at zero and the run cache still answers', async () => {
+    const cache = createToolGateCache();
+    const first = harness(answer(3, 1), { maxDenialsPerNode: 2, cache });
+    await first.gate(shell(ESCALATED, first.root));
+    await first.gate(shell(DENIED_BY_RULE, first.root));
+    expect(await first.gate(shell(DENIED_BY_RULE, first.root))).toMatchObject({
+      ruleId: REPEATED_DENIALS_RULE_ID,
+    });
+    expect(first.calls).toHaveLength(1);
+
+    const next = harness(answer(3, 1), { maxDenialsPerNode: 2, cache, repoRoot: first.root });
+    expect(await next.gate(shell(DENIED_BY_RULE, first.root))).toMatchObject({
+      ruleId: 'deny.git_reset_hard',
+    });
+    const escalated = await next.gate(shell(ESCALATED, first.root));
+    expect(escalated).toMatchObject({ action: 'deny', needsApproval: true });
+    expect(escalated).not.toMatchObject({ ruleId: REPEATED_DENIALS_RULE_ID });
+    // The classifier's answer belongs to the run, not to the attempt.
+    expect(next.calls).toHaveLength(0);
+  });
+
   test('the default limit is a positive whole number', () => {
     expect(Number.isInteger(DEFAULT_MAX_DENIALS_PER_NODE)).toBe(true);
     expect(DEFAULT_MAX_DENIALS_PER_NODE).toBeGreaterThan(0);
@@ -647,9 +670,12 @@ describe('identical calls made at the same time', () => {
         if (fail) throw new Error('store is down');
       },
     });
-    const batch = [h.gate(shell(ALLOWED, h.root)), h.gate(shell(ALLOWED, h.root))];
-    const settled = await Promise.allSettled(batch);
-    expect(settled.map(result => result.status)).toEqual(['rejected', 'rejected']);
+    const batch = await Promise.all([
+      h.gate(shell(ALLOWED, h.root)),
+      h.gate(shell(ALLOWED, h.root)),
+    ]);
+    expect(batch.map(decision => decision.action)).toEqual(['deny', 'deny']);
+    expect(batch[0]).toMatchObject({ ruleId: UNRECORDED_DECISION_RULE_ID });
     fail = false;
     expect(await h.gate(shell(ALLOWED, h.root))).toEqual({ action: 'allow' });
   });
@@ -719,6 +745,98 @@ describe('a request the gate cannot read', () => {
       });
     }
   );
+
+  const PLANTED = 'planted-raw-content-0123456789';
+  test.each<[string, Record<string, unknown>]>([
+    ['no input', { input: undefined }],
+    ['a null input', { input: null }],
+    ['an input that is not an object', { input: 7 }],
+    ['an input that is a list', { input: [PLANTED] }],
+    ['a command that is not text', { command: 10n }],
+    ['a command that is an object', { command: { run: PLANTED } }],
+    ['paths that are one string', { paths: `${PLANTED} b` }],
+    ['paths holding something that is not text', { paths: ['a.txt', 5] }],
+    ['a working directory that is not text', { cwd: 5 }],
+    ['a tool name that is not text', { toolName: 1 }],
+    ['a URL that is not text', { url: 1 }],
+    // Spread as text, this would have been read one character at a time.
+    ['parsed commands that are one string', { parsedCommands: 'ls' }],
+    ['parsed commands holding something that is not text', { parsedCommands: [PLANTED, 3] }],
+  ])(
+    '%s is denied by rule and recorded once, with nothing of the request in the record',
+    async (_name, fields) => {
+      const h = harness(CALM);
+      const request = {
+        ...shell(ALLOWED, h.root),
+        input: { command: PLANTED },
+        ...fields,
+      } as unknown as ToolActionRequest;
+      const decision = await h.gate(request);
+
+      const rule = DENY_RULES['deny.unreadable_request'];
+      expect(decision).toMatchObject({
+        action: 'deny',
+        needsApproval: false,
+        ruleId: 'deny.unreadable_request',
+        alternatives: rule.alternatives,
+      });
+      if (decision.action !== 'deny') throw new Error('unreachable');
+      expect(decision.reason.startsWith(rule.reason)).toBe(true);
+      expect(h.calls).toHaveLength(0);
+      expect(h.records).toHaveLength(1);
+      const tool = typeof fields.toolName === 'number' ? 'unknown' : 'Bash';
+      expect(h.records[0]).toMatchObject({
+        tool,
+        kind: 'other',
+        decision: 'deny',
+        needsApproval: false,
+        source: 'rule',
+        ruleId: 'deny.unreadable_request',
+        count: 1,
+      });
+      expect(h.records[0]?.commandHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(h.records[0]?.redactedPreview).toContain(tool);
+      const recorded = JSON.stringify(h.records);
+      expect(recorded).not.toContain(PLANTED);
+      expect(recorded).not.toContain(ALLOWED);
+    }
+  );
+
+  test.each([[null], [undefined], ['Bash'], [3]])(
+    'a request that is not an object at all (%p) is denied and recorded',
+    async request => {
+      const h = harness(CALM);
+      const decision = await h.gate(request as unknown as ToolActionRequest);
+      expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.unreadable_request' });
+      expect(h.records).toHaveLength(1);
+      expect(h.records[0]).toMatchObject({
+        tool: 'unknown',
+        kind: 'other',
+        ruleId: 'deny.unreadable_request',
+      });
+    }
+  );
+
+  test('a tool name is all an unreadable request is recorded by, masked and capped like any recorded text', async () => {
+    const secret = 'gho_engineInjectedCredential0123456789';
+    const h = harness(CALM, { credentialValues: [secret] });
+    const request = {
+      ...shell(ALLOWED, h.root),
+      toolName: `${secret}${'t'.repeat(2_000)}`,
+      input: undefined,
+    } as unknown as ToolActionRequest;
+    await h.gate(request);
+    const recorded = JSON.stringify(h.records);
+    expect(recorded).not.toContain(secret);
+    expect(recorded.length).toBeLessThan(2_000);
+  });
+
+  test('an unreadable request counts toward the repeated-denial guard like any denial', async () => {
+    const h = harness(CALM, { maxDenialsPerNode: 1 });
+    const request = { ...shell(ALLOWED, h.root), input: null } as unknown as ToolActionRequest;
+    await h.gate(request);
+    expect(await h.gate(request)).toMatchObject({ ruleId: REPEATED_DENIALS_RULE_ID });
+  });
 });
 
 describe('records', () => {
@@ -749,13 +867,22 @@ describe('records', () => {
     ]);
   });
 
-  test('a record sink that throws fails the call instead of losing the audit trail', async () => {
+  test('a record sink that throws denies the call instead of losing the audit trail', async () => {
     const h = harness(CALM, {
       record: () => {
         throw new Error('store is down');
       },
     });
-    await expect(h.gate(shell(ALLOWED, h.root))).rejects.toThrow('store is down');
+    const decision = await h.gate(shell(ALLOWED, h.root));
+    expect(decision).toMatchObject({
+      action: 'deny',
+      needsApproval: true,
+      ruleId: UNRECORDED_DECISION_RULE_ID,
+    });
+    if (decision.action !== 'deny') throw new Error('unreachable');
+    expect(decision.reason).toContain('could not be recorded');
+    // What went wrong in the store is not the agent's to read.
+    expect(JSON.stringify(decision)).not.toContain('store is down');
   });
 
   test('an async record sink is waited for before the call is answered', async () => {
@@ -771,7 +898,7 @@ describe('records', () => {
     expect(order).toEqual(['recorded', 'answered']);
   });
 
-  test('an async record sink that rejects fails the call, like a throw: never an allow, never unhandled', async () => {
+  test('an async record sink that rejects denies the call, like a throw: never an allow, never unhandled', async () => {
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown): void => {
       unhandled.push(reason);
@@ -779,12 +906,161 @@ describe('records', () => {
     process.on('unhandledRejection', onUnhandled);
     try {
       const h = harness(CALM, { record: () => Promise.reject(new Error('store is down')) });
-      await expect(h.gate(shell(ALLOWED, h.root))).rejects.toThrow('store is down');
+      const decision = await h.gate(shell(ALLOWED, h.root));
+      expect(decision).toMatchObject({
+        action: 'deny',
+        needsApproval: true,
+        ruleId: UNRECORDED_DECISION_RULE_ID,
+      });
+      expect(JSON.stringify(decision)).not.toContain('store is down');
       await new Promise(resolve => setTimeout(resolve, 10));
       expect(unhandled).toEqual([]);
     } finally {
       process.off('unhandledRejection', onUnhandled);
     }
+  });
+
+  test('a classifier allow that could not be recorded is denied too', async () => {
+    const h = harness(CALM, { record: () => Promise.reject(new Error('store is down')) });
+    expect(await h.gate(shell(ESCALATED, h.root))).toMatchObject({
+      action: 'deny',
+      needsApproval: true,
+      ruleId: UNRECORDED_DECISION_RULE_ID,
+    });
+  });
+
+  test('a call that was already denied stays that denial when its record fails', async () => {
+    const recorded = harness(CALM);
+    const unrecorded = harness(CALM, {
+      repoRoot: recorded.root,
+      record: () => Promise.reject(new Error('store is down')),
+    });
+    const request = shell(DENIED_BY_RULE, recorded.root);
+    const decision = await unrecorded.gate(request);
+    expect(decision).toMatchObject({ needsApproval: false, ruleId: 'deny.git_reset_hard' });
+    expect(decision).toEqual(await recorded.gate(request));
+  });
+
+  test('a record failure is logged once, by the name of the error, without its text or the command', async () => {
+    class StoreDown extends Error {
+      override name = 'StoreDown';
+    }
+    const logs = captureLogLines();
+    try {
+      const h = harness(CALM, {
+        record: () => Promise.reject(new StoreDown('insert failed for row planted-row-text')),
+      });
+      await h.gate(shell(ALLOWED, h.root));
+      const failures = logs.lines.filter(line => line.msg === 'tool_gate.decision_record_failed');
+      expect(failures).toHaveLength(1);
+      expect(failures[0]).toMatchObject({ errorName: 'StoreDown' });
+      const logged = JSON.stringify(logs.lines);
+      expect(logged).not.toContain('planted-row-text');
+      expect(logged).not.toContain(ALLOWED);
+    } finally {
+      logs.restore();
+    }
+  });
+
+  test('a sink that fails with something that is not an error is still a denial', async () => {
+    const h = harness(CALM, {
+      record: () => Promise.reject('store is down'),
+    });
+    const decision = await h.gate(shell(ALLOWED, h.root));
+    expect(decision).toMatchObject({ action: 'deny', ruleId: UNRECORDED_DECISION_RULE_ID });
+    expect(JSON.stringify(decision)).not.toContain('store is down');
+  });
+
+  test('calls denied because they could not be recorded count toward the repeated-denial guard', async () => {
+    const h = harness(CALM, {
+      maxDenialsPerNode: 1,
+      record: () => Promise.reject(new Error('store is down')),
+    });
+    expect(await h.gate(shell(ALLOWED, h.root))).toMatchObject({
+      ruleId: UNRECORDED_DECISION_RULE_ID,
+    });
+    const second = await h.gate(shell('git diff', h.root));
+    expect(second).toMatchObject({ action: 'deny', ruleId: REPEATED_DENIALS_RULE_ID });
+    if (second.action !== 'deny') throw new Error('unreachable');
+    expect(second.reason).toContain(UNRECORDED_DECISION_RULE_ID);
+  });
+});
+
+// A provider's shell may keep its working directory between calls, and the gate
+// is told only the directory each request reports.
+describe('a shell that may be standing outside the root', () => {
+  const LEAVE = 'cd ..';
+  const RELATIVE_WRITE = 'echo hi > notes.txt';
+  const BY_RULE = { decision: 'allow', source: 'rule' } as const;
+
+  test('control: a relative write from the root is allowed by rule', async () => {
+    const h = harness(CALM);
+    await h.gate(shell(RELATIVE_WRITE, h.root));
+    expect(h.records.at(-1)).toMatchObject(BY_RULE);
+  });
+
+  test.each([
+    ['the classifier', true],
+    ['nobody, no classifier being configured', false],
+  ])(
+    'once a call that leaves the root was allowed by %s, a later relative path is no longer placed by the reported directory',
+    async (_who, classifierConfigured) => {
+      const h = harness(CALM, { classifierConfigured });
+      expect(await h.gate(shell(LEAVE, h.root))).toEqual({ action: 'allow' });
+      expect(h.records.at(-1)).toMatchObject({ ruleId: 'risk.cwd_outside_root' });
+
+      const later = await h.gate(shell(RELATIVE_WRITE, h.root));
+      expect(h.records.at(-1)).not.toMatchObject(BY_RULE);
+      expect(later).toMatchObject({ action: 'deny' });
+      // A call that names no path is judged as before.
+      await h.gate(shell(ALLOWED, h.root));
+      expect(h.records.at(-1)).toMatchObject(BY_RULE);
+    }
+  );
+
+  test('a call that leaves the root and was denied did not run: nothing changes', async () => {
+    const h = harness(answer(3, 1));
+    expect(await h.gate(shell(LEAVE, h.root))).toMatchObject({ action: 'deny' });
+    await h.gate(shell(RELATIVE_WRITE, h.root));
+    expect(h.records.at(-1)).toMatchObject(BY_RULE);
+  });
+
+  test('nor does one whose allow could not be recorded', async () => {
+    let fail = true;
+    const records: ToolGateDecisionEvent[] = [];
+    const h = harness(CALM, {
+      record: event => {
+        if (fail) throw new Error('store is down');
+        records.push(event);
+      },
+    });
+    expect(await h.gate(shell(LEAVE, h.root))).toMatchObject({ action: 'deny' });
+    fail = false;
+    await h.gate(shell(RELATIVE_WRITE, h.root));
+    expect(records.at(-1)).toMatchObject(BY_RULE);
+  });
+
+  test('a file-writing tool reports its own directory and is judged by it', async () => {
+    const h = harness(CALM);
+    await h.gate(shell(LEAVE, h.root));
+    const write: ToolActionRequest = {
+      toolName: 'Write',
+      kind: 'file_write',
+      cwd: h.root,
+      paths: ['notes.txt'],
+      input: {},
+    };
+    expect(await h.gate(write)).toEqual({ action: 'allow' });
+    expect(h.records.at(-1)).toMatchObject(BY_RULE);
+  });
+
+  test('a new attempt starts in the directory it reports: the next gate trusts it again', async () => {
+    const cache = createToolGateCache();
+    const first = harness(CALM, { cache });
+    await first.gate(shell(LEAVE, first.root));
+    const next = harness(CALM, { cache, repoRoot: first.root });
+    await next.gate(shell(RELATIVE_WRITE, first.root));
+    expect(next.records.at(-1)).toMatchObject(BY_RULE);
   });
 });
 

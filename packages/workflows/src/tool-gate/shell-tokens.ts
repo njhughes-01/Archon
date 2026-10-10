@@ -152,6 +152,8 @@ export interface ParsedShell {
   opaque: OpaqueKind[];
   /** For each scope, the scope that encloses it; `undefined` for the outermost. */
   scopeParents: (number | undefined)[];
+  /** The script exceeded the reading budget and was not read to the end. */
+  overBudget: boolean;
 }
 
 /** A word's text with `~` and `$HOME` resolved, and whether the rest of it is knowable. */
@@ -176,20 +178,58 @@ export const SHELL_INTERPRETERS: ReadonlySet<string> = new Set([
 /** Variables that name the user's shell: `curl x | $SHELL` runs a shell. */
 const SHELL_VARIABLES: ReadonlySet<string> = new Set(['$SHELL', '${SHELL}', '$BASH', '${BASH}']);
 
+/** Programs that run code given on their command line or stdin. */
+export const CODE_INTERPRETERS: ReadonlySet<string> = new Set([
+  ...['python', 'python2', 'python3', 'perl', 'ruby', 'node', 'nodejs', 'php', 'deno', 'bun'],
+  ...['pwsh', 'powershell', 'tclsh', 'wish', 'lua', 'luajit', 'Rscript', 'osascript', 'tsx'],
+]);
+
 /** Commands that only read a heredoc as data. Fed to anything else, a heredoc is opaque. */
 const HEREDOC_DATA_SINKS: ReadonlySet<string> = new Set(['cat', 'tee', 'wc', 'grep', 'jq']);
 
 /** How deep `-c` strings and substitution bodies are followed. */
 const MAX_NESTING = 5;
 
+/**
+ * The gate runs on the server's event loop, so reading a command has a fixed
+ * budget. A script past any of these is not read further and is reported as
+ * `overBudget`, which the rules deny: escalating it instead would let padding
+ * turn a denied command into an allowed one wherever no classifier is set up.
+ * A heredoc body that is only data costs one item whatever its size, up to the
+ * character limit.
+ */
+export const MAX_SCRIPT_CHARS = 262_144;
+/** Words, operators and redirections, counted across every nested script. */
+export const MAX_SCRIPT_ITEMS = 3_000;
+export const MAX_SCRIPT_COMMANDS = 400;
+export const MAX_GROUP_OPERATORS = 400;
+/** An arithmetic command longer than this is read as subshells, which only costs it a signal. */
+const MAX_ARITHMETIC_CHARS = 4_096;
+
 const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set(['-exec', '-execdir', '-ok', '-okdir']);
 
-export function resolveWord(word: ShellWord, homeDir: string): ResolvedWord {
+/** `$NAME` or `${NAME}`, nothing more: the only spellings a known variable is read from. */
+const PLAIN_VARIABLE = /^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$/;
+
+/**
+ * `variables` holds the values of variables the caller knows for certain (the
+ * run directories the engine itself exports). A word using one of them is as
+ * placeable as a literal; every other variable still makes the word dynamic.
+ */
+export function resolveWord(
+  word: ShellWord,
+  homeDir: string,
+  variables?: Readonly<Record<string, string>>
+): ResolvedWord {
   let text = '';
   let dynamic = false;
   let glob = false;
   for (const [index, part] of word.parts.entries()) {
-    if (part.kind === 'home') {
+    const named = part.kind === 'variable' ? PLAIN_VARIABLE.exec(part.text) : null;
+    const known = named === null ? undefined : variables?.[named[1] ?? named[2] ?? ''];
+    if (known !== undefined) {
+      text += known;
+    } else if (part.kind === 'home') {
       text += homeDir;
     } else if (part.kind === 'cwd') {
       // `$PWD` and `$PWD/x` are `.` and `./x`. Anywhere else (`a/$PWD`, `${PWD}x`)
@@ -381,10 +421,17 @@ function isWordBreak(ch: string | undefined): boolean {
  * Index of the bracket that closes the one opened just before `start`, or -1.
  * Quotes and backslashes inside are skipped so a `)` in a string does not close early.
  */
-function findClosing(text: string, start: number, open: string, close: string): number {
+function findClosing(
+  text: string,
+  start: number,
+  open: string,
+  close: string,
+  limit = text.length
+): number {
   let depth = 1;
   let i = start;
-  while (i < text.length) {
+  const end = Math.min(text.length, start + limit);
+  while (i < end) {
     const ch = text[i];
     if (ch === '\\') {
       i += 2;
@@ -416,6 +463,8 @@ function findClosing(text: string, start: number, open: string, close: string): 
 interface ScanResult {
   items: Item[];
   unterminated: boolean;
+  /** The text is too large, or too deeply grouped, to be read within the gate's time budget. */
+  overBudget: boolean;
 }
 
 function scan(text: string): ScanResult {
@@ -425,6 +474,11 @@ function scan(text: string): ScanResult {
   let word: WordBuilder | undefined;
   let pendingHeredocs: PendingHeredoc[] = [];
   let i = 0;
+  /** Up to here there is no `]` to close a bracket glob: saves looking again for each `[`. */
+  let noBracketBefore = 0;
+  /** `(` and `)` seen as operators. Past the budget the scan stops: see `MAX_GROUP_OPERATORS`. */
+  let groupOperators = 0;
+  let overBudget = text.length > MAX_SCRIPT_CHARS;
 
   const current = (): WordBuilder => {
     word ??= { parts: [], nested: [], quoted: false };
@@ -724,7 +778,7 @@ function scan(text: string): ScanResult {
     return first?.kind === 'literal' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(first.text);
   };
 
-  while (i < length) {
+  while (i < length && !overBudget) {
     const ch = text[i] ?? '';
     const next = text[i + 1];
     if (ch === '\\') {
@@ -788,10 +842,13 @@ function scan(text: string): ScanResult {
         pushOperator('|');
         i += next === '&' ? 2 : 1;
       }
+    } else if ((ch === '(' || ch === ')') && ++groupOperators > MAX_GROUP_OPERATORS) {
+      overBudget = true;
+      break;
     } else if (ch === '(' && next === '(' && word === undefined) {
       // `(( expr ))` is arithmetic when the inner bracket is closed by `))`;
       // otherwise it is two nested subshells.
-      const inner = findClosing(text, i + 2, '(', ')');
+      const inner = findClosing(text, i + 2, '(', ')', MAX_ARITHMETIC_CHARS);
       if (inner !== -1 && text[inner + 1] === ')') {
         addArithmetic(i, i + 2, inner, inner + 2);
         // A shell without `((` runs the same text as nested subshells: read it as commands too.
@@ -809,9 +866,14 @@ function scan(text: string): ScanResult {
     } else if (ch === '*' || ch === '?') {
       current().parts.push({ kind: 'glob', text: ch });
       i++;
+    } else if (ch === '[' && i < noBracketBefore) {
+      // An earlier `[` in this run already looked ahead and found no `]`.
+      addLiteral(ch);
+      i++;
     } else if (ch === '[') {
       let close = i + 1;
       while (!isWordBreak(text[close]) && text[close] !== ']') close++;
+      if (text[close] !== ']') noBracketBefore = close;
       if (text[close] === ']' && close > i + 1) {
         current().parts.push({ kind: 'glob', text: text.slice(i, close + 1) });
         i = close + 1;
@@ -849,7 +911,7 @@ function scan(text: string): ScanResult {
   flush();
   // A heredoc opened on the last line has no body at all.
   for (const heredoc of pendingHeredocs) heredoc.item.body = '';
-  return { items, unterminated };
+  return { items, unterminated, overBudget };
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,6 +1147,16 @@ function normalise(words: WordItem[], redirections: ShellRedirection[]): Normali
   };
   skipAssignments();
 
+  // Each word is rendered once however many wrappers look at it.
+  const rendered = new Map<WordItem, ItemWord>();
+  const itemWord = (item: WordItem): ItemWord => {
+    let cached = rendered.get(item);
+    if (cached === undefined) {
+      cached = toItemWord(item);
+      rendered.set(item, cached);
+    }
+    return cached;
+  };
   // No cap on depth: every pass removes at least the wrapper's own word, so this
   // ends, and a cap would be a place to hide a command behind.
   for (;;) {
@@ -1092,7 +1164,7 @@ function normalise(words: WordItem[], redirections: ShellRedirection[]): Normali
     const wrapper = name === undefined ? undefined : baseName(name);
     const spec = wrapper === undefined ? undefined : WRAPPERS[wrapper];
     if (wrapper === undefined || spec === undefined) break;
-    const following = rest.slice(1).map(toItemWord);
+    const following = rest.slice(1).map(itemWord);
     if (spec.lookup?.includes(following[0]?.text ?? '')) break;
 
     const options = leadingOptions(following, spec);
@@ -1185,7 +1257,8 @@ function normalise(words: WordItem[], redirections: ShellRedirection[]): Normali
 
   for (const redirection of redirections) {
     if (redirection.operator !== '<<' && redirection.operator !== '<<<') continue;
-    if (!HEREDOC_DATA_SINKS.has(head)) opaque.add('heredoc');
+    // A program handed to an interpreter is read by the rules like `-c` code is.
+    if (!HEREDOC_DATA_SINKS.has(head) && !CODE_INTERPRETERS.has(head)) opaque.add('heredoc');
   }
 
   return {
@@ -1232,6 +1305,9 @@ interface ParseState {
   opaque: Set<OpaqueKind>;
   nextPipeline: number;
   scopeParents: (number | undefined)[];
+  /** Items scanned so far, nested scripts included. */
+  items: number;
+  overBudget: boolean;
 }
 
 function openScope(state: ParseState, enclosing: number | undefined): number {
@@ -1335,7 +1411,13 @@ function parseInto(
   parent: number | undefined,
   parentVia: NestedVia | undefined
 ): void {
-  const { items, unterminated } = scan(text);
+  if (state.overBudget) return;
+  const { items, unterminated, overBudget } = scan(text);
+  state.items += items.length;
+  if (overBudget || state.items > MAX_SCRIPT_ITEMS) {
+    state.overBudget = true;
+    return;
+  }
   if (unterminated) state.opaque.add('unterminated_quote');
 
   let words: WordItem[] = [];
@@ -1463,10 +1545,19 @@ function parseInto(
     startPipeline();
   }
   finish();
+  // A group left open (`((((`) is not a script this reader understood.
+  if (groups.length > 0) state.opaque.add('unterminated_quote');
 }
 
 function newState(): ParseState {
-  return { commands: [], opaque: new Set(), nextPipeline: 0, scopeParents: [] };
+  return {
+    commands: [],
+    opaque: new Set(),
+    nextPipeline: 0,
+    scopeParents: [],
+    items: 0,
+    overBudget: false,
+  };
 }
 
 function result(state: ParseState): ParsedShell {
@@ -1474,6 +1565,7 @@ function result(state: ParseState): ParsedShell {
     commands: state.commands,
     opaque: [...state.opaque],
     scopeParents: state.scopeParents,
+    overBudget: state.overBudget || state.commands.length > MAX_SCRIPT_COMMANDS,
   };
 }
 

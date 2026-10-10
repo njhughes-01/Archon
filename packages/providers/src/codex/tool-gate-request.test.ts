@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
 import {
   describeDenialForModel,
-  parseApplyPatchTargets,
+  readApplyPatch,
   translateCodexHookCall,
 } from './tool-gate-request';
 
@@ -124,6 +124,179 @@ describe('translateCodexHookCall', () => {
     });
   });
 
+  // Codex 0.157.0 applied this patch and wrote `../out.txt`: its parser trims a
+  // header line before matching it, so indentation does not hide a target.
+  test('an indented header after another hunk is judged as a target', () => {
+    const patch = [
+      '*** Begin Patch',
+      '*** Delete File: d.txt',
+      '  *** Add File: ../out.txt',
+      '+hi',
+      '*** End Patch',
+    ].join('\n');
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'apply_patch', tool_input: { command: patch } })
+    );
+
+    expect(result.outcome === 'ask' && result.request).toMatchObject({
+      kind: 'file_write',
+      paths: ['/repo/d.txt', '/out.txt'],
+      input: { command: patch },
+    });
+  });
+
+  test.each([
+    ['a header with no path', '*** Add File:'],
+    ['a header in another letter case', '*** update file: ../x'],
+    ['an environment header', '*** Environment ID: other-machine'],
+    ['a bare carriage return inside a path', '*** Add File: ok\r/../../out.txt'],
+  ])('apply_patch with %s is marked unreadable for the gate', (_label, line) => {
+    const patch = ['*** Begin Patch', '*** Add File: ok.txt', '+x', line, '*** End Patch'].join(
+      '\n'
+    );
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'apply_patch', tool_input: { command: patch } })
+    );
+
+    expect(result).toEqual({
+      outcome: 'ask',
+      category: 'file_change',
+      request: {
+        toolName: 'apply_patch',
+        kind: 'file_write',
+        cwd: '/repo',
+        paths: ['/repo/ok.txt'],
+        input: { command: patch, unreadablePatch: true },
+        toolCallId: 'call-1',
+      },
+    });
+  });
+
+  test('an unreadable patch with no readable target carries the mark and no path', () => {
+    const patch = '*** Begin Patch\n*** add file: ../x\n+x\n*** End Patch';
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'apply_patch', tool_input: { command: patch } })
+    );
+
+    expect(result.outcome === 'ask' && result.request).toEqual({
+      toolName: 'apply_patch',
+      kind: 'file_write',
+      cwd: '/repo',
+      input: { command: patch, unreadablePatch: true },
+      toolCallId: 'call-1',
+    });
+  });
+
+  test('the mark is added to a copy, never to the payload Codex sent', () => {
+    const toolInput = { command: '*** Begin Patch\n*** Add File:\n*** End Patch' };
+    translateCodexHookCall(hookPayload({ tool_name: 'apply_patch', tool_input: toolInput }));
+
+    expect(toolInput).toEqual({ command: '*** Begin Patch\n*** Add File:\n*** End Patch' });
+  });
+
+  test('an unreadable patch piped to apply_patch in the shell is marked too', () => {
+    const command =
+      "apply_patch <<'EOF'\n*** Begin Patch\n*** Environment ID: e1\n*** Add File: a.txt\n+x\n*** End Patch\nEOF";
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'Bash', tool_input: { command } })
+    );
+
+    expect(result.outcome === 'ask' && result.request).toMatchObject({
+      kind: 'shell',
+      command,
+      paths: ['/repo/a.txt'],
+      input: { command, unreadablePatch: true },
+    });
+  });
+
+  test('shell text that only mentions patch headers is not read as a patch', () => {
+    // Codex applies nothing without the `*** Begin Patch` line.
+    const command = "cat > notes.md <<'EOF'\n*** Add File: /etc/hosts\n*** add file:\nEOF";
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'Bash', tool_input: { command } })
+    );
+
+    expect(result.outcome === 'ask' && result.request).toEqual({
+      toolName: 'Bash',
+      kind: 'shell',
+      cwd: '/repo',
+      command,
+      input: { command },
+      toolCallId: 'call-1',
+    });
+  });
+
+  test.each([
+    ['workdir', { command: 'touch x', workdir: 'packages/app' }, '/repo/packages/app'],
+    ['an absolute workdir', { command: 'touch x', workdir: '/srv/other' }, '/srv/other'],
+    ['a workdir that climbs out', { command: 'touch x', workdir: '../elsewhere' }, '/elsewhere'],
+    ['cwd', { command: 'touch x', cwd: 'packages/app' }, '/repo/packages/app'],
+    ['workdir ahead of cwd', { command: 'touch x', workdir: 'a', cwd: 'b' }, '/repo/a'],
+    ['no directory of its own', { command: 'touch x' }, '/repo'],
+    ['an empty workdir', { command: 'touch x', workdir: '' }, '/repo'],
+    ['a null workdir', { command: 'touch x', workdir: null }, '/repo'],
+  ])('a shell call with %s is judged in that directory', (_label, toolInput, expected) => {
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'Bash', tool_input: toolInput })
+    );
+
+    expect(result.outcome === 'ask' && result.request.cwd).toBe(expected);
+    expect(result.outcome === 'ask' && result.request.input).toEqual(toolInput);
+  });
+
+  test("a patch piped in the shell is resolved against the call's own directory", () => {
+    const command =
+      "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: ../x.txt\n+x\n*** End Patch\nEOF";
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'Bash', tool_input: { command, workdir: '/repo/sub' } })
+    );
+
+    expect(result.outcome === 'ask' && result.request).toMatchObject({
+      cwd: '/repo/sub',
+      paths: ['/repo/x.txt'],
+    });
+  });
+
+  test.each([
+    ['a number', 7],
+    ['a list', ['/repo']],
+  ])('a shell call whose workdir is %s is denied without asking', (_label, workdir) => {
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'Bash', tool_input: { command: 'touch x', workdir } })
+    );
+
+    expect(result.outcome).toBe('deny');
+    expect(result.category).toBe('command');
+  });
+
+  test('a tool this provider does not know has its path fields judged as write targets', () => {
+    const toolInput = { file_path: '../outside.txt', files: ['a.ts', 'b.ts'], edits: [] };
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'multi_edit', tool_input: toolInput })
+    );
+
+    expect(result).toEqual({
+      outcome: 'ask',
+      category: 'other',
+      request: {
+        toolName: 'multi_edit',
+        kind: 'other',
+        cwd: '/repo',
+        paths: ['../outside.txt', 'a.ts', 'b.ts'],
+        input: toolInput,
+        toolCallId: 'call-1',
+      },
+    });
+  });
+
+  test("an MCP tool's arguments are not read as write targets", () => {
+    const result = translateCodexHookCall(
+      hookPayload({ tool_name: 'mcp__files__read', tool_input: { path: '/etc/hosts' } })
+    );
+
+    expect(result.outcome === 'ask' && result.request.paths).toBeUndefined();
+  });
+
   test.each(['update_plan', 'view_image'])('%s is read-only and never reaches the gate', name => {
     const result = translateCodexHookCall(hookPayload({ tool_name: name, tool_input: {} }));
 
@@ -191,20 +364,18 @@ describe('translateCodexHookCall', () => {
   });
 });
 
-describe('parseApplyPatchTargets', () => {
+describe('readApplyPatch', () => {
   test('reads add, update, move and delete targets', () => {
-    expect(parseApplyPatchTargets(PATCH, '/repo')).toEqual([
-      '/repo/src/new.ts',
-      '/repo/src/old.ts',
-      '/repo/src/renamed.ts',
-      '/abs/gone.ts',
-    ]);
+    expect(readApplyPatch(PATCH, '/repo')).toEqual({
+      paths: ['/repo/src/new.ts', '/repo/src/old.ts', '/repo/src/renamed.ts', '/abs/gone.ts'],
+      unreadable: false,
+    });
   });
 
   test('keeps a path that climbs out of the working directory visible to the gate', () => {
     const patch = '*** Begin Patch\n*** Add File: ../../.ssh/authorized_keys\n+key\n*** End Patch';
 
-    expect(parseApplyPatchTargets(patch, '/home/u/repo')).toEqual(['/home/.ssh/authorized_keys']);
+    expect(readApplyPatch(patch, '/home/u/repo').paths).toEqual(['/home/.ssh/authorized_keys']);
   });
 
   test('ignores header-looking text inside added content', () => {
@@ -215,18 +386,29 @@ describe('parseApplyPatchTargets', () => {
       '*** End Patch',
     ].join('\n');
 
-    expect(parseApplyPatchTargets(patch, '/repo')).toEqual(['/repo/notes.md']);
+    expect(readApplyPatch(patch, '/repo')).toEqual({
+      paths: ['/repo/notes.md'],
+      unreadable: false,
+    });
   });
 
   test('handles CRLF line endings and repeated targets', () => {
     const patch =
       '*** Begin Patch\r\n*** Update File: a.ts\r\n@@\r\n-x\r\n+y\r\n*** Update File: a.ts\r\n*** End Patch';
 
-    expect(parseApplyPatchTargets(patch, '/repo')).toEqual(['/repo/a.ts']);
+    expect(readApplyPatch(patch, '/repo')).toEqual({ paths: ['/repo/a.ts'], unreadable: false });
+  });
+
+  // Codex 0.157.0 wrote a file named `   a.txt` for this header: it keeps the
+  // space after the marker. A newer CLI may trim it, so both spellings are named.
+  test('names a path with leading space both as Codex 0.157.0 writes it and trimmed', () => {
+    const patch = '*** Begin Patch\n*** Add File:    /abs/a.txt\n+x\n*** End Patch';
+
+    expect(readApplyPatch(patch, '/repo').paths).toEqual(['/repo/   /abs/a.txt', '/abs/a.txt']);
   });
 
   test('returns nothing for text that is not a patch', () => {
-    expect(parseApplyPatchTargets('echo hi', '/repo')).toEqual([]);
+    expect(readApplyPatch('echo hi', '/repo')).toEqual({ paths: [], unreadable: false });
   });
 });
 

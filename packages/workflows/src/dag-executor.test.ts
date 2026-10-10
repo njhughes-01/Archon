@@ -162,6 +162,7 @@ import {
 } from './model-validation';
 import { captureWorkflowSource, capturedSourceRoots } from './workflow-source';
 import { CONTAINER_MARKER_PROBE } from './checkout-observation';
+import { DEFAULT_MAX_DENIALS_PER_NODE } from './tool-gate';
 
 function composeScope(
   nodeId = 'fan',
@@ -37741,6 +37742,44 @@ describe('executeDagWorkflow -- tool action gate', () => {
       'iterate',
       'group.body',
     ]);
+  });
+
+  it('gate on: each loop iteration starts its own denial count, so denials early in a loop do not stop a later iteration', async () => {
+    const decisions: Decision[] = [];
+    let iteration = 0;
+    mockSendQueryDag.mockImplementation(async function* (_prompt, _cwd, _resume, options) {
+      const gate = options?.toolGate;
+      if (gate === undefined) throw new Error('the node was given no tool gate');
+      const last = ++iteration === 2;
+      // The first iteration uses up the whole allowance; the second is refused once more.
+      const asks = last ? 1 : DEFAULT_MAX_DENIALS_PER_NODE;
+      for (let i = 0; i < asks; i++) decisions.push(await gate(shell('git reset --hard')));
+      yield {
+        type: 'assistant',
+        content: last ? 'Finished. <promise>DONE</promise>' : 'Still working.',
+      };
+      yield { type: 'result', sessionId: `gate-session-${String(iteration)}` };
+    });
+
+    const store = await run(
+      [
+        {
+          id: 'iterate',
+          kind: 'loop',
+          provider: GATED,
+          loop: { prompt: 'iterate', until: 'DONE', max_iterations: 2, fresh_context: true },
+        },
+      ],
+      GATE_ON
+    );
+
+    expect(store.failWorkflowRun).not.toHaveBeenCalled();
+    expect(iteration).toBe(2);
+    const ruleIds = decisions.map(decision => (decision.action === 'deny' ? decision.ruleId : ''));
+    expect(ruleIds).toEqual(Array(DEFAULT_MAX_DENIALS_PER_NODE + 1).fill('deny.git_reset_hard'));
+    expect(gateEvents(store).map(event => [event.step_name, event.data?.ruleId])).toEqual(
+      Array(DEFAULT_MAX_DENIALS_PER_NODE + 1).fill(['iterate', 'deny.git_reset_hard'])
+    );
   });
 
   it('gate on: writes into the run artifacts and state directories are allowed, every other outside write is denied', async () => {

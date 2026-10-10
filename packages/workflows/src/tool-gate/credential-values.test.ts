@@ -58,6 +58,25 @@ describe('collectCredentialValues', () => {
     ).toEqual(new Set(['npm-value', 'db-value', 'smtp-value']));
   });
 
+  test('a run-together key name counts, an everyday word ending in key does not', () => {
+    expect(
+      new Set(
+        collectCredentialValues(
+          {
+            SSHKEY: 'ssh-value',
+            STRIPEKEY: 'vendor-value',
+            PGPASSWORD: 'pg-value',
+            MYSECRET: 'secret-value',
+            HOTKEY: 'ctrl+k',
+            MONKEY: 'banana',
+          },
+          undefined,
+          undefined
+        )
+      )
+    ).toEqual(new Set(['ssh-value', 'vendor-value', 'pg-value', 'secret-value']));
+  });
+
   test('a protected variable is taken whatever it is called', () => {
     expect(collectCredentialValues({ CODEX_HOME: '/run/codex-home' }, ['CODEX_HOME'], [])).toEqual([
       '/run/codex-home',

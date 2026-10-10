@@ -3,22 +3,10 @@
  *
  * One owner for both: the subprocess paths of the workflow executor and the
  * tool gate redact against the same set, found the same way. The masking
- * itself and the secret-name vocabulary live in `redact.ts`.
+ * itself and the secret-name vocabulary live in `redact.ts`, including names
+ * that run their words together (`NPM_AUTHTOKEN`, `DBPASSWORD`, `SSHKEY`).
  */
 import { isSecretKey, maskCredentialValues } from './redact';
-
-/**
- * Environment names often run the words together (`NPM_AUTHTOKEN`,
- * `DBPASSWORD`), which the whole-word vocabulary in `redact.ts` rightly does
- * not read as secret in free text. For a variable the engine is about to hand
- * to a process, a name that ends this way is still treated as one: a value
- * left unmasked in a log costs more than one masked needlessly.
- */
-const RUN_TOGETHER_SECRET_NAME = /(?:token|key|secret|password)$/i;
-
-function namesCredential(key: string): boolean {
-  return isSecretKey(key) || RUN_TOGETHER_SECRET_NAME.test(key);
-}
 
 /** Masks every occurrence of each exact credential value in `text`. */
 export function redactCredentialValues(text: string, credentialValues: readonly string[]): string {
@@ -38,7 +26,7 @@ export function collectCredentialValues(
 ): string[] {
   const explicitlyProtected = new Set(protectedEnvKeys);
   const values = Object.entries(env).flatMap(([key, value]) =>
-    value !== undefined && (explicitlyProtected.has(key) || namesCredential(key)) ? [value] : []
+    value !== undefined && (explicitlyProtected.has(key) || isSecretKey(key)) ? [value] : []
   );
   return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
     .filter(value => value.length > 0)
