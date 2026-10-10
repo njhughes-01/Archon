@@ -57,6 +57,8 @@ interface Tree {
   root: string;
   outside: string;
   home: string;
+  /** A second place a call may write, as a run's artifacts directory is. */
+  artifacts: string;
 }
 
 const trackTempRoot = trackTempRoots();
@@ -70,7 +72,9 @@ function makeTree(): Tree {
   const root = join(base, 'repo');
   const outside = join(base, 'outside');
   const home = join(base, 'home');
-  const dirs = ['src', 'docs', 'build/empty', 'sub', 'dist', 'a\\b\\c'];
+  const artifacts = join(base, 'artifacts');
+  const dirs = ['src/legacy', 'src/secrets', 'docs', 'build/empty', 'sub', 'dist', 'a\\b\\c'];
+  dirs.push('env', '.docker', 'k8s');
   for (const dir of dirs) mkdirSync(join(root, dir), { recursive: true });
   // Three checkouts with different current branches, read from their HEAD files.
   const heads = [
@@ -84,6 +88,10 @@ function makeTree(): Tree {
   }
   writeFileSync(join(root, '.env.example'), 'FIXTURE=\n');
   mkdirSync(outside);
+  mkdirSync(join(artifacts, 'logs'), { recursive: true });
+  writeFileSync(join(root, 'src', 'legacy', 'old.ts'), 'export const old = 1;\n');
+  writeFileSync(join(root, 'src', 'api.key.ts'), 'export const keyName = 1;\n');
+  writeFileSync(join(root, '.docker', 'Dockerfile'), 'FROM scratch\n');
   mkdirSync(join(home, '.ssh'), { recursive: true });
   writeFileSync(join(root, 'README.md'), '# fixture\n');
   writeFileSync(join(root, 'docs', 'README.md'), '# docs\n');
@@ -95,14 +103,15 @@ function makeTree(): Tree {
   symlinkSync('src', join(root, 'link-in'));
   symlinkSync('../outside/missing.txt', join(root, 'dangling'));
   symlinkSync('.env', join(root, 'notes.txt'));
-  return { root, outside, home };
+  return { root, outside, home, artifacts };
 }
 
 function fill(text: string, tree: Tree): string {
   return text
     .replaceAll('{root}', tree.root)
     .replaceAll('{outside}', tree.outside)
-    .replaceAll('{home}', tree.home);
+    .replaceAll('{home}', tree.home)
+    .replaceAll('{artifacts}', tree.artifacts);
 }
 
 function toRequest(row: FixtureRow, tree: Tree): ToolActionRequest {
@@ -111,7 +120,8 @@ function toRequest(row: FixtureRow, tree: Tree): ToolActionRequest {
     // One row carries a kind no provider should send, to pin the refusal.
     kind: row.kind as ToolActionKind,
     cwd: fill(row.cwd, tree),
-    input: row.input ?? {},
+    // Placeholders inside the input are filled like those in a command.
+    input: JSON.parse(fill(JSON.stringify(row.input ?? {}), tree)) as Record<string, unknown>,
     ...(row.command !== undefined && { command: fill(row.command, tree) }),
     ...(row.paths !== undefined && { paths: row.paths.map(path => fill(path, tree)) }),
     ...(row.url !== undefined && { url: row.url }),
@@ -138,6 +148,7 @@ async function runGate(
   const gate = createToolGate({
     repoRoot: tree.root,
     homeDir: tree.home,
+    extraWriteRoots: [tree.artifacts],
     classifierConfigured,
     escalate: request => {
       calls.push(request);
@@ -212,6 +223,7 @@ describe.skipIf(isWindows)('fixture table: rules alone', () => {
     const outcome = await evaluateRules(toRequest(row, tree), {
       repoRoot: tree.root,
       homeDir: tree.home,
+      extraWriteRoots: [tree.artifacts],
       protectedBranches: DEFAULT_PROTECTED_BRANCHES,
       verificationCommands: DEFAULT_VERIFICATION_COMMANDS,
     });

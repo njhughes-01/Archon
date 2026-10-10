@@ -286,7 +286,13 @@ export const OPTION_SPECS: Readonly<Record<string, OptionSpec>> = {
   'clang++': { valueShort: 'oIDLlxU' },
   rustc: { valueShort: 'oLlCA', valueLong: ['--out-dir', '--crate-name', '--edition'] },
   ld: { valueShort: 'oLlT' },
-  docker: { valueLong: ['--env-file', '--config', '--context', '--host'] },
+  docker: {
+    valueShort: 'fpH',
+    valueLong: [
+      ...['--env-file', '--config', '--context', '--host', '--file', '--project-name'],
+      ...['--profile', '--project-directory'],
+    ],
+  },
   gh: {
     valueShort: 'XfFHRqtbBaAlmLjS',
     valueLong: [

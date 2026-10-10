@@ -325,8 +325,11 @@ posix('plain push: the checked-out branch or another', () => {
     ['git push', 'default.no_signal'],
     ['git push origin HEAD', 'default.no_signal'],
     ['git push -u origin feature/login', 'default.no_signal'],
-    ['git push origin feature/other', 'risk.mutation_verb'],
-    ['git push origin feature/login:feature/other', 'risk.mutation_verb'],
+    // Another unprotected branch, with nothing that lets the push overwrite it.
+    ['git push origin feature/other', 'default.no_signal'],
+    ['git push origin feature/login:feature/other', 'default.no_signal'],
+    ['git push fork feature/other', 'risk.mutation_verb'],
+    ['git push origin feature/other:main', 'risk.mutation_verb'],
     ['git push origin feature/login --tags', 'risk.mutation_verb'],
     ['git push --all origin', 'risk.mutation_verb'],
     ['git push origin --delete feature/login', 'risk.mutation_verb'],
@@ -380,9 +383,13 @@ posix('discarding uncommitted work: the whole tree or named paths', () => {
     ['git switch --discard-changes main', 'deny.git_discard_worktree'],
     ['git checkout-index -f -a', 'deny.git_discard_worktree'],
     ['cd src && cd .. && git restore .', 'deny.git_discard_worktree'],
-    // One file or one sub-directory is a scoped discard: flagged, not denied.
-    ['git checkout -- src/app.ts', 'risk.mutation_verb'],
-    ['git restore src/app.ts', 'risk.mutation_verb'],
+    // Files named one by one are what an edit would overwrite too.
+    ['git checkout -- src/app.ts', 'default.no_signal'],
+    ['git restore src/app.ts', 'default.no_signal'],
+    ['git restore --source=HEAD~1 src/app.ts README.md', 'default.no_signal'],
+    // A sub-directory, or a file nobody can name, is a scoped discard: flagged, not denied.
+    ['git restore "$FILE"', 'risk.mutation_verb'],
+    ['git restore -p src/app.ts', 'risk.mutation_verb'],
     ['git restore src/', 'risk.mutation_verb'],
     ['cd src && git restore .', 'risk.mutation_verb'],
     ['git checkout-index -f src/app.ts', 'risk.mutation_verb'],
@@ -402,19 +409,19 @@ posix('facts stated with an escalation', () => {
   }
 
   test.each([
-    ['git push origin feature/other', { gitPushTarget: 'other_unprotected_branch' }],
+    ['git push fork feature/other', { gitPushTarget: 'other_unprotected_branch' }],
     ['git push origin main', { gitPushTarget: 'protected_branch' }],
     ['git push origin HEAD:main', { gitPushTarget: 'protected_branch' }],
-    ['git push origin feature/login:feature/other', { gitPushTarget: 'other_unprotected_branch' }],
+    ['git push fork feature/login:feature/other', { gitPushTarget: 'other_unprotected_branch' }],
     ['git push origin --delete feature/other', { gitPushTarget: 'deletes_remote_ref' }],
     ['git push --tags', { gitPushTarget: 'several_or_all_refs' }],
     ['git push origin "$BRANCH"', { gitPushTarget: 'unknown' }],
-    ['git restore src/app.ts', { uncommittedWork: 'discarded_in_named_paths' }],
+    ['git restore src/', { uncommittedWork: 'discarded_in_named_paths' }],
     ['git checkout -- "$FILE"', { uncommittedWork: 'unknown' }],
-    ['rm -rf src/generated', { removalTarget: 'other_repository_path' }],
+    ['rm -rf src', { removalTarget: 'other_repository_path' }],
     ['rm -rf "$DIR"/out', { removalTarget: 'unknown' }],
     ['find src -name "*.bak" -delete', { removalTarget: 'other_repository_path' }],
-    ['gh pr comment 31 --body ok', { githubAction: 'comment' }],
+    ['gh issue comment 31 --body ok', { githubAction: 'comment' }],
     ['gh run rerun 7712 --failed', { githubAction: 'ci_run_control' }],
     ['gh pr merge 5', { githubAction: 'merge_or_close' }],
     ['gh secret set KEY_NAME --body x', { githubAction: 'settings_or_secrets' }],
@@ -429,7 +436,7 @@ posix('facts stated with an escalation', () => {
     ['psql -h localhost -d app_production -c "select 1"', { targetHost: 'production_named' }],
     ['curl -X POST http://127.0.0.1:8080/v1/echo -d x', { targetHost: 'loopback' }],
     ['ssh deploy@prod-1.example.com uptime', { targetHost: 'production_named' }],
-    ['docker ps', {}],
+    ['docker run widgets:dev', {}],
   ])('%s → %p', async (command, facts) => {
     expect(await factsOf(command)).toEqual(facts);
   });

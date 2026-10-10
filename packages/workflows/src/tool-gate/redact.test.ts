@@ -597,3 +597,186 @@ describe('item 7: argument lists', () => {
     );
   });
 });
+
+const FAKE = 's3cr3t-VALUE-123';
+
+/** [group, command, text that must stay readable after the value is gone]. */
+const LEAK_SHAPES: ReadonlyArray<readonly [string, string, string]> = [
+  // 1. JSON with backslash-escaped quotes inside a double-quoted body
+  [
+    '1 json',
+    String.raw`curl -d "{\"password\":\"${FAKE}\"}" https://api.example.com`,
+    'api.example.com',
+  ],
+  [
+    '1 json',
+    String.raw`curl -d "{\"token\":\"${FAKE}\"}" https://api.example.com`,
+    'api.example.com',
+  ],
+  [
+    '1 json',
+    String.raw`curl -d "{\"secret\":\"${FAKE}\"}" https://api.example.com`,
+    'api.example.com',
+  ],
+  [
+    '1 json',
+    String.raw`curl -d "{\"api_key\":\"${FAKE}\"}" https://api.example.com`,
+    'api.example.com',
+  ],
+  [
+    '1 json',
+    String.raw`curl -d "{\"authorization\":\"${FAKE}\"}" https://api.example.com`,
+    'api.example.com',
+  ],
+  ['1 json', String.raw`curl -d "{\"user\":\"sam\",\"password\":\"${FAKE}\"}" https://x.io`, 'sam'],
+  [
+    '1 json',
+    String.raw`curl -d "{\"password\": \"${FAKE}\", \"user\": \"sam\"}" https://x.io`,
+    'sam',
+  ],
+  ['1 json', String.raw`curl -X POST -d "{\"Password\":\"${FAKE}\"}" https://x.io`, 'POST'],
+  // 2. single-word compound env names
+  ['2 env', `PGPASSWORD=${FAKE} psql -h db app`, 'psql -h db app'],
+  ['2 env', `MYSQL_PWD=${FAKE} mysql -h db app`, 'mysql -h db app'],
+  ['2 env', `authtoken=${FAKE} ./run`, './run'],
+  ['2 env', `pgpassword=${FAKE} psql app`, 'psql app'],
+  ['2 env', `AUTHTOKEN=${FAKE} ./run`, './run'],
+  ['2 env', `APIKEY=${FAKE} ./run`, './run'],
+  ['2 env', `ACCESSKEY=${FAKE} ./run`, './run'],
+  ['2 env', `secretkey=${FAKE} ./run`, './run'],
+  ['2 env', `export PGPASSWORD="${FAKE}" && psql app`, 'psql app'],
+  // 3. gh secret set body
+  ['3 gh', `gh secret set NAME --body ${FAKE}`, 'gh secret set NAME'],
+  ['3 gh', `gh secret set NAME -b ${FAKE} --repo acme/app`, '--repo acme/app'],
+  ['3 gh', `gh secret set NAME --body=${FAKE}`, 'gh secret set NAME'],
+  ['3 gh', `gh secret set NAME --body "${FAKE}" --org acme`, '--org acme'],
+  // 4. user:password options
+  ['4 user', `curl --proxy-user user:${FAKE} https://x.io`, 'https://x.io'],
+  ['4 user', `curl -U user:${FAKE} https://x.io`, 'https://x.io'],
+  ['4 user', `curl --user user:${FAKE} https://x.io`, 'https://x.io'],
+  ['4 user', `curl -u user:${FAKE} https://x.io`, 'https://x.io'],
+  ['4 user', `curl -u "user:${FAKE}" https://x.io`, 'https://x.io'],
+  // 5. password options of other tools
+  ['5 tool', `zip -p ${FAKE} out.zip dir`, 'out.zip'],
+  ['5 tool', `zip -P ${FAKE} out.zip dir`, 'out.zip'],
+  ['5 tool', `7z a -p${FAKE} out.7z dir`, 'out.7z'],
+  ['5 tool', `mysql -u root -p${FAKE} app`, 'app'],
+  ['5 tool', `ldapsearch -x -w ${FAKE} -b dc=x`, '-b dc=x'],
+  ['5 tool', `ssh-keygen -t ed25519 -N ${FAKE} -f id`, '-f id'],
+  ['5 tool', `az login -u me --password ${FAKE}`, 'az login'],
+  ['5 tool', `az login -u me -p ${FAKE}`, 'az login'],
+  ['5 tool', `sshpass -p ${FAKE} ssh host`, 'ssh host'],
+  // 6. pair keys in other letter case
+  ['6 case', `Password=${FAKE} ./run`, './run'],
+  ['6 case', `PASSWORD: ${FAKE}`, 'PASSWORD'],
+  ['6 case', `curl -H "Api-Key: ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H "X-API-KEY: ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H "x-api-key: ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H "Authorization: Bearer ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H "AUTHORIZATION: BEARER ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H "authorization: bearer ${FAKE}" https://x.io`, 'https://x.io'],
+  ['6 case', `curl -H 'Authorization: Basic ${FAKE}' https://x.io`, 'https://x.io'],
+  ['6 case', `TOKEN=${FAKE} ./run`, './run'],
+  ['6 case', `Secret: ${FAKE}`, 'Secret'],
+  // 7. argv given as JSON or Python array text
+  ['7 array', `["curl","--token","${FAKE}","https://x.io"]`, 'https://x.io'],
+  ['7 array', `['tool', '--password', '${FAKE}', 'next']`, 'next'],
+  ['7 array', `["tool", "--password", "${FAKE}", "next"]`, 'next'],
+  ['7 array', `["tool","--api-key","${FAKE}"]`, 'tool'],
+  ['7 array', `["sshpass","-p","${FAKE}","ssh","host"]`, 'host'],
+  ['7 array', `["curl","-u","user:${FAKE}","https://x.io"]`, 'https://x.io'],
+  ['7 array', `["curl","--user","user:${FAKE}","https://x.io"]`, 'https://x.io'],
+  ['7 array', `["mysql","-p${FAKE}","app"]`, 'app'],
+  ['7 array', `["zip","-P","${FAKE}","out.zip"]`, 'out.zip'],
+  ['7 array', `["ssh-keygen","-N","${FAKE}","-f","id"]`, 'id'],
+  ['7 array', `["gh","secret","set","NAME","--body","${FAKE}"]`, 'NAME'],
+];
+
+describe('review shapes: the value leaves the preview and the command stays readable', () => {
+  test('there are at least 48 shapes', () => {
+    expect(LEAK_SHAPES.length).toBeGreaterThanOrEqual(48);
+  });
+
+  test.each(LEAK_SHAPES.map(([group, command, readable]) => [group, command, readable] as const))(
+    '%s: %s',
+    (_group, command, readable) => {
+      const out = redact(command);
+      expect(out).not.toContain(FAKE);
+      expect(out).not.toContain('VALUE-123');
+      expect(out).toContain('[REDACTED]');
+      expect(out).toContain(readable);
+    }
+  );
+
+  test.each(LEAK_SHAPES.map(([group, command]) => [group, command] as const))(
+    '%s: %s as a tool input field',
+    (_group, command) => {
+      const out = redactInput({ command }, WIDE);
+      expect(out).not.toContain(FAKE);
+      expect(out).not.toContain('VALUE-123');
+    }
+  );
+
+  test.each([
+    'git commit -m "fix password prompt"',
+    'git commit -m "rotate token handling"',
+    'grep -p pattern file',
+    'ls -p',
+    'mkdir -p src/x',
+    'cp -p a b',
+    'ssh -p 2222 host',
+    'docker run -p 8080:80 img',
+    'curl -u',
+    'curl -u deploy https://x.io',
+    'gh variable set REGION --body us-east-1',
+    'gh variable set REGION -b us-east-1',
+    'mysql -h db -P 3306 app',
+    'wget -P downloads https://example.com/a',
+    'tar -cf out.tar -N 2024-01-01 dir',
+    'echo password',
+    'echo "the token was rotated"',
+    'MAX_TOKENS=4096 ./run',
+    'Content-Type: application/json',
+    String.raw`curl -d "{\"user\":\"sam\"}" https://x.io`,
+    '["ls","-p","src"]',
+    '["mkdir","-p","src/x"]',
+  ])('control: leaves %s unchanged', text => {
+    expect(redact(text)).toBe(text);
+  });
+});
+
+describe('review shapes: redaction stays linear on adversarial input', () => {
+  const KINDS: ReadonlyArray<readonly [string, string]> = [
+    ['quotes', '"\'"\''],
+    ['backslashed quotes', String.raw`\"\"\\"`],
+    ['backslashes', '\\'],
+    ['equals', '='],
+    ['colons', ':'],
+    ['-p flags', ' -p'],
+    ['-P flags', ' -P'],
+    ['json pairs', String.raw`{\"password\":`],
+    ['name equals', 'password='],
+    ['user flags', ' -u a:'],
+    ['array elements', '["-p",'],
+    ['mixed', String.raw`\"=:-p "`],
+  ];
+
+  test('a closed 100 KB array text redacts quickly', () => {
+    const text = `["mysql"${',"-p"'.repeat(16_000)}]`;
+    const started = performance.now();
+    redactText(text, { credentialValues: [], cap: 200 });
+    const elapsed = performance.now() - started;
+    console.info(`redact 100 KB closed array text: ${elapsed.toFixed(1)} ms`);
+    expect(elapsed).toBeLessThan(500);
+  });
+
+  test.each(KINDS)('100 KB of %s redacts quickly', (_kind, unit) => {
+    const text = unit.repeat(Math.ceil(100_000 / unit.length)).slice(0, 100_000);
+    const started = performance.now();
+    redactText(text, { credentialValues: [], cap: 200 });
+    redactInput({ command: text, args: text.split(' ') }, { credentialValues: [], cap: 200 });
+    const elapsed = performance.now() - started;
+    console.info(`redact 100 KB of ${_kind}: ${elapsed.toFixed(1)} ms`);
+    expect(elapsed).toBeLessThan(500);
+  });
+});

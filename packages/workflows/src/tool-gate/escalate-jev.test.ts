@@ -340,7 +340,7 @@ describe('the escalator behind the real gate', () => {
       toolName: 'Bash',
       kind: 'shell',
       cwd: root,
-      command: 'gh pr create --fill',
+      command: 'gh pr ready 5',
       input: {},
     });
     expect(decision).toEqual({ action: 'allow' });

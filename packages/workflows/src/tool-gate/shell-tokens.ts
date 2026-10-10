@@ -208,28 +208,12 @@ const MAX_ARITHMETIC_CHARS = 4_096;
 
 const FIND_EXEC_FLAGS: ReadonlySet<string> = new Set(['-exec', '-execdir', '-ok', '-okdir']);
 
-/** `$NAME` or `${NAME}`, nothing more: the only spellings a known variable is read from. */
-const PLAIN_VARIABLE = /^\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})$/;
-
-/**
- * `variables` holds the values of variables the caller knows for certain (the
- * run directories the engine itself exports). A word using one of them is as
- * placeable as a literal; every other variable still makes the word dynamic.
- */
-export function resolveWord(
-  word: ShellWord,
-  homeDir: string,
-  variables?: Readonly<Record<string, string>>
-): ResolvedWord {
+export function resolveWord(word: ShellWord, homeDir: string): ResolvedWord {
   let text = '';
   let dynamic = false;
   let glob = false;
   for (const [index, part] of word.parts.entries()) {
-    const named = part.kind === 'variable' ? PLAIN_VARIABLE.exec(part.text) : null;
-    const known = named === null ? undefined : variables?.[named[1] ?? named[2] ?? ''];
-    if (known !== undefined) {
-      text += known;
-    } else if (part.kind === 'home') {
+    if (part.kind === 'home') {
       text += homeDir;
     } else if (part.kind === 'cwd') {
       // `$PWD` and `$PWD/x` are `.` and `./x`. Anywhere else (`a/$PWD`, `${PWD}x`)

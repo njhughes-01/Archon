@@ -158,7 +158,7 @@ const COMMAND_PASSWORD_FLAGS: readonly RegExp[] = [
   /(\b(?:docker|podman|helm|npm)\s+login\b[^\n;|&]{0,400}?\s-p[=\s]*)\S+/g,
   /(\bredis-cli\b[^\n;|&]{0,400}?\s(?:-a|--pass)\s+)\S+/g,
   commandPasswordFlag('az', String.raw`-p(?:=|\s+)`),
-  commandPasswordFlag('zip|unzip', String.raw`-P\s*`),
+  commandPasswordFlag('zip|unzip', String.raw`-[pP]\s*`),
   // 7z takes the password attached; a bare `-p` asks for it at a prompt.
   commandPasswordFlag('7z[arz]?', '-p'),
   commandPasswordFlag('ldap[a-z]{2,8}', String.raw`-w\s*`),
@@ -246,9 +246,37 @@ function maskFlagValues(text: string): string {
   return masked;
 }
 
+/**
+ * A command given as array text, `["curl","--token","VALUE"]` or `['tool', '-p', 'x']`.
+ * Elements are quoted and separated by one comma, so the match cannot overlap itself.
+ */
+const ARRAY_ELEMENT = String.raw`(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')`;
+const ARRAY_TEXT = new RegExp(
+  String.raw`\[\s*${ARRAY_ELEMENT}(?:\s*,\s*${ARRAY_ELEMENT})*\s*\]`,
+  'g'
+);
+const ARRAY_TEXT_ELEMENT = new RegExp(ARRAY_ELEMENT, 'g');
+
+/** Masks the secret elements of array text with the rules that read an argument list. */
+function maskArrayText(text: string): string {
+  return text.replace(ARRAY_TEXT, array => {
+    const elements = [...array.matchAll(ARRAY_TEXT_ELEMENT)];
+    const args = elements.map(element => element[0].slice(1, -1));
+    let masked = '';
+    let copied = 0;
+    elements.forEach((element, index) => {
+      const start = secretStartInArgument(args, index);
+      if (start === null) return;
+      const quote = element[0].slice(0, 1);
+      masked += `${array.slice(copied, element.index)}${quote}${(args[index] ?? '').slice(0, start)}${REDACTED}${quote}`;
+      copied = element.index + element[0].length;
+    });
+    return masked + array.slice(copied);
+  });
+}
+
 function maskShapes(text: string): string {
-  const masked = text
-    .replace(PEM_BLOCK, `${REDACTED} PEM block`)
+  const masked = maskArrayText(text.replace(PEM_BLOCK, `${REDACTED} PEM block`))
     .replace(CREDENTIAL_HEADER, `$1$2${REDACTED}`)
     .replace(BEARER_TOKEN, `$1 ${REDACTED}`)
     .replace(URL_USER_PASSWORD, `$1${REDACTED}@`)

@@ -14,7 +14,7 @@
  * a relative path starts; it never widens what counts as inside.
  */
 import { readFile, stat } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ToolActionRequest } from '@archon/providers/types';
 import {
   GIT_OPTION_SPECS,
@@ -44,6 +44,7 @@ import {
   shellInvocation,
   WRAPPERS,
   type NestedScript,
+  type OpaqueKind,
   type ParsedShell,
   type PipelineStage,
   type ResolvedWord,
@@ -228,12 +229,6 @@ export interface RuleContext {
   extraWriteRoots?: readonly string[];
   /** Real paths no call may write, move or remove, inside a write root or not. */
   protectedPaths?: readonly string[];
-  /**
-   * Variables whose values the engine knows because it exports them to the
-   * step itself (`ARTIFACTS_DIR` and the other run directories). `$NAME` and
-   * `${NAME}` of one of these are read as the value, like `$HOME`.
-   */
-  variables?: Readonly<Record<string, string>>;
 }
 
 export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ['main', 'master'];
@@ -281,6 +276,14 @@ const READ_ONLY_GIT: ReadonlySet<string> = new Set([
 const GIT_BRANCH_LIST_FLAGS = /^(-a|-r|-v|--all|--remotes|--verbose|--list|--show-current)$/;
 const RG_EXEC_FLAGS: readonly string[] = ['--pre', '--pre-glob', '--hostname-bin'];
 const FIND_FILE_ACTIONS: ReadonlySet<string> = new Set(['-fprint', '-fprint0', '-fprintf', '-fls']);
+/** find tests whose operand is a name or path pattern. */
+const FIND_NAME_TESTS: ReadonlySet<string> = new Set([
+  ...['-name', '-iname', '-path', '-ipath', '-wholename', '-iwholename', '-regex', '-iregex'],
+  '-lname',
+]);
+const FIND_EXEC_ACTIONS: ReadonlySet<string> = new Set(['-exec', '-execdir', '-ok', '-okdir']);
+/** Commands that remove what they are given. */
+const REMOVERS: ReadonlySet<string> = new Set(['rm', 'rimraf', 'unlink', 'shred', 'rmdir']);
 /** find predicates that do not narrow what `-delete` removes. */
 const FIND_UNFILTERED = /^-(delete|depth|d|print|print0|mindepth|maxdepth|xdev|mount|noleaf|true)$/;
 
@@ -393,6 +396,11 @@ const WGET_BODY_FLAGS: readonly string[] = [
 ];
 
 const MUTATION_HEADS: Readonly<Record<string, ReversibleHint>> = {
+  'redis-cli': 'unlikely',
+  dropdb: 'unlikely',
+  dropuser: 'unlikely',
+  pg_restore: 'unlikely',
+  mongorestore: 'unlikely',
   rm: 'unknown',
   rimraf: 'unknown',
   mv: 'likely',
@@ -407,6 +415,101 @@ const MUTATION_HEADS: Readonly<Record<string, ReversibleHint>> = {
   su: 'unlikely',
 };
 const PUBLISHERS: ReadonlySet<string> = new Set(['npm', 'pnpm', 'yarn', 'bun', 'cargo']);
+/** Their subcommands that change what a registry serves, or who may publish to it. */
+const REGISTRY_VERBS: ReadonlySet<string> = new Set([
+  ...['publish', 'unpublish', 'deprecate', 'yank', 'owner', 'dist-tag', 'access'],
+]);
+
+/** Subcommands of the container and cluster clients that only show state. */
+const CONTAINER_READ_VERBS: ReadonlySet<string> = new Set([
+  ...['ps', 'images', 'logs', 'version', 'info', 'stats', 'top', 'port', 'history'],
+]);
+const CONTAINER_GROUP_READ_VERBS: Readonly<Record<string, readonly string[]>> = {
+  compose: ['ps', 'logs', 'ls', 'top', 'images', 'version', 'port'],
+  image: ['ls', 'list', 'history'],
+  container: ['ls', 'list', 'ps', 'logs', 'top', 'port', 'stats'],
+  volume: ['ls', 'list'],
+  network: ['ls', 'list'],
+  system: ['df', 'info'],
+  context: ['ls', 'list', 'show'],
+};
+const CLUSTER_READ_VERBS: ReadonlySet<string> = new Set([
+  ...['get', 'describe', 'logs', 'top', 'version', 'api-resources', 'api-versions', 'explain'],
+]);
+/** Cluster resources whose printed form is a credential. */
+const CLUSTER_SECRET_RESOURCE = /^(secrets?|sa|serviceaccounts?|tokens?)(\/|\.|$)/i;
+
+/**
+ * Tools whose first words say what they do: the words that change state the
+ * checkout cannot bring back. A tool listed here raises the signal for those
+ * words only, so `terraform plan` and `systemctl status` stay ordinary.
+ */
+const STATE_CHANGING_VERBS: Readonly<Record<string, RegExp>> = {
+  terraform:
+    /^(apply|destroy|import|taint|untaint|force-unlock|refresh|state (rm|mv|push|replace-provider)|workspace (delete|new))\b/,
+  tofu: /^(apply|destroy|import|taint|untaint|force-unlock|refresh|state (rm|mv|push|replace-provider)|workspace (delete|new))\b/,
+  helm: /^(install|upgrade|uninstall|delete|rollback)\b/,
+  pulumi: /^(up|destroy|refresh|cancel|import|state|stack rm)\b/,
+  systemctl:
+    /^(?!(status|show|is-active|is-enabled|is-failed|list-[a-z-]+|cat|get-default|help)\b)\S/,
+  service: /^\S+ (?!status\b)\S/,
+  launchctl: /^(?!(list|print|blame)\b)\S/,
+};
+/** Cloud clients: every operation changes something unless its name says it reads. */
+const CLOUD_CLIENTS: ReadonlySet<string> = new Set(['aws', 'gcloud', 'az']);
+const CLOUD_READ_WORD =
+  /^(describe|list|get|ls|show|head|wait|help|version|info|logs|tail|search|lookup|view|read|status|whoami|check)(-.*)?$/;
+/** Commands that stop the machine, or processes chosen by name. */
+const ALWAYS_STATE_CHANGING: ReadonlySet<string> = new Set([
+  ...['pkill', 'killall', 'shutdown', 'reboot', 'halt', 'poweroff'],
+]);
+
+/** `gh pr` verbs, and the options with which each only adds to the caller's own pull request. */
+const GH_OWN_PR_OPTIONS: Readonly<Record<string, ReadonlySet<string>>> = {
+  create: new Set([
+    ...['-t', '--title', '-b', '--body', '-F', '--body-file', '-B', '--base', '-H', '--head'],
+    ...['-d', '--draft', '-f', '--fill', '--fill-first', '--fill-verbose', '-l', '--label'],
+    ...['-a', '--assignee', '-r', '--reviewer', '-m', '--milestone', '--no-maintainer-edit'],
+    ...['-T', '--template', '-p', '--project'],
+  ]),
+  comment: new Set(['-b', '--body', '-F', '--body-file']),
+  edit: new Set([
+    ...['-t', '--title', '-b', '--body', '-F', '--body-file', '--add-label', '--remove-label'],
+    ...['--add-assignee', '--remove-assignee', '--add-reviewer', '--remove-reviewer'],
+    ...['-m', '--milestone', '--add-project', '--remove-project'],
+  ]),
+};
+const GH_SWITCHES: ReadonlySet<string> = new Set([
+  ...['-d', '--draft', '-f', '--fill', '--fill-first', '--fill-verbose', '--no-maintainer-edit'],
+]);
+/** Variables that point `gh` at another repository or host. */
+const GH_TARGET_VARIABLE = /^GH_(REPO|HOST|ENTERPRISE_TOKEN|CONFIG_DIR)$/;
+
+/**
+ * Whether a `gh pr` command only opens, comments on or edits a pull request of
+ * the repository the call runs in, with nothing that points it elsewhere: no
+ * `--repo`, no URL or `owner/repo#n` operand, no variable naming another
+ * repository, nothing unreadable.
+ */
+function isOwnPullRequestStep(view: CommandView, verb: string, judgement: Judgement): boolean {
+  const allowed = GH_OWN_PR_OPTIONS[verb];
+  if (allowed === undefined || view.args.some(arg => arg.dynamic || arg.glob)) return false;
+  // Options before the group (`gh -R other/repo pr …`) are not read here.
+  if (view.args[0]?.text !== 'pr' || view.args[1]?.text !== verb) return false;
+  const names = [...view.command.assignments, ...judgement.environment];
+  if (names.some(name => GH_TARGET_VARIABLE.test(name))) return false;
+  if (view.command.wrappers.some(wrapper => WRAPPERS[wrapper]?.kind !== 'benign')) return false;
+  // Past `pr <verb>`: an option must be one of the listed ones, and an operand
+  // a pull request number or a branch name.
+  return view.args.slice(2).every((arg, index, rest) => {
+    if (arg.text.startsWith('-')) return allowed.has(arg.text.split('=')[0] ?? arg.text);
+    const previous = rest[index - 1]?.text ?? '';
+    const takesValue = allowed.has(previous) && !GH_SWITCHES.has(previous);
+    if (previous.startsWith('-') && !previous.includes('=') && takesValue) return true;
+    return /^[A-Za-z0-9._/-]+$/.test(arg.text) && !arg.text.includes('//');
+  });
+}
+
 const DATABASE_CLIENTS: ReadonlySet<string> = new Set(['psql', 'mysql', 'mongosh', 'redis-cli']);
 /** Clients whose arguments name the host or database they act on. */
 const HOST_CLIENTS: ReadonlySet<string> = new Set([
@@ -558,6 +661,8 @@ interface Judgement {
   gitRelocated: boolean;
   /** A push in this call was judged by the branch that was checked out: with the lease flag, or plain. */
   pushRelied: 'lease' | 'plain' | undefined;
+  /** Variables the call sets for the commands after it: exported, or assigned on a line of their own. */
+  environment: Set<string>;
 }
 
 function newJudgement(): Judgement {
@@ -574,6 +679,7 @@ function newJudgement(): Judgement {
     branches: new Map(),
     gitRelocated: false,
     pushRelied: undefined,
+    environment: new Set(),
   };
 }
 
@@ -606,11 +712,10 @@ type Options = ParsedOptions<Arg>;
 const MKTEMP = /^\$\(\s*mktemp(\s+-[A-Za-z]+)*\s*\)$/;
 
 function toArg(word: ShellWord, context: RuleContext): Arg {
-  const resolved = resolveWord(word, context.homeDir, context.variables);
+  const resolved = resolveWord(word, context.homeDir);
   if (resolved.dynamic && MKTEMP.test(resolved.text)) {
     // The name is random but the directory is not, and the directory is what is judged.
-    const directory = context.variables?.TMPDIR ?? '/tmp';
-    return { text: join(directory, 'mktemp'), dynamic: false, glob: false, nested: [] };
+    return { text: '/tmp/mktemp', dynamic: false, glob: false, nested: [] };
   }
   return { ...resolved, nested: word.nested };
 }
@@ -657,6 +762,8 @@ interface Evaluation {
    * cannot answer for them.
    */
   links: Map<string, string | undefined>;
+  /** A command made a link whose own name could not be read: no relative path can be trusted. */
+  unplaceable: boolean;
 }
 
 /** Keyed by the context object `evaluateRules` makes for one call, so it ends with the call. */
@@ -677,6 +784,11 @@ async function place(
     if (target === undefined) return { kind: 'unknown' };
     real = `${target}${real.slice(link.length)}`;
     exists = false;
+  }
+  // A link of unknown name may stand anywhere inside the roots: a path that
+  // looks inside one is no longer known to be. One outside stays outside.
+  if (evaluation?.unplaceable === true && writeRootOf(real, context) !== undefined) {
+    return { kind: 'unknown' };
   }
   return { kind: 'resolved', real, exists, inside: isInside(context.repoRoot, real) };
 }
@@ -772,6 +884,9 @@ async function judgeWriteTarget(
   const inRepository = relative(context.repoRoot, where.real);
   if (inRepository === '.git' || inRepository.startsWith('.git/')) {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
+    // `HEAD` is in there: which branch is out is no longer what the file said.
+    branchNoLongerKnown(judgement);
+    judgement.gitRelocated = true;
   }
   if (
     isProtectedPath(where.real, context) ||
@@ -851,8 +966,12 @@ interface GitCommandLine {
    */
   alternatives: GitInvocation[];
   directories: Arg[];
+  /** Values of `-c`: `key=value` settings for this one command. */
+  configs: Arg[];
   configOverride: boolean;
   unknownGlobal: boolean;
+  /** `--git-dir`, `--work-tree` or `--namespace`: the command acts on a repository named there. */
+  relocated: boolean;
 }
 
 /** Global options that take the next word as their value. */
@@ -877,8 +996,10 @@ function parseGit(args: readonly Arg[]): GitCommandLine {
     primary: { subcommand: undefined, args: [] },
     alternatives: [],
     directories: [],
+    configs: [],
     configOverride: false,
     unknownGlobal: false,
+    relocated: false,
   };
   let i = 0;
   while (i < args.length) {
@@ -893,9 +1014,14 @@ function parseGit(args: readonly Arg[]): GitCommandLine {
       const directory = args[i + 1];
       if (directory !== undefined) line.directories.push(directory);
     }
-    if (text === '-c' || text.startsWith('--config-env') || text.startsWith('--exec-path=')) {
+    if (text === '-c') {
+      const setting = args[i + 1];
+      if (setting !== undefined) line.configs.push(setting);
+    }
+    if (text.startsWith('--config-env') || text.startsWith('--exec-path=')) {
       line.configOverride = true;
     }
+    if (/^--(git-dir|work-tree|namespace)(=|$)/.test(text)) line.relocated = true;
     if (GIT_GLOBAL_VALUE.has(text)) {
       i += 2;
     } else {
@@ -916,39 +1042,79 @@ function parseGit(args: readonly Arg[]): GitCommandLine {
   return line;
 }
 
-/**
- * The branch a checkout has out, read from its `HEAD` file. `undefined` for a
- * detached head, or when no checkout is found at or above `directory`.
- */
-async function currentBranch(directory: string | undefined): Promise<string | undefined> {
+interface Checkout {
+  /** The directory holding `.git`. */
+  top: string;
+  gitDir: string;
+}
+
+/** The checkout `directory` is in: the nearest directory at or above it with a `.git`. */
+async function findCheckout(directory: string | undefined): Promise<Checkout | undefined> {
   let at = directory;
   while (at !== undefined) {
     const dotGit = join(at, '.git');
-    let gitDir: string | undefined;
     try {
-      if ((await stat(dotGit)).isDirectory()) {
-        gitDir = dotGit;
-      } else {
-        // A linked worktree: `.git` is a file naming the real git directory.
-        const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(dotGit, 'utf8'))?.[1];
-        gitDir = pointer === undefined ? undefined : resolve(at, pointer.trim());
-      }
+      if ((await stat(dotGit)).isDirectory()) return { top: at, gitDir: dotGit };
+      // A linked worktree: `.git` is a file naming the real git directory.
+      const pointer = /^gitdir:\s*(.+)$/m.exec(await readFile(dotGit, 'utf8'))?.[1];
+      if (pointer !== undefined) return { top: at, gitDir: resolve(at, pointer.trim()) };
     } catch {
       // No `.git` here: look one directory up.
-    }
-    if (gitDir !== undefined) {
-      try {
-        const head = await readFile(join(gitDir, 'HEAD'), 'utf8');
-        return /^ref:\s*refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim();
-      } catch {
-        return undefined;
-      }
     }
     const parent = dirname(at);
     at = parent === at ? undefined : parent;
   }
   return undefined;
 }
+
+/**
+ * The branch a checkout has out: where an earlier command of this call left it,
+ * else what its `HEAD` file says. `undefined` for a detached head, when no
+ * checkout is found at or above `directory`, or when the call itself made the
+ * answer unknowable.
+ */
+async function currentBranch(
+  directory: string | undefined,
+  judgement: Judgement
+): Promise<string | undefined> {
+  if (judgement.gitRelocated) return undefined;
+  const checkout = await findCheckout(directory);
+  if (checkout === undefined) return undefined;
+  const moved = judgement.branches.get(checkout.top);
+  if (moved !== undefined) return moved ?? undefined;
+  try {
+    const head = await readFile(join(checkout.gitDir, 'HEAD'), 'utf8');
+    return /^ref:\s*refs\/heads\/(.+)$/m.exec(head)?.[1]?.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * A push judged earlier in this call went by the branch that was out then. A
+ * loop, a function or a background job can run a later command before it, so
+ * the order the commands are written in proves nothing.
+ */
+function branchNoLongerKnown(judgement: Judgement): void {
+  if (judgement.pushRelied === 'lease') deny(judgement, 'deny.git_force_push_protected');
+  if (judgement.pushRelied === 'plain') signal(judgement, 'risk.mutation_verb', 'unlikely');
+}
+
+/** Records that a command leaves the checkout at `directory` on `branch` (`null`: unknown). */
+async function noteBranchMove(
+  directory: string | undefined,
+  branch: string | null,
+  judgement: Judgement
+): Promise<void> {
+  branchNoLongerKnown(judgement);
+  const checkout = judgement.gitRelocated ? undefined : await findCheckout(directory);
+  if (checkout === undefined) judgement.gitRelocated = true;
+  else judgement.branches.set(checkout.top, branch);
+}
+
+/** Variables that tell git which repository, work tree or configuration to use. */
+const GIT_LOCATION_VARIABLE =
+  /^GIT_(DIR|WORK_TREE|NAMESPACE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|CEILING_DIRECTORIES|CONFIG.*)$/;
 
 /** Commands whose whole output is the name of the branch that is checked out. */
 const CURRENT_BRANCH_COMMANDS: ReadonlySet<string> = new Set([
@@ -974,10 +1140,11 @@ function pushDestination(refspec: string): string | undefined {
   const destination = refspec
     .slice(refspec.lastIndexOf(':') + 1)
     .replace(/^\+/, '')
+    .replace(/\/{2,}/g, '/')
     .replace(/^(refs\/)?heads\//, '');
-  return destination === '' || destination === 'HEAD' || destination === '@'
-    ? undefined
-    : destination;
+  // A pattern (`refs/heads/*`) names every branch it matches, the protected ones included.
+  if (destination === '' || destination === 'HEAD' || destination === '@') return undefined;
+  return /[*?[]/.test(destination) ? undefined : destination;
 }
 
 /** Push options that change neither where a push goes nor what it may overwrite or remove. */
@@ -1014,13 +1181,16 @@ async function judgeGitPush(
   } else if (lease) {
     // With no refspec git pushes the branch that is checked out.
     const named = refspecs.length === 0 ? [plainPath('HEAD')] : refspecs;
-    const current = named.some(namesCurrentBranch) ? await currentBranch(gitDirectory) : undefined;
+    const relies = named.some(namesCurrentBranch);
+    const current = relies ? await currentBranch(gitDirectory, judgement) : undefined;
     const destinations = named.map(refspec => {
       if (namesCurrentBranch(refspec)) return current;
       return refspec.dynamic || refspec.glob ? undefined : pushDestination(refspec.text);
     });
     if (everything || destinations.some(isProtected)) {
       deny(judgement, 'deny.git_force_push_protected');
+    } else if (relies) {
+      judgement.pushRelied = 'lease';
     }
   }
 
@@ -1033,7 +1203,7 @@ async function judgeGitPush(
   }
 
   // Where the push lands, as far as the command and the checkout show it.
-  const checkedOut = await currentBranch(gitDirectory);
+  const checkedOut = await currentBranch(gitDirectory, judgement);
   const pushed = refspecs.length === 0 ? [plainPath('HEAD')] : refspecs;
   const landsOn = pushed.map(refspec => {
     if (namesCurrentBranch(refspec)) return checkedOut;
@@ -1064,12 +1234,13 @@ async function judgeGitPush(
   const plainOptions =
     parsed.values.size === 0 &&
     [...parsed.flags].every(flag => PLAIN_PUSH_FLAGS.has(flag.split('=')[0] ?? flag));
-  if (
-    target === 'checked_out_branch' &&
-    configuredRemote &&
-    plainOptions &&
-    judgement.deny === undefined
-  ) {
+  // So is a push of another unprotected branch, as long as nothing lets it
+  // overwrite what is there: without the lease flag the remote refuses anything
+  // but new commits on top.
+  const settled =
+    target === 'checked_out_branch' || (target === 'other_unprotected_branch' && !lease);
+  if (settled && configuredRemote && plainOptions && judgement.deny === undefined) {
+    if (target === 'checked_out_branch') judgement.pushRelied ??= 'plain';
     return;
   }
   signal(judgement, 'risk.mutation_verb', 'unlikely');
@@ -1150,6 +1321,161 @@ function discardScope(operands: readonly Arg[]): NonNullable<EscalationFacts['un
   return operands.some(operand => operand.dynamic) ? 'unknown' : 'discarded_in_named_paths';
 }
 
+/** How many named files one checkout or restore may bring back and still be read as naming them. */
+const MAX_NAMED_RESTORES = 8;
+const RESTORE_PLAIN_FLAGS: ReadonlySet<string> = new Set([
+  ...['--staged', '-S', '--worktree', '-W', '-q', '--quiet', '-s', '--source', '--'],
+]);
+
+/**
+ * Whether every operand names one file inside the repository: no directory, no
+ * wildcard, nothing in a variable. Bringing back a file named like that loses
+ * what the caller pointed at and nothing else, which is what an edit does too.
+ */
+async function namesOnlyFiles(operands: readonly Arg[], scope: ShellScope): Promise<boolean> {
+  if (operands.length === 0 || operands.length > MAX_NAMED_RESTORES) return false;
+  for (const operand of operands) {
+    if (operand.dynamic || operand.glob || /[*?[]|^:|\/$/.test(operand.text)) return false;
+    const where = await locate(operand.text, scope.cwd, scope.context);
+    if (where.kind !== 'resolved' || !where.inside || where.real === scope.context.repoRoot) {
+      return false;
+    }
+    if (where.exists && (await isDirectory(where.real))) return false;
+  }
+  return true;
+}
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Config keys whose value cannot run a program, move a repository or change where a push goes. */
+const HARMLESS_CONFIG_KEY =
+  /^(user\.(name|email)|color\..+|advice\..+|column\..+|log\.(date|decorate|abbrevcommit|follow)|core\.(quotepath|autocrlf|eol|safecrlf|filemode|ignorecase|precomposeunicode|longpaths|abbrev|whitespace|symlinks|commentchar|untrackedcache|preloadindex)|commit\.(gpgsign|verbose|cleanup)|tag\.(gpgsign|sort)|pull\.(rebase|ff)|merge\.(ff|conflictstyle|stat)|rebase\.(autosquash|autostash|updaterefs)|init\.defaultbranch|diff\.(renames|algorithm|colormoved|noprefix|context|mnemonicprefix)|fetch\.(prune|prunetags)|status\..+|gc\.auto|branch\.(autosetuprebase|sort)|format\.pretty|grep\.(linenumber|patterntype)|blame\.(date|coloring)|rerere\.enabled|help\.autocorrect)$/i;
+
+/** Shell text a git command line hands to a shell, and whether some of it could not be read. */
+function gitScripts(subcommand: string, args: readonly Arg[], parsed: Options): Arg[] {
+  const { positionals } = parsed;
+  const quoted = (words: readonly Arg[]): Arg[] => {
+    if (words.length === 0) return [];
+    const text = words.map(word => `'${word.text.replaceAll("'", "'\\''")}'`).join(' ');
+    return [{ text, dynamic: words.some(word => word.dynamic), glob: false, nested: [] }];
+  };
+  switch (subcommand) {
+    case 'rebase':
+      return valuesOf(parsed, '-x', '--exec');
+    case 'submodule': {
+      // `foreach` hands its words to a shell as one line; a single quoted word is
+      // that line. The words are the command's own, options included.
+      const at = args.findIndex(word => !word.dynamic && word.text === 'foreach');
+      if (at === -1) return [];
+      const words = args
+        .slice(at + 1)
+        .filter((word, index) => index > 0 || !/^(--recursive|-q|--quiet)$/.test(word.text));
+      const line = words.map(word => word.text).join(' ');
+      return words.length === 0
+        ? []
+        : [{ text: line, dynamic: words.some(word => word.dynamic), glob: false, nested: [] }];
+    }
+    case 'bisect': {
+      const at = args.findIndex(word => !word.dynamic && word.text === 'run');
+      return at === -1 ? [] : quoted(args.slice(at + 1));
+    }
+    case 'config': {
+      // A value git will run later: an alias (`!cmd`), a pager, an editor, an ssh command.
+      const [key, value] = positionals;
+      if (key === undefined || value === undefined) return [];
+      if (!key.dynamic && HARMLESS_CONFIG_KEY.test(key.text)) return [];
+      return [{ ...value, text: value.text.replace(/^!/, '') }];
+    }
+    case 'filter-branch':
+      return args.flatMap((arg, index) => {
+        const next = args[index + 1];
+        return !arg.dynamic && /^--[a-z-]+-filter$/.test(arg.text) && next !== undefined
+          ? [next]
+          : [];
+      });
+    case 'difftool':
+    case 'mergetool':
+      return valuesOf(parsed, '-x', '--extcmd');
+    default:
+      return [];
+  }
+}
+
+/** Git subcommands this reader knows. Any other name may be an alias, which can do anything. */
+const GIT_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  ...['add', 'am', 'apply', 'archive', 'bisect', 'blame', 'branch', 'bundle', 'cat-file'],
+  ...['check-ignore', 'checkout', 'checkout-index', 'cherry', 'cherry-pick', 'clean', 'clone'],
+  ...['commit', 'config', 'count-objects', 'credential', 'describe', 'diff', 'diff-tree'],
+  ...['difftool', 'fetch', 'filter-branch', 'filter-repo', 'for-each-ref', 'format-patch'],
+  ...['fsck', 'gc', 'grep', 'hash-object', 'help', 'init', 'log', 'ls-files', 'ls-remote'],
+  ...['ls-tree', 'maintenance', 'merge', 'merge-base', 'mergetool', 'mv', 'name-rev', 'notes'],
+  ...['prune', 'pull', 'push', 'range-diff', 'read-tree', 'rebase', 'reflog', 'remote'],
+  ...['repack', 'replace', 'rerere', 'reset', 'restore', 'rev-list', 'rev-parse', 'revert'],
+  ...['rm', 'shortlog', 'show', 'show-ref', 'sparse-checkout', 'stash', 'status', 'submodule'],
+  ...['switch', 'symbolic-ref', 'tag', 'update-index', 'update-ref', 'verify-commit'],
+  ...['version', 'whatchanged', 'worktree', 'lfs', 'diff-index', 'diff-files', 'var'],
+]);
+
+/**
+ * Where a git command leaves the checkout, when it changes which branch is
+ * out: the branch name, `null` when it moves somewhere this reader cannot
+ * name, `undefined` when it does not move at all.
+ */
+async function branchAfter(
+  subcommand: string,
+  parsed: Options,
+  raw: readonly Arg[],
+  scope: ShellScope
+): Promise<string | null | undefined> {
+  const { positionals } = parsed;
+  const named = (arg: Arg | undefined): string | null =>
+    arg === undefined || arg.dynamic || arg.glob || arg.text === '-' ? null : arg.text;
+  if (!GIT_SUBCOMMANDS.has(subcommand)) return null;
+  switch (subcommand) {
+    case 'checkout': {
+      const created = valuesOf(parsed, '-b', '-B', '--orphan').at(-1);
+      if (created !== undefined) return named(created);
+      // `git checkout [<tree>] -- <paths>` and `git checkout <file>` stay where they are.
+      if (raw.some(arg => !arg.dynamic && arg.text === '--')) return undefined;
+      const [first] = positionals;
+      if (first === undefined) return undefined;
+      if (first.dynamic) return null;
+      const where = await locate(first.text, scope.cwd, scope.context);
+      return where.kind === 'resolved' && where.exists ? undefined : named(first);
+    }
+    case 'switch': {
+      const created = valuesOf(parsed, '-c', '-C', '--create', '--force-create', '--orphan').at(-1);
+      return named(created ?? positionals[0]);
+    }
+    case 'branch':
+      // Renaming: with one name it is the current branch that takes it.
+      if (!hasOption(parsed, '-m', '-M', '--move')) return undefined;
+      return positionals.length === 1 ? named(positionals[0]) : null;
+    case 'rebase':
+      // `git rebase <upstream> <branch>` checks the branch out first.
+      return positionals.length >= 2 ? named(positionals[1]) : undefined;
+    case 'symbolic-ref':
+      return positionals.length >= 2 ? null : undefined;
+    case 'bisect':
+    case 'worktree':
+    case 'submodule':
+    case 'stash':
+      return ['run', 'start', 'reset', 'good', 'bad', 'skip', 'branch'].includes(
+        positionals[0]?.text ?? ''
+      )
+        ? null
+        : undefined;
+    default:
+      return undefined;
+  }
+}
+
 /** Raises the signal for git commands that throw away work or history without a deny rule. */
 async function judgeGitDiscard(
   subcommand: string,
@@ -1164,16 +1490,29 @@ async function judgeGitDiscard(
   let hint: ReversibleHint = 'unknown';
   switch (subcommand) {
     case 'rebase':
+      // Rewrites commits of the local branch only, and the reflog keeps the old
+      // ones. What a rebase runs on the way (`--exec`) is judged as a script.
+      discards = raw.some(arg => arg.dynamic);
+      hint = 'likely';
+      break;
     case 'filter-branch':
     case 'filter-repo':
       discards = true;
-      hint = subcommand === 'rebase' ? 'likely' : 'unlikely';
+      hint = 'unlikely';
       break;
     case 'branch':
+      // Deleting unmerged work, or moving a branch name onto other commits.
       discards =
-        hasOption(parsed, '-D') ||
-        (hasOption(parsed, '-d', '--delete') && hasOption(parsed, '-f', '--force'));
+        hasOption(parsed, '-D', '-M', '-C') ||
+        (hasOption(parsed, '-f', '--force') && positionals.length > 0) ||
+        (hasOption(parsed, '-m', '--move', '-c', '--copy') &&
+          positionals.some(
+            arg => arg.dynamic || scope.context.protectedBranches.includes(arg.text)
+          ));
       hint = 'likely';
+      break;
+    case 'worktree':
+      discards = verb === 'remove' || verb === 'prune' || verb === 'move';
       break;
     case 'tag':
       discards = hasOption(parsed, '-d', '--delete');
@@ -1198,6 +1537,19 @@ async function judgeGitDiscard(
         paths.includes(true);
       if (discards && hasWildcard(positionals)) deny(judgement, 'deny.git_discard_worktree');
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
+      // `-B` moves an existing branch onto other commits.
+      if (hasOption(parsed, '-B')) discards = true;
+      else if (discards && judgement.deny === undefined) {
+        // Named files only: `git checkout [<tree>] -- <file>…`, or files that exist.
+        const dashes = raw.findIndex(arg => !arg.dynamic && arg.text === '--');
+        const files =
+          dashes === -1 ? positionals.filter((_, index) => paths[index]) : raw.slice(dashes + 1);
+        const others = positionals.length - files.length;
+        const plain = [...parsed.flags].every(flag => flag === '-q' || flag === '--quiet');
+        if (plain && parsed.values.size === 0 && others <= 1 && !raw.some(arg => arg.dynamic)) {
+          discards = !(await namesOnlyFiles(files, scope));
+        }
+      }
       break;
     }
     case 'restore':
@@ -1207,10 +1559,20 @@ async function judgeGitDiscard(
         deny(judgement, 'deny.git_discard_worktree');
       }
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
+      if (
+        discards &&
+        judgement.deny === undefined &&
+        !raw.some(arg => arg.dynamic) &&
+        [...parsed.flags, ...parsed.values.keys()].every(flag => RESTORE_PLAIN_FLAGS.has(flag))
+      ) {
+        discards = !(await namesOnlyFiles(positionals, scope));
+      }
       break;
     case 'switch':
       discards = hasOption(parsed, '--discard-changes', '-f', '--force');
       if (discards) deny(judgement, 'deny.git_discard_worktree');
+      // `-C` moves an existing branch onto other commits.
+      if (hasOption(parsed, '-C', '--force-create')) discards = true;
       break;
     case 'stash':
       discards = verb === 'drop' || verb === 'clear';
@@ -1266,8 +1628,11 @@ async function judgeGitDiscard(
       if (key !== undefined && !key.dynamic && writes && REMOTE_ROUTING_KEY.test(key.text)) {
         deny(judgement, 'deny.git_push_destination_change');
       }
-      // A key in a variable may be one of those: flagged, since it cannot be read.
-      discards = key?.dynamic && writes;
+      // Any other setting that is not known to be inert may name a program git
+      // runs later (`core.hooksPath`, `core.sshCommand`, an alias) or move the
+      // repository. A key in a variable may be one of those.
+      discards =
+        writes && key !== undefined && (key.dynamic || !HARMLESS_CONFIG_KEY.test(key.text));
       hint = 'likely';
       break;
     }
@@ -1280,7 +1645,8 @@ async function judgeGitDiscard(
 async function judgeGitSubcommand(
   invocation: GitInvocation,
   scope: ShellScope,
-  gitDirectory: string | undefined
+  gitDirectory: string | undefined,
+  mode: Mode
 ): Promise<Options | undefined> {
   const { subcommand } = invocation;
   const { context, judgement } = scope;
@@ -1306,6 +1672,18 @@ async function judgeGitSubcommand(
   for (const target of gitWriteTargets(subcommand, parsed, context)) {
     await judgeWriteTarget(target, scope);
   }
+
+  // What the command hands to a shell is a script of this call like any other.
+  const scripts = gitScripts(subcommand, invocation.args, parsed);
+  if (scripts.length > 0 && subcommand !== 'config') signal(judgement, 'risk.opaque_shell');
+  if (mode.nesting < MAX_SCRIPT_NESTING) {
+    const inner: Mode = { nesting: mode.nesting + 1, speculative: mode.speculative };
+    for (const script of scripts) {
+      await judgeScript(parseShell(script.text), scope.cwd, context, judgement, inner);
+    }
+  }
+  const moved = await branchAfter(subcommand, parsed, invocation.args, scope);
+  if (moved !== undefined) await noteBranchMove(gitDirectory, moved, judgement);
 
   switch (subcommand) {
     case 'push':
@@ -1335,10 +1713,26 @@ async function judgeGitSubcommand(
 }
 
 /** Returns whether this git call is a known read-only one. */
-async function judgeGit(view: CommandView, scope: ShellScope): Promise<boolean> {
+async function judgeGit(view: CommandView, scope: ShellScope, mode: Mode): Promise<boolean> {
   const { context, judgement } = scope;
   const line = parseGit(view.args);
+  for (const setting of line.configs) {
+    const equals = setting.text.indexOf('=');
+    const key = equals === -1 ? setting.text : setting.text.slice(0, equals);
+    if (!setting.dynamic && HARMLESS_CONFIG_KEY.test(key)) continue;
+    line.configOverride = true;
+    // An alias (`!cmd`), a pager, an ssh command: the value may be a command line.
+    const value = equals === -1 ? '' : setting.text.slice(equals + 1).replace(/^!/, '');
+    if (value.trim() !== '' && mode.nesting < MAX_SCRIPT_NESTING) {
+      const inner: Mode = { nesting: mode.nesting + 1, speculative: true };
+      await judgeScript(parseShell(value), scope.cwd, context, judgement, inner);
+    }
+  }
   if (line.configOverride || line.unknownGlobal) signal(judgement, 'risk.opaque_shell');
+  // Told where its repository is: the checkout this call started in says nothing about it.
+  const located =
+    line.relocated || view.command.assignments.some(name => GIT_LOCATION_VARIABLE.test(name));
+  if (located) signal(judgement, 'risk.opaque_shell');
 
   // `git -C dir` runs there: the branch that matters is that checkout's.
   let gitDirectory = scope.cwd;
@@ -1356,15 +1750,18 @@ async function judgeGit(view: CommandView, scope: ShellScope): Promise<boolean> 
     }
   }
 
+  if (located || judgement.gitRelocated) gitDirectory = undefined;
+
   // The subcommand itself sits in a variable: `git $SUB --hard`.
   if (line.primary.subcommand === undefined && view.args.some(arg => arg.dynamic)) {
     signal(judgement, 'risk.opaque_shell');
+    await noteBranchMove(gitDirectory, null, judgement);
   }
 
   for (const alternative of line.alternatives) {
-    await judgeGitSubcommand(alternative, scope, gitDirectory);
+    await judgeGitSubcommand(alternative, scope, gitDirectory, mode);
   }
-  const parsed = await judgeGitSubcommand(line.primary, scope, gitDirectory);
+  const parsed = await judgeGitSubcommand(line.primary, scope, gitDirectory, mode);
   const { subcommand } = line.primary;
 
   if (parsed === undefined || subcommand === undefined || !READ_ONLY_GIT.has(subcommand)) {
@@ -1462,6 +1859,41 @@ async function removesOnlyBuildOutput(
   return buildOutput;
 }
 
+/**
+ * Whether everything a removal or a move names is a path of its own inside a
+ * write root: nothing in a variable, not a root itself, nothing of git's own
+ * data. A wildcard counts by the directory it is anchored in.
+ *
+ * Removing or renaming a file named like that is what editing a checkout is:
+ * the file-writing tools may already overwrite it. A whole top-level directory
+ * of the repository is a different size of loss, so a recursive removal of one
+ * is left for a closer look.
+ */
+async function namesRepositoryPaths(
+  targets: readonly ResolvedWord[],
+  recursive: boolean,
+  scope: ShellScope
+): Promise<boolean> {
+  const { context } = scope;
+  if (targets.length === 0) return false;
+  for (const target of targets) {
+    if (target.dynamic) return false;
+    let text = target.text;
+    if (target.glob) {
+      text = text.slice(0, text.search(/[*?[]/));
+      text = text.slice(0, text.lastIndexOf('/') + 1) || '.';
+    }
+    const where = await locate(text, scope.cwd, context);
+    if (where.kind !== 'resolved') return false;
+    const root = writeRootOf(where.real, context);
+    if (root === undefined) return false;
+    const inRoot = relative(root, where.real);
+    if (inRoot === '' || inRoot === '.git' || inRoot.startsWith('.git/')) return false;
+    if (recursive && root === context.repoRoot && !inRoot.includes('/')) return false;
+  }
+  return true;
+}
+
 /** Judges paths a command removes; `recursive` adds the never-acceptable directories. */
 async function judgeRemoval(
   targets: readonly ResolvedWord[],
@@ -1485,9 +1917,14 @@ async function judgeRm(view: CommandView, scope: ShellScope): Promise<void> {
     hasOption(parsed, '-r', '-R') ||
     hasAbbreviated(parsed, '--recursive', '--r');
   const buildOutput = await removesOnlyBuildOutput(parsed.positionals, scope);
-  // Removing what a build makes again is not a risk signal of its own.
-  if (buildOutput) scope.judgement.settled.add(view.command);
-  await judgeRemoval(parsed.positionals, recursive, scope, buildOutput);
+  // Removing what a build makes again is not a risk signal of its own, and
+  // neither is removing paths the command names one by one inside a write root.
+  const named =
+    view.command.via !== 'exec' &&
+    !view.args.some(arg => arg.dynamic) &&
+    (await namesRepositoryPaths(parsed.positionals, recursive, scope));
+  if (buildOutput || named) scope.judgement.settled.add(view.command);
+  await judgeRemoval(parsed.positionals, recursive, scope, buildOutput || named);
 }
 
 /** find: the files its actions write, and what `-delete` removes. */
@@ -1499,14 +1936,37 @@ async function judgeFind(view: CommandView, scope: ShellScope): Promise<void> {
       await judgeWriteTarget(file, scope);
     }
   }
-  if (!args.some(arg => arg.text === '-delete')) return;
+  const readers = view.execChildren.filter(child => CONTENT_READERS.has(child.command.head));
+  if (readers.length > 0) {
+    // What find hands to a reader is chosen by its name tests and start paths.
+    const named = args.filter(
+      (arg, index) => !arg.text.startsWith('-') || FIND_NAME_TESTS.has(args[index - 1]?.text ?? '')
+    );
+    for (const arg of named) {
+      if (isSecretPath(literalView(arg.text, scope.context))) {
+        deny(scope.judgement, 'deny.secret_read');
+      }
+    }
+  }
+  const removes = view.execChildren.some(child => REMOVERS.has(child.command.head));
+  if (!removes && !args.some(arg => arg.text === '-delete')) return;
   const expression = args.findIndex(arg => !arg.dynamic && /^(-|\(|!)/.test(arg.text));
   const starts = args.slice(0, expression === -1 ? args.length : expression);
   // `find . -delete` empties the tree. A test before it (`-name '*.pyc'`)
   // narrows what goes to something this gate cannot enumerate: that escalates.
-  const filtered = args
-    .slice(expression === -1 ? args.length : expression)
-    .some(arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text)));
+  // The words of an `-exec` command are that command's, not tests of find's.
+  let inExec = false;
+  const tests = args.slice(expression === -1 ? args.length : expression).filter(arg => {
+    if (inExec) {
+      if (!arg.dynamic && (arg.text === ';' || arg.text === '+')) inExec = false;
+      return false;
+    }
+    inExec = !arg.dynamic && FIND_EXEC_ACTIONS.has(arg.text);
+    return !inExec;
+  });
+  const filtered = tests.some(
+    arg => arg.dynamic || (arg.text.startsWith('-') && !FIND_UNFILTERED.test(arg.text))
+  );
   const removed = starts.length > 0 ? starts : [plainPath('.')];
   const buildOutput = await removesOnlyBuildOutput(removed, scope);
   await judgeRemoval(removed, !filtered, scope, buildOutput);
@@ -1699,6 +2159,63 @@ function writeTargets(view: CommandView, judgement: Judgement): Arg[] {
   }
 }
 
+/** Build and package tools, and the options that say where they write or run. */
+const BUILD_TOOLS: ReadonlySet<string> = new Set([
+  ...['go', 'bun', 'deno', 'tsc', 'esbuild', 'vite', 'webpack', 'rollup', 'swc', 'babel'],
+  ...['tsup', 'cargo', 'npm', 'pnpm', 'yarn', 'make', 'gmake', 'cmake', 'ninja', 'mvn'],
+  ...['gradle', 'dotnet', 'javac', 'pip', 'pip3', 'uv', 'pyinstaller', 'next', 'nuxt'],
+]);
+const BUILD_OUTPUT_OPTION =
+  /^(--(?:outfile|outFile|outdir|outDir|out-dir|output|out|target-dir|destdir|install-dir|declarationDir|tsBuildInfoFile|prefix|root|cwd|dir|directory|install-prefix|output-path|dist-dir|distDir))(?:=(.*))?$/;
+/** Short options that name a directory to work in or a file to write, per tool. */
+const BUILD_SHORT_OUTPUTS: Readonly<Record<string, readonly string[]>> = {
+  go: ['-o'],
+  make: ['-C'],
+  gmake: ['-C'],
+  ninja: ['-C'],
+  cmake: ['-B', '-S'],
+  pnpm: ['-C'],
+  javac: ['-d'],
+  babel: ['-d', '-o'],
+  esbuild: [],
+  tsup: ['-d'],
+  dotnet: ['-o'],
+  rollup: ['-o', '-d'],
+  webpack: ['-o'],
+};
+/** `--target` is a directory for these and a platform name for every other tool. */
+const TARGET_IS_DIRECTORY: ReadonlySet<string> = new Set(['pip', 'pip3', 'uv']);
+
+/**
+ * Where a build tool was told to write or to run: `go build -o`, `--outfile`,
+ * `--outDir`, `--target-dir`, `make -C`, `npm --prefix`. These tools have
+ * grammars of their own, so the options are picked out by name.
+ */
+function buildOutputs(view: CommandView): Arg[] {
+  const { head } = view.command;
+  if (!BUILD_TOOLS.has(head)) return [];
+  const short = BUILD_SHORT_OUTPUTS[head] ?? [];
+  const { args } = view;
+  return args.flatMap((arg, index) => {
+    if (arg.dynamic && !arg.text.startsWith('-')) return [];
+    const next = args[index + 1];
+    const long = BUILD_OUTPUT_OPTION.exec(arg.text);
+    if (long !== null) {
+      if (long[2] !== undefined) return [{ ...arg, text: long[2] }];
+      return next === undefined ? [] : [next];
+    }
+    const target = /^(--target|-t)(?:=(.*))?$/.exec(arg.text);
+    if (target !== null && TARGET_IS_DIRECTORY.has(head)) {
+      if (target[2] !== undefined) return [{ ...arg, text: target[2] }];
+      return next === undefined ? [] : [next];
+    }
+    const flag = short.find(name => arg.text === name || arg.text.startsWith(name));
+    if (flag === undefined) return [];
+    if (arg.text !== flag) return [{ ...arg, text: arg.text.slice(flag.length) }];
+    return next === undefined ? [] : [next];
+  });
+}
+
 // --- signals ---------------------------------------------------------------
 
 function isNetworkClient(head: string): boolean {
@@ -1744,6 +2261,22 @@ function judgeNetworkClient(view: CommandView, judgement: Judgement): void {
   if (risky) signal(judgement, 'risk.network_request', 'unlikely');
 }
 
+/** Whether a container or cluster client was asked only to show state. */
+function onlyShowsState(head: string, positionals: readonly Arg[]): boolean {
+  const [first, second] = positionals.map(arg => (arg.dynamic ? '' : arg.text));
+  if (first === undefined) return false;
+  if (head === 'docker' || head === 'podman') {
+    if (CONTAINER_READ_VERBS.has(first)) return true;
+    return second !== undefined && (CONTAINER_GROUP_READ_VERBS[first] ?? []).includes(second);
+  }
+  if (head === 'kubectl') {
+    if (!CLUSTER_READ_VERBS.has(first)) return false;
+    // `kubectl get secret -o yaml` prints the credential itself.
+    return !positionals.slice(1).some(arg => arg.dynamic || CLUSTER_SECRET_RESOURCE.test(arg.text));
+  }
+  return false;
+}
+
 /** Raises the mutation signal for the verbs that change state outside what git can undo. */
 function judgeMutation(view: CommandView, judgement: Judgement): void {
   const { command, args } = view;
@@ -1755,8 +2288,30 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
   const hint = MUTATION_HEADS[head];
-  if (hint !== undefined && !judgement.settled.has(command)) {
+  if (hint !== undefined && !judgement.settled.has(command) && !onlyShowsState(head, positionals)) {
     signal(judgement, 'risk.mutation_verb', hint);
+  }
+  const words = positionals.map(arg => arg.text).join(' ');
+  if (STATE_CHANGING_VERBS[head]?.test(words) || ALWAYS_STATE_CHANGING.has(head)) {
+    signal(judgement, 'risk.mutation_verb', 'unlikely');
+  }
+  if (CLOUD_CLIENTS.has(head) && positionals.length > 0) {
+    const reads = positionals.slice(0, 4).some(arg => CLOUD_READ_WORD.test(arg.text));
+    if (!reads) signal(judgement, 'risk.mutation_verb', 'unlikely');
+  }
+  if (head === 'crontab' && !hasOption(parsed, '-l')) {
+    signal(judgement, 'risk.mutation_verb', 'unlikely');
+  }
+  if (head === 'kill') {
+    // `-1` and `0` are every process the caller may signal, a negative number a
+    // whole group, `1` init; a target in a variable may be any of them.
+    const broad = args.some(
+      (arg, index) => arg.dynamic || (index > 0 && /^(-\d+|0|1)$/.test(arg.text))
+    );
+    const [only] = args;
+    if (broad || (args.length === 1 && only !== undefined && /^(-1|0|1)$/.test(only.text))) {
+      signal(judgement, 'risk.mutation_verb', 'unlikely');
+    }
   }
   if (HOST_CLIENTS.has(head)) {
     // A database client always connects somewhere: one that names nothing says `unknown`.
@@ -1774,7 +2329,7 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   if (['chmod', 'chown', 'chgrp'].includes(head) && recursive) {
     signal(judgement, 'risk.mutation_verb');
   }
-  if (PUBLISHERS.has(head) && positionals[0]?.text === 'publish') {
+  if (PUBLISHERS.has(head) && REGISTRY_VERBS.has(positionals[0]?.text ?? '')) {
     signal(judgement, 'risk.mutation_verb', 'unlikely');
   }
   if (head === 'rsync' && [...parsed.flags].some(flag => /^--(delete|remove-source)/.test(flag))) {
@@ -1783,7 +2338,8 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   if (head === 'gh') {
     const [group, verb] = positionals.map(arg => arg.text);
     if (group !== undefined && GH_GROUPS.has(group) && verb !== undefined) {
-      if (!GH_READ_VERBS.has(verb)) {
+      const ownStep = group === 'pr' && isOwnPullRequestStep(view, verb, judgement);
+      if (!GH_READ_VERBS.has(verb) && !ownStep) {
         signal(judgement, 'risk.mutation_verb', 'unlikely');
         noteFact(judgement.facts, 'githubAction', githubAction(group, verb));
       }
@@ -1868,7 +2424,7 @@ function scanCodeStrings(code: string): { strings: CodeString[]; complete: boole
 
 /** Calls that hand their argument to a shell or run it as a command. */
 const EXEC_CALL =
-  /(?:\b(?:system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|exec|execSync|execFile|execFileSync|spawn|spawnSync|shell_exec|passthru|proc_open|sh|shell|cmd|subprocess|child_process)|[$`])\s*\(?\s*(\[\s*)?$/;
+  /(?:\b(?:system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|exec|execute|execSync|execFile|execFileSync|spawn|spawnSync|shell_exec|passthru|proc_open|sh|shell|cmd|subprocess|child_process)|[$`])\s*\(?\s*(\[\s*)?$/;
 /** Calls that open the file their argument names. */
 const READ_CALL =
   /\b(?:open|fopen|readFileSync|readFile|createReadStream|read_text|read_bytes|read|file_get_contents|load_dotenv|dotenv_values|config|Path|slurp)\s*\(\s*$/;
@@ -2005,8 +2561,11 @@ function fileArguments(view: CommandView): Arg[] {
   // files it reads; for any other, every value that is not text or a credential in use.
   const values = [...parsed.values.entries()].flatMap(([name, list]) => {
     if (TEXT_VALUE_FLAGS.has(name) || CREDENTIAL_USE_FLAGS.has(name)) return [];
-    if (hasSpec(head))
-      return (FILE_VALUE_FLAGS[SPEC_ALIASES[head] ?? head] ?? []).includes(name) ? list : [];
+    if (hasSpec(head)) {
+      if (!(FILE_VALUE_FLAGS[SPEC_ALIASES[head] ?? head] ?? []).includes(name)) return [];
+      // `gh api -F key=@file` sends the file: the name after `@` is what is read.
+      return list.map(value => ({ ...value, text: value.text.replace(/^([^=]*=)?@/, '') }));
+    }
     return COMMON_OUTPUT_FLAGS.includes(name) ? [] : list;
   });
   return [...operands, ...values];
@@ -2022,7 +2581,8 @@ const FILE_VALUE_FLAGS: Readonly<Record<string, readonly string[]>> = {
   wget: ['--post-file', '--body-file', '-i', '--input-file', '--load-cookies'],
   patch: ['-i', '--input'],
   node: ['--env-file', '-r', '--require', '--import'],
-  docker: ['--env-file'],
+  docker: ['--env-file', '-f', '--file'],
+  gh: ['-F', '--body-file', '--input', '--notes-file', '--field'],
   openssl: ['-in', '-inkey', '-key', '-kfile', '-passin'],
   gpg: ['--passphrase-file'],
   rsync: ['--files-from', '--password-file'],
@@ -2203,37 +2763,56 @@ const EMBEDDED = new WeakMap<CommandView, ParsedShell[]>();
 const MAX_EMBEDDED_SCRIPTS = 6;
 
 /**
- * Short options whose value is text in the tools that have them: a test name
- * filter, a title, a message. Their value is never read as a command. Options
- * that hand over a command (`-c`, `-x`, `--exec`, `--command`, `--run`) are
- * deliberately not here.
+ * Options whose value is text in the tools that have them: a test name, a
+ * title, a message, a filter. Options that hand over a command (`-c`, `-x`,
+ * `--exec`, `--command`, `--run`) are deliberately not here.
  */
-const TEXT_SHORT_FLAGS: ReadonlySet<string> = new Set(['-g', '-t', '-e', '-m', '-k']);
+const TEXT_OPTION_NAMES: ReadonlySet<string> = new Set([
+  ...['-g', '-t', '-e', '-m', '-k', '--filter', '--title', '--grep', '--body', '--message'],
+  ...['--name', '--description', '--subject', '--label', '--comment', '--reason', '--notes'],
+  ...['--search', '--query', '--testNamePattern', '--test-name-pattern', '--grep-invert'],
+]);
+/** Commands a text value would have to start with to be read as a command after all. */
+const COMMAND_STARTS: ReadonlySet<string> = new Set([...EMBEDDED_HEADS, 'cd']);
 
-function isTextFlag(text: string): boolean {
-  const name = text.split('=')[0] ?? text;
-  return TEXT_SHORT_FLAGS.has(name) || TEXT_VALUE_FLAGS.has(name);
+function isTextOption(text: string): boolean {
+  return TEXT_OPTION_NAMES.has(text.split('=')[0] ?? text);
+}
+
+/** The first word of a text, as a command name would be written. */
+function firstWord(text: string): string {
+  const word = /^\s*([^\s;&|<>()]+)/.exec(text)?.[1] ?? '';
+  return word.slice(word.lastIndexOf('/') + 1);
 }
 
 function findEmbeddedScripts(view: CommandView): ParsedShell[] {
   if (!runsItsArguments(view)) return [];
+  // A tool known to run its arguments has no text options worth trusting.
+  const trustsText = !ARGUMENT_RUNNERS.has(view.command.head);
   const scripts: ParsedShell[] = [];
   let suffixes = 0;
   let quoted = 0;
   let unread = false;
   view.args.forEach((arg, index) => {
     const previous = view.args[index - 1];
-    // The value of a text option is a name or a message, whatever it says.
-    if (previous !== undefined && !previous.dynamic && isTextFlag(previous.text)) return;
-    if (!arg.dynamic && arg.text.startsWith('-') && isTextFlag(arg.text)) return;
+    const attached = !arg.dynamic && arg.text.startsWith('-') && arg.text.includes('=');
+    const value = attached ? arg.text.slice(arg.text.indexOf('=') + 1) : arg.text;
+    // The value of a text option is a name or a message, unless it starts the
+    // way a command does: `-t "does not run git clean"` is a name, and
+    // `-e 'git clean …'` is still read.
+    const isTextValue =
+      trustsText &&
+      ((attached && isTextOption(arg.text)) ||
+        (previous !== undefined && !previous.dynamic && isTextOption(previous.text)));
+    if (isTextValue && !COMMAND_STARTS.has(firstWord(value))) return;
     const name = arg.text.slice(arg.text.lastIndexOf('/') + 1);
     if (!arg.dynamic && EMBEDDED_HEADS.has(name)) {
-      if (suffixes++ < MAX_EMBEDDED_SCRIPTS)
+      if (suffixes++ < MAX_EMBEDDED_SCRIPTS) {
         scripts.push(parseArgv(view.command.args.slice(index)));
-      else unread = true;
+      } else unread = true;
     }
-    if (/\s/.test(arg.text.trim())) {
-      if (quoted++ < MAX_EMBEDDED_SCRIPTS) scripts.push(parseShell(arg.text));
+    if (/\s/.test(value.trim())) {
+      if (quoted++ < MAX_EMBEDDED_SCRIPTS) scripts.push(parseShell(value));
       else unread = true;
     }
   });
@@ -2243,9 +2822,6 @@ function findEmbeddedScripts(view: CommandView): ParsedShell[] {
   }
   return scripts;
 }
-
-// --- one command -----------------------------------------------------------
-
 async function changeDirectory(view: CommandView, scope: ShellScope): Promise<string | undefined> {
   const { context, judgement } = scope;
   const [target] = parseOptions(view.args).positionals;
@@ -2261,6 +2837,61 @@ async function changeDirectory(view: CommandView, scope: ShellScope): Promise<st
   }
   if (!where.inside) signal(judgement, 'risk.cwd_outside_root');
   return where.real;
+}
+
+/**
+ * Remembers the symlinks a command creates, for the commands after it in the
+ * same call: `ln -s <target> <link>`, with a directory as the last word, or
+ * with `-t`. The link does not exist yet when the next command is judged, so
+ * without this a write through it would be placed where the link's name is.
+ */
+async function noteLinks(view: CommandView, scope: ShellScope): Promise<void> {
+  const { context } = scope;
+  const evaluation = EVALUATIONS.get(context);
+  const parsed = parseOptions(view.args, specFor(view.command.head));
+  if (evaluation === undefined || !hasOption(parsed, '-s', '--symbolic')) return;
+  const into = valuesOf(parsed, ...TARGET_DIRECTORY).at(-1);
+  const sources = into === undefined ? parsed.positionals.slice(0, -1) : parsed.positionals;
+  const last = into ?? parsed.positionals.at(-1);
+  if (last === undefined) return;
+  // With one word, the link is made here under the target's own name.
+  interface Link {
+    target: Arg;
+    link: string | undefined;
+  }
+  const pairs: Link[] =
+    sources.length === 0
+      ? [{ target: last, link: last.dynamic ? undefined : basename(last.text) }]
+      : sources.flatMap((target): Link[] => {
+          if (last.dynamic) return [{ target, link: undefined }];
+          const inside = join(last.text, basename(target.text));
+          // `ln -s a b` names the link `b`, or `b/a` when `b` is a directory:
+          // both are remembered, since which one holds is decided at run time.
+          return into === undefined && sources.length === 1
+            ? [
+                { target, link: last.text },
+                { target, link: inside },
+              ]
+            : [{ target, link: inside }];
+        });
+  for (const { target, link } of pairs) {
+    // A link whose own name is unknown could be any path: nothing later is placeable.
+    if (link === undefined) {
+      evaluation.unplaceable = true;
+      continue;
+    }
+    const at = await locate(link, scope.cwd, context);
+    if (at.kind !== 'resolved') continue;
+    let points: string | undefined;
+    if (!target.dynamic && !target.glob) {
+      const from = isAbsolute(target.text) ? target.text : join(dirname(at.real), target.text);
+      const to = await locate(from, scope.cwd, context);
+      points = to.kind === 'resolved' ? to.real : undefined;
+    }
+    evaluation.links.set(at.real, points);
+  }
+  // What was placed before the links existed is placed again when asked.
+  evaluation.located.clear();
 }
 
 /**
@@ -2292,6 +2923,57 @@ async function runsFetchedFile(view: CommandView, scope: ShellScope): Promise<bo
   return where.kind === 'resolved' && judgement.fetched.has(rootView(where.real, context));
 }
 
+/** Commands that do the same whatever a substitution among their arguments turns out to say. */
+const VALUE_INDIFFERENT: ReadonlySet<string> = new Set([
+  ...TEXT_ONLY,
+  ...['', 'test', '[', '[[', 'export', 'local', 'declare', 'typeset', 'readonly', 'sleep'],
+  ...['basename', 'dirname', 'wc', 'stat', 'du', 'ls'],
+]);
+/** Commands that only look at the names `xargs` hands them, never at what is in the files. */
+const NAME_ONLY: ReadonlySet<string> = new Set([
+  ...['wc', 'ls', 'stat', 'du', 'file', 'basename', 'dirname', 'echo', 'printf', 'true', 'test'],
+]);
+
+/**
+ * Whether an opaque construct is one the rules have read in full, so that it
+ * needs no signal of its own.
+ *
+ * A substitution's body is judged as commands of this call; what is left
+ * unknown is only the text it prints, which matters to the command holding it
+ * and not to one that merely prints or stores it. `find -exec` with a command
+ * that only reads is `grep -r` spelled differently. `xargs` feeding names to a
+ * command that only looks at names adds nothing either.
+ */
+function isRead(kind: OpaqueKind, view: CommandView): boolean {
+  const { command } = view;
+  const plain = command.wrappers.every(wrapper => WRAPPERS[wrapper]?.kind === 'benign');
+  switch (kind) {
+    case 'command_substitution':
+      return plain && VALUE_INDIFFERENT.has(command.head);
+    case 'find_exec':
+      return (
+        view.execChildren.length > 0 &&
+        view.execChildren.every(
+          child =>
+            READ_ONLY_HEADS.has(child.command.head) &&
+            child.command.head !== 'find' &&
+            child.command.opaque.length === 0 &&
+            child.command.wrappers.length === 0 &&
+            child.command.redirections.length === 0
+        )
+      );
+    case 'xargs':
+      return (
+        NAME_ONLY.has(command.head) &&
+        command.wrappers.every(
+          wrapper => wrapper === 'xargs' || WRAPPERS[wrapper]?.kind === 'benign'
+        )
+      );
+    default:
+      return false;
+  }
+}
+
 /** Judges one command. Returns whether it matched the read-only allow rule. */
 async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): Promise<boolean> {
   const { command, args } = view;
@@ -2307,7 +2989,7 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
     else if (!where.inside) signal(judgement, 'risk.cwd_outside_root');
   }
 
-  if (command.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
+  if (command.opaque.some(kind => !isRead(kind, view))) signal(judgement, 'risk.opaque_shell');
   if (command.assignments.some(name => EXEC_VARIABLES.has(name))) {
     signal(judgement, 'risk.opaque_shell');
   }
@@ -2315,17 +2997,39 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
     ? args.map(arg => /^([A-Za-z_][A-Za-z0-9_]*)=/.exec(arg.text)?.[1] ?? '')
     : [];
   if (exported.some(name => EXEC_VARIABLES.has(name))) signal(judgement, 'risk.opaque_shell');
+  for (const name of [...exported, ...(command.head === '' ? command.assignments : [])]) {
+    if (name === '') continue;
+    judgement.environment.add(name);
+    if (GIT_LOCATION_VARIABLE.test(name)) {
+      branchNoLongerKnown(judgement);
+      judgement.gitRelocated = true;
+    }
+  }
 
   let gitReadOnly = false;
-  if (command.head === 'git') gitReadOnly = await judgeGit(view, scope);
+  if (command.head === 'git') gitReadOnly = await judgeGit(view, scope, mode);
   if (command.head === 'rm' || command.head === 'rimraf') await judgeRm(view, scope);
   if (command.head === 'find') await judgeFind(view, scope);
   if (command.head === 'rg' && hasOption(parseOptions(args, specFor('rg')), ...RG_EXEC_FLAGS)) {
     signal(judgement, 'risk.opaque_shell');
   }
 
+  if (command.head === 'mv') {
+    const moved = parseOptions(args, specFor('mv'));
+    const operands = [...moved.positionals, ...valuesOf(moved, ...TARGET_DIRECTORY)];
+    // A rename inside the write roots loses nothing a file write could not.
+    if (
+      command.via !== 'exec' &&
+      !args.some(arg => arg.dynamic) &&
+      (await namesRepositoryPaths(operands, false, scope))
+    ) {
+      judgement.settled.add(command);
+    }
+  }
+
   const targets = [
     ...writeTargets(view, judgement),
+    ...buildOutputs(view),
     ...command.wrapperTargets.map(word => toArg(word, context)),
     ...command.redirections
       .filter(redirection => redirection.write)
@@ -2339,6 +3043,7 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
     }
   }
   if (await runsFetchedFile(view, scope)) deny(judgement, 'deny.pipe_to_shell');
+  if (command.head === 'ln' || command.head === 'cp') await noteLinks(view, scope);
 
   await judgeReads(view, scope, mode);
   judgeMutation(view, judgement);
@@ -2441,7 +3146,9 @@ function judgeAcrossCommands(
   const members = new Map<number, number[]>();
   views.forEach((view, index) => {
     for (const stage of view.command.pipelinePath) {
-      members.set(stage.id, [...(members.get(stage.id) ?? []), index]);
+      const list = members.get(stage.id);
+      if (list === undefined) members.set(stage.id, [index]);
+      else list.push(index);
     }
   });
   views.forEach((later, index) => {
@@ -2524,6 +3231,13 @@ function printedText(view: CommandView): string | undefined {
   return undefined;
 }
 
+/** How many words fed to `xargs` are put in place: the dangerous ones are short. */
+const MAX_FED_WORDS = 64;
+
+function literalWord(text: string): ShellWord {
+  return { parts: [{ kind: 'literal', text }], nested: [] };
+}
+
 /** Judges one script. Returns whether every command in it matched the read-only allow rule. */
 async function judgeScript(
   parsed: ParsedShell,
@@ -2541,6 +3255,10 @@ async function judgeScript(
   if (parsed.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
 
   const views: CommandView[] = parsed.commands.map(command => toView(command, context));
+  for (const view of views) {
+    const holder = view.command.via === 'exec' ? views[view.command.parent ?? -1] : undefined;
+    holder?.execChildren.push(view);
+  }
   judgeAcrossCommands(views, context, judgement);
 
   // One working directory per subshell: a `cd` inside `( ... )` or `$(...)` ends
@@ -2568,10 +3286,37 @@ async function judgeScript(
         .filter(earlier => feeds(earlier.command.pipelinePath, view.command.pipelinePath))
         .at(-1);
       const piped = feeder === undefined ? undefined : printedText(feeder);
-      const own = SHELL_INTERPRETERS.has(view.command.head) ? [] : view.command.stdin;
+      // A shell's own heredoc is parsed with the script, and an interpreter's is
+      // read as its program by `judgeReads`: neither is left to do here.
+      const { head } = view.command;
+      const code = INTERPRETERS.has(head);
+      const own = SHELL_INTERPRETERS.has(head) || code ? [] : view.command.stdin;
       if (feeder !== undefined || own.length > 0) signal(judgement, 'risk.opaque_shell');
       for (const script of [...own, ...(piped === undefined ? [] : [piped])]) {
-        await judgeScript(parseShell(script), scope.cwd, context, judgement, inner);
+        if (code) await judgeCode(script, head, scope, mode);
+        else await judgeScript(parseShell(script), scope.cwd, context, judgement, inner);
+      }
+    }
+    // `xargs` appends what it reads to the command. When that text is written
+    // in the call itself, the command is judged again with it in place.
+    if (view.command.opaque.includes('xargs') && mode.nesting < MAX_SCRIPT_NESTING) {
+      const feeder = views
+        .slice(0, index)
+        .filter(earlier => feeds(earlier.command.pipelinePath, view.command.pipelinePath))
+        .at(-1);
+      const printed = feeder === undefined ? undefined : printedText(feeder);
+      for (const text of [...view.command.stdin, ...(printed === undefined ? [] : [printed])]) {
+        const words = text.split(/\s+/).filter(word => word !== '');
+        const fed: ShellCommand = {
+          ...view.command,
+          args: [...view.command.args, ...words.slice(0, MAX_FED_WORDS).map(literalWord)],
+          opaque: [],
+          stdin: [],
+        };
+        await judgeCommand(toView(fed, context), scope, {
+          nesting: mode.nesting + 1,
+          speculative: mode.speculative,
+        });
       }
     }
     if (view.command.head === 'cd' || view.command.head === 'pushd') {
@@ -2657,7 +3402,12 @@ export async function evaluateRules(
 ): Promise<RuleOutcome> {
   // One evaluation, one view of the filesystem: see `Evaluation`.
   const context: RuleContext = { ...given };
-  EVALUATIONS.set(context, { located: new Map(), entries: new Map(), links: new Map() });
+  EVALUATIONS.set(context, {
+    located: new Map(),
+    entries: new Map(),
+    links: new Map(),
+    unplaceable: false,
+  });
   const judgement = newJudgement();
   const input: Record<string, unknown> =
     typeof request.input === 'object' && request.input !== null ? request.input : {};

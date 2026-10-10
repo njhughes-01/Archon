@@ -11,7 +11,12 @@ describe('isSecretPath', () => {
     'config/.env.production',
     'prod.env',
     'env.production',
-    'env',
+    '/home/someone/.docker/config.json',
+    '~/.docker/config.json',
+    '/home/someone/.ssh/id_ed25519.pub',
+    '.aws/ca.crt',
+    'deploy/server.key.bak',
+    'k8s/secrets.yaml',
     '.env.d/app.conf',
     '.envs/local/app.conf',
     'secrets.enc.yaml',
@@ -96,7 +101,14 @@ describe('secretPathExemption', () => {
     ['docs/secrets.md', 'source_file'],
     ['lib/secret.rb', 'source_file'],
     ['id_rsa.pub', 'public_material'],
-    ['/home/someone/.ssh/id_ed25519.pub', 'public_material'],
+    ['keys/id_ed25519.pub', 'public_material'],
+    ['env', 'env_directory_name'],
+    ['src/env', 'env_directory_name'],
+    ['.docker/Dockerfile', 'project_directory'],
+    ['src/api.key.ts', 'source_file'],
+    ['src/secrets/index.jsx', 'source_file'],
+    ['docs/credentials.mdx', 'source_file'],
+    ['lib/secrets.mjs', 'source_file'],
     ['certs/server.crt', 'public_material'],
     ['certs/ca.cer', 'public_material'],
   ] as const)('%s is exempt as %s', (path, exemption) => {
@@ -192,7 +204,9 @@ describe('conformance with the context scout', () => {
 
     const exempted = new Set(scoutSecrets.map(path => secretPathExemption(path)));
     expect([...exempted].filter(kind => kind !== undefined).sort()).toEqual([
+      'env_directory_name',
       'env_template',
+      'project_directory',
       'public_material',
       'source_file',
     ]);

@@ -526,7 +526,7 @@ describe('what the classifier is sent is bounded', () => {
   test('a call naming hundreds of targets sends a capped list and says how many were left out', async () => {
     const h = harness(CALM);
     const paths = Array.from({ length: 400 }, (_, index) => `src/gen/out-${String(index)}.tmp`);
-    await h.gate(shell(`rm ${paths.join(' ')}`, h.root));
+    await h.gate(shell(`shred ${paths.join(' ')}`, h.root));
 
     const sent = h.calls[0]?.targets ?? [];
     expect(sent.length).toBeLessThanOrEqual(MAX_ESCALATION_TARGETS + 1);
@@ -541,7 +541,7 @@ describe('what the classifier is sent is bounded', () => {
       { length: 15 },
       (_, index) => `src/${'d'.repeat(192)}-${String(index)}`
     );
-    await h.gate(shell(`rm ${long.join(' ')}`, h.root));
+    await h.gate(shell(`shred ${long.join(' ')}`, h.root));
 
     const sent = h.calls[0]?.targets ?? [];
     expect(sent.length).toBeLessThan(15);
@@ -551,7 +551,7 @@ describe('what the classifier is sent is bounded', () => {
 
   test('a short list is sent whole', async () => {
     const h = harness(CALM);
-    await h.gate(shell('rm src/a.tmp src/b.tmp', h.root));
+    await h.gate(shell('shred src/a.tmp src/b.tmp', h.root));
     expect(h.calls[0]?.targets).toEqual(['src/a.tmp', 'src/b.tmp']);
   });
 });
@@ -1200,7 +1200,8 @@ describe.skipIf(isWindows)('extra write roots', () => {
       'mv {extra}/codex-home/auth.json build/leak.json',
       'deny.secret_write',
     ],
-    ['removing a sub-directory', 'shell', 'rm -rf {extra}/tmp', 'risk.mutation_verb'],
+    ['removing a sub-directory', 'shell', 'rm -rf {extra}/tmp', 'allow'],
+    ['removing through a variable', 'shell', 'rm -rf {extra}/"$NAME"', 'risk.mutation_verb'],
     ['a working directory there', 'shell', 'cd {extra} && ls', 'risk.cwd_outside_root'],
   ] as const)('in an extra root, %s → %s', async (_name, kind, text, expected) => {
     const base = makeRoot();
