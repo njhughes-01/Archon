@@ -73,6 +73,23 @@ type Entry = { kind: 'plain' } | { kind: 'link'; target: string } | { kind: 'err
 export type PathEntryCache = Map<string, Entry>;
 
 /**
+ * Tells the walk about a symlink that does not exist yet: one a command of the
+ * call being judged is about to make. `target` is what the link will hold, as
+ * written; `undefined` when that cannot be read, which makes every path through
+ * the link a failure instead of a guess.
+ */
+export function rememberLink(
+  cache: PathEntryCache,
+  link: string,
+  target: string | undefined
+): void {
+  cache.set(
+    link,
+    target === undefined ? { kind: 'error', code: 'EUNKNOWNLINK' } : { kind: 'link', target }
+  );
+}
+
+/**
  * Reads one entry with the synchronous calls, on purpose. A call can name
  * hundreds of paths and each is one `lstat` of a local directory entry: a few
  * microseconds done in place, against tens of microseconds of scheduling each
@@ -106,20 +123,31 @@ export async function resolveRealPath(
   let current = root;
   let pending = segmentsOf(start.slice(root.length));
   let hops = 0;
+  // Past the first missing segment nothing is on disk, so nothing is read from
+  // it. A link the caller remembered can still stand there (`mkdir d && ln -s
+  // / d/r`), and the walk goes on following those.
+  let missing = false;
 
   for (;;) {
     const segment = pending.shift();
-    if (segment === undefined) return { ok: true, path: current, exists: true };
+    if (segment === undefined) return { ok: true, path: current, exists: !missing };
     if (segment === '..') {
       current = dirname(current);
       continue;
     }
     const candidate = join(current, segment);
     if (PROCESS_RELATIVE.test(candidate)) return { ok: false, code: 'EPROCESS' };
-    const entry = readEntry(candidate, cache);
+    const entry: Entry = missing
+      ? (cache?.get(candidate) ?? { kind: 'error', code: 'ENOENT' })
+      : readEntry(candidate, cache);
     if (entry.kind === 'error') {
       if (entry.code !== 'ENOENT') return { ok: false, code: entry.code };
-      return { ok: true, path: resolve(candidate, ...pending), exists: false };
+      // With no remembered links there is nothing left that could redirect the rest.
+      if (cache === undefined)
+        return { ok: true, path: resolve(candidate, ...pending), exists: false };
+      missing = true;
+      current = candidate;
+      continue;
     }
     if (entry.kind === 'plain') {
       current = candidate;

@@ -33,7 +33,7 @@ import {
   targetHost,
   type EscalationFacts,
 } from './escalation-facts';
-import { isInside, resolveRealPath, type PathEntryCache } from './path-resolution';
+import { isInside, rememberLink, resolveRealPath, type PathEntryCache } from './path-resolution';
 import { isSecretPath } from './secret-paths';
 import {
   CODE_INTERPRETERS,
@@ -483,7 +483,7 @@ const GH_SWITCHES: ReadonlySet<string> = new Set([
   ...['-d', '--draft', '-f', '--fill', '--fill-first', '--fill-verbose', '--no-maintainer-edit'],
 ]);
 /** Variables that point `gh` at another repository or host. */
-const GH_TARGET_VARIABLE = /^GH_(REPO|HOST|ENTERPRISE_TOKEN|CONFIG_DIR)$/;
+const GH_TARGET_VARIABLE = /^(GH_(REPO|HOST|ENTERPRISE_TOKEN|CONFIG_DIR)|HOME|XDG_CONFIG_HOME)$/;
 
 /**
  * Whether a `gh pr` command only opens, comments on or edits a pull request of
@@ -759,12 +759,11 @@ interface Evaluation {
   located: Map<string, Promise<Where>>;
   entries: PathEntryCache;
   /**
-   * Symlinks an earlier command of the same call creates: real path of the
-   * link to where it will point (`undefined` when that cannot be read). They do
-   * not exist yet when a later command's target is resolved, so the filesystem
-   * cannot answer for them.
+   * What the path walk knows about directory entries. Symlinks an earlier
+   * command of the same call creates are put in here too (`noteLinks`): they
+   * do not exist yet when a later command's target is resolved, so the
+   * filesystem cannot answer for them.
    */
-  links: Map<string, string | undefined>;
   /** A command made a link whose own name could not be read: no relative path can be trusted. */
   unplaceable: boolean;
   /** More paths were named than one call is placed for: see `MAX_PLACED_PATHS`. */
@@ -789,14 +788,8 @@ async function place(
 ): Promise<Where> {
   const resolved = await resolveRealPath(text, cwd ?? context.repoRoot, evaluation?.entries);
   if (!resolved.ok) return { kind: 'failed' };
-  let real = resolved.path;
-  let { exists } = resolved;
-  for (const [link, target] of evaluation?.links ?? []) {
-    if (real !== link && !real.startsWith(`${link}/`)) continue;
-    if (target === undefined) return { kind: 'unknown' };
-    real = `${target}${real.slice(link.length)}`;
-    exists = false;
-  }
+  const real = resolved.path;
+  const { exists } = resolved;
   // A link of unknown name may stand anywhere inside the roots: a path that
   // looks inside one is no longer known to be. One outside stays outside.
   if (evaluation?.unplaceable === true && writeRootOf(real, context) !== undefined) {
@@ -1130,7 +1123,7 @@ async function noteBranchMove(
 
 /** Variables that tell git which repository, work tree or configuration to use. */
 const GIT_LOCATION_VARIABLE =
-  /^GIT_(DIR|WORK_TREE|NAMESPACE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|CEILING_DIRECTORIES|CONFIG.*)$/;
+  /^(GIT_(DIR|WORK_TREE|NAMESPACE|COMMON_DIR|INDEX_FILE|OBJECT_DIRECTORY|CEILING_DIRECTORIES|CONFIG.*)|HOME|XDG_CONFIG_HOME)$/;
 
 /** Commands whose whole output is the name of the branch that is checked out. */
 const CURRENT_BRANCH_COMMANDS: ReadonlySet<string> = new Set([
@@ -1160,7 +1153,11 @@ function pushDestination(refspec: string): string | undefined {
     .replace(/^(refs\/)?heads\//, '');
   // A pattern (`refs/heads/*`) names every branch it matches, the protected ones included.
   if (destination === '' || destination === 'HEAD' || destination === '@') return undefined;
-  return /[*?[]/.test(destination) ? undefined : destination;
+  // Anything but a plain branch name (`..`, `~`, `^`, a stray quote) is not
+  // read as one: which ref it ends on is git's to work out, not this reader's.
+  return /^[A-Za-z0-9._/-]+$/.test(destination) && !destination.includes('..')
+    ? destination
+    : undefined;
 }
 
 /** Push options that change neither where a push goes nor what it may overwrite or remove. */
@@ -1497,7 +1494,9 @@ async function judgeGitDiscard(
   subcommand: string,
   parsed: Options,
   raw: readonly Arg[],
-  scope: ShellScope
+  scope: ShellScope,
+  /** Git runs where the command stands: no `-C`, no repository named another way. */
+  inPlace: boolean
 ): Promise<void> {
   const { judgement } = scope;
   const { positionals } = parsed;
@@ -1562,7 +1561,8 @@ async function judgeGitDiscard(
           dashes === -1 ? positionals.filter((_, index) => paths[index]) : raw.slice(dashes + 1);
         const others = positionals.length - files.length;
         const plain = [...parsed.flags].every(flag => flag === '-q' || flag === '--quiet');
-        if (plain && parsed.values.size === 0 && others <= 1 && !raw.some(arg => arg.dynamic)) {
+        const readable = inPlace && !raw.some(arg => arg.dynamic);
+        if (plain && parsed.values.size === 0 && others <= 1 && readable) {
           discards = !(await namesOnlyFiles(files, scope));
         }
       }
@@ -1577,6 +1577,7 @@ async function judgeGitDiscard(
       if (discards) noteFact(judgement.facts, 'uncommittedWork', discardScope(positionals));
       if (
         discards &&
+        inPlace &&
         judgement.deny === undefined &&
         !raw.some(arg => arg.dynamic) &&
         [...parsed.flags, ...parsed.values.keys()].every(flag => RESTORE_PLAIN_FLAGS.has(flag))
@@ -1722,7 +1723,13 @@ async function judgeGitSubcommand(
       }
       break;
     default:
-      await judgeGitDiscard(subcommand, parsed, invocation.args, scope);
+      await judgeGitDiscard(
+        subcommand,
+        parsed,
+        invocation.args,
+        scope,
+        gitDirectory !== undefined && gitDirectory === scope.cwd
+      );
       break;
   }
   return parsed;
@@ -2227,7 +2234,7 @@ function buildOutputs(view: CommandView): Arg[] {
     }
     const flag = short.find(name => arg.text === name || arg.text.startsWith(name));
     if (flag === undefined) return [];
-    if (arg.text !== flag) return [{ ...arg, text: arg.text.slice(flag.length) }];
+    if (arg.text !== flag) return [{ ...arg, text: arg.text.slice(flag.length).replace(/^=/, '') }];
     return next === undefined ? [] : [next];
   });
 }
@@ -2276,6 +2283,11 @@ function judgeNetworkClient(view: CommandView, judgement: Judgement): void {
   }
   if (risky) signal(judgement, 'risk.network_request', 'unlikely');
 }
+
+const REROUTING_OPTION =
+  /^(-x|--proxy|--preproxy|--socks[0-9a-z-]*|--resolve|--connect-to|--unix-socket|--abstract-unix-socket|--doh-url|-K|--config|--interface|--dns-servers)(=|$)/;
+const REROUTING_VARIABLE =
+  /^(([a-z]+_)?proxy|PG(HOST|HOSTADDR|SERVICE|SERVICEFILE|PORT|DATABASE)|MYSQL_(HOST|TCP_PORT|UNIX_PORT)|CURL_HOME)$/i;
 
 /** Whether a container or cluster client was asked only to show state. */
 function onlyShowsState(head: string, positionals: readonly Arg[]): boolean {
@@ -2332,11 +2344,19 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   if (HOST_CLIENTS.has(head)) {
     // A database client always connects somewhere: one that names nothing says `unknown`.
     const database = DATABASE_CLIENTS.has(head);
-    const host =
+    const named =
       targetHost(
         args.filter(arg => !arg.dynamic).map(arg => arg.text),
         database
       ) ?? (database ? 'unknown' : undefined);
+    // A proxy, a pinned address or a connection variable sends the request
+    // somewhere the host name does not say.
+    const rerouted =
+      args.some(arg => REROUTING_OPTION.test(arg.text)) ||
+      [...command.assignments, ...judgement.environment].some(name =>
+        REROUTING_VARIABLE.test(name)
+      );
+    const host = named !== undefined && rerouted ? 'unknown' : named;
     if (host !== undefined) noteFact(judgement.facts, 'targetHost', host);
   }
   if (head.startsWith('mkfs')) signal(judgement, 'risk.mutation_verb', 'unlikely');
@@ -2441,6 +2461,13 @@ function scanCodeStrings(code: string): { strings: CodeString[]; complete: boole
 /** Calls that hand their argument to a shell or run it as a command. */
 const EXEC_CALL =
   /(?:\b(?:system|popen|Popen|run|call|check_call|check_output|getoutput|getstatusoutput|exec|execute|execSync|execFile|execFileSync|spawn|spawnSync|shell_exec|passthru|proc_open|sh|shell|cmd|subprocess|child_process)|[$`])\s*\(?\s*(\[\s*)?$/;
+/**
+ * A call that runs a command whose argument is not written out: a variable, a
+ * concatenation, a decoded string. Only names that mean nothing else are
+ * listed, so `asyncio.run(main())` and `regex.exec(text)` are not caught.
+ */
+const COMPUTED_EXEC =
+  /\b(?:system|popen|Popen|execSync|execFileSync|spawnSync|check_call|check_output|getoutput|shell_exec|passthru|proc_open|eval)\s*\(\s*[^'"`[\s)]/;
 /** Calls that open the file their argument names. */
 const READ_CALL =
   /\b(?:open|fopen|readFileSync|readFile|createReadStream|read_text|read_bytes|read|file_get_contents|load_dotenv|dotenv_values|config|Path|slurp)\s*\(\s*$/;
@@ -2473,6 +2500,8 @@ async function judgeCode(
   const { strings, complete } = scanCodeStrings(code);
   // What was not read may hold anything.
   if (!complete || source.length > MAX_CODE_CHARS) signal(judgement, 'risk.opaque_shell');
+  // A command that is put together at run time cannot be read off the code.
+  if (COMPUTED_EXEC.test(code)) signal(judgement, 'risk.opaque_shell');
 
   for (const [index, string] of strings.entries()) {
     const before = code.slice(Math.max(0, string.start - CALL_LOOKBEHIND), string.start);
@@ -2480,11 +2509,13 @@ async function judgeCode(
     const runs = call !== null || (string.quote === '`' && BACKTICK_RUNS.has(head));
     if (runs) {
       // An argv list: the strings that follow, separated by nothing but commas.
+      // An argv list: the strings that follow, separated by nothing but commas,
+      // inside one list (`['git', 'reset']`) or after the program (`'git', ['reset']`).
       let script = string.text;
-      if (call?.[1] !== undefined) {
+      if (call !== null && !/\s/.test(string.text)) {
         for (let next = index + 1; next < strings.length; next++) {
           const between = code.slice(strings[next - 1]?.end, strings[next]?.start);
-          if (!/^\s*,\s*$/.test(between)) break;
+          if (!/^\s*,\s*\[?\s*$/.test(between)) break;
           script += ` ${strings[next]?.text ?? ''}`;
         }
       }
@@ -2788,17 +2819,21 @@ const TEXT_OPTION_NAMES: ReadonlySet<string> = new Set([
   ...['--name', '--description', '--subject', '--label', '--comment', '--reason', '--notes'],
   ...['--search', '--query', '--testNamePattern', '--test-name-pattern', '--grep-invert'],
 ]);
-/** Commands a text value would have to start with to be read as a command after all. */
-const COMMAND_STARTS: ReadonlySet<string> = new Set([...EMBEDDED_HEADS, 'cd']);
-
 function isTextOption(text: string): boolean {
   return TEXT_OPTION_NAMES.has(text.split('=')[0] ?? text);
 }
 
-/** The first word of a text, as a command name would be written. */
-function firstWord(text: string): string {
-  const word = /^\s*([^\s;&|<>()]+)/.exec(text)?.[1] ?? '';
-  return word.slice(word.lastIndexOf('/') + 1);
+/**
+ * Whether the value of a text option is shaped like a script after all: more
+ * than one command, or a first command (behind any wrappers and assignments)
+ * that has rules of its own. `-t "does not run git clean"` is a name;
+ * `-e 'git clean …'` and `-e 'x; git clean …'` are read.
+ */
+function readsAsScript(parsed: ParsedShell): boolean {
+  const [first] = parsed.commands;
+  if (first === undefined) return false;
+  if (parsed.commands.length > 1 || parsed.overBudget) return true;
+  return EMBEDDED_HEADS.has(first.head);
 }
 
 function findEmbeddedScripts(view: CommandView): ParsedShell[] {
@@ -2807,7 +2842,6 @@ function findEmbeddedScripts(view: CommandView): ParsedShell[] {
   const trustsText = !ARGUMENT_RUNNERS.has(view.command.head);
   const scripts: ParsedShell[] = [];
   let suffixes = 0;
-  let quoted = 0;
   let unread = false;
   view.args.forEach((arg, index) => {
     const previous = view.args[index - 1];
@@ -2820,22 +2854,23 @@ function findEmbeddedScripts(view: CommandView): ParsedShell[] {
       trustsText &&
       ((attached && isTextOption(arg.text)) ||
         (previous !== undefined && !previous.dynamic && isTextOption(previous.text)));
-    if (isTextValue && !COMMAND_STARTS.has(firstWord(value))) return;
     const name = arg.text.slice(arg.text.lastIndexOf('/') + 1);
     if (!arg.dynamic && EMBEDDED_HEADS.has(name)) {
+      // Each of these reads every word after it, so their number is bounded.
       if (suffixes++ < MAX_EMBEDDED_SCRIPTS) {
         scripts.push(parseArgv(view.command.args.slice(index)));
       } else unread = true;
     }
+    // A quoted value costs what it measures, so every one of them is read.
     if (/\s/.test(value.trim())) {
-      if (quoted++ < MAX_EMBEDDED_SCRIPTS) scripts.push(parseShell(value));
-      else unread = true;
+      const parsed = parseShell(value);
+      if (!isTextValue || readsAsScript(parsed)) scripts.push(parsed);
     }
   });
-  // More candidates than the budget reads: say so rather than pass them unread.
-  if (unread) {
-    scripts.push({ commands: [], opaque: ['nesting_limit'], scopeParents: [], overBudget: false });
-  }
+  // More candidates than are read: over the reading budget, which is denied.
+  // Leaving the rest to a classifier would let a run of padding words carry a
+  // denied command past the rules.
+  if (unread) scripts.push({ commands: [], opaque: [], scopeParents: [], overBudget: true });
   return scripts;
 }
 async function changeDirectory(view: CommandView, scope: ShellScope): Promise<string | undefined> {
@@ -2870,6 +2905,9 @@ async function noteLinks(view: CommandView, scope: ShellScope): Promise<void> {
   const sources = into === undefined ? parsed.positionals.slice(0, -1) : parsed.positionals;
   const last = into ?? parsed.positionals.at(-1);
   if (last === undefined) return;
+  const lastPlace = last.dynamic ? undefined : await locate(last.text, scope.cwd, context);
+  const intoDirectory =
+    lastPlace?.kind === 'resolved' && lastPlace.exists && (await isDirectory(lastPlace.real));
   // With one word, the link is made here under the target's own name.
   interface Link {
     target: Arg;
@@ -2881,14 +2919,14 @@ async function noteLinks(view: CommandView, scope: ShellScope): Promise<void> {
       : sources.flatMap((target): Link[] => {
           if (last.dynamic) return [{ target, link: undefined }];
           const inside = join(last.text, basename(target.text));
-          // `ln -s a b` names the link `b`, or `b/a` when `b` is a directory:
-          // both are remembered, since which one holds is decided at run time.
-          return into === undefined && sources.length === 1
-            ? [
-                { target, link: last.text },
-                { target, link: inside },
-              ]
-            : [{ target, link: inside }];
+          // `ln -s a b` names the link `b`, or `b/a` when `b` is a directory.
+          return [
+            {
+              target,
+              link:
+                into === undefined && sources.length === 1 && !intoDirectory ? last.text : inside,
+            },
+          ];
         });
   for (const { target, link } of pairs) {
     // A link whose own name is unknown could be any path: nothing later is placeable.
@@ -2898,13 +2936,12 @@ async function noteLinks(view: CommandView, scope: ShellScope): Promise<void> {
     }
     const at = await locate(link, scope.cwd, context);
     if (at.kind !== 'resolved') continue;
-    let points: string | undefined;
-    if (!target.dynamic && !target.glob) {
-      const from = isAbsolute(target.text) ? target.text : join(dirname(at.real), target.text);
-      const to = await locate(from, scope.cwd, context);
-      points = to.kind === 'resolved' ? to.real : undefined;
-    }
-    evaluation.links.set(at.real, points);
+    // The walk follows it from here on as the kernel will, `..` after it included.
+    rememberLink(
+      evaluation.entries,
+      at.real,
+      target.dynamic || target.glob ? undefined : target.text
+    );
   }
   // What was placed before the links existed is placed again when asked.
   evaluation.located.clear();
@@ -3422,7 +3459,6 @@ export async function evaluateRules(
   EVALUATIONS.set(context, {
     located: new Map(),
     entries: new Map(),
-    links: new Map(),
     unplaceable: false,
     exhausted: false,
   });
