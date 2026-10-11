@@ -43,6 +43,7 @@ type OptionalCapabilityAxis = {
 export const OPTIONAL_AXES = {
   sessionFork: true,
   fileWriteRestriction: true,
+  toolActionGate: true,
   tokenReporting: true,
   stopReasonReporting: true,
   turnCountReporting: true,

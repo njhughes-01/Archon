@@ -147,6 +147,9 @@
         "fileWriteRestriction": {
           "type": "boolean"
         },
+        "toolActionGate": {
+          "type": "boolean"
+        },
         "knownToolNames": {
           "readOnly": true,
           "type": "array",

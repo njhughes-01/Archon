@@ -10,36 +10,11 @@
 
 export const REDACTED = '[REDACTED]';
 
-const CREDENTIAL_ENV_KEY_SUFFIX = /(?:TOKEN|KEY|SECRET|PASSWORD)$/i;
-const CREDENTIAL_ENV_KEYS = new Set(['DATABASE_URL']);
+// The exact layer has one owner, shared with the tool gate and the subprocess
+// paths of the executor, so every caller masks the same set of values.
+import { collectCredentialValues, redactCredentialValues } from './tool-gate/credential-values';
 
-/** Exact credential values in `env`, longest first so a value never survives inside another. */
-export function collectCredentialValues(
-  env: NodeJS.ProcessEnv,
-  protectedEnvKeys: readonly string[] | undefined,
-  protectedCredentialValues: readonly string[] | undefined
-): string[] {
-  const explicitlyProtected = new Set(protectedEnvKeys);
-  const values = Object.entries(env).flatMap(([key, value]) =>
-    value &&
-    (explicitlyProtected.has(key) ||
-      CREDENTIAL_ENV_KEYS.has(key) ||
-      CREDENTIAL_ENV_KEY_SUFFIX.test(key))
-      ? [value]
-      : []
-  );
-  return [...new Set([...values, ...(protectedCredentialValues ?? [])])]
-    .filter(value => value.length > 0)
-    .sort((a, b) => b.length - a.length);
-}
-
-export function redactCredentialValues(input: string, credentialValues: readonly string[]): string {
-  let result = input;
-  for (const value of credentialValues) {
-    result = result.replaceAll(value, REDACTED);
-  }
-  return result;
-}
+export { collectCredentialValues, redactCredentialValues };
 
 /**
  * Every quantifier below is bounded or anchored on a literal, so matching is linear in the

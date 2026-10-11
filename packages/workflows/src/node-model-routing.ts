@@ -69,9 +69,9 @@ export interface NodeRoutingRun {
   /** The topological layers the executor is walking: the whole top-level DAG. */
   layers: GraphPlan['layers'];
   /**
-   * Whether this run may use a provider at all. Nothing sets it yet; the tool-action
-   * gate will, so that with the gate on a provider without the `toolActionGate`
-   * capability is never offered. Absent means every registered provider is usable.
+   * Whether this run may use a provider at all. The executor sets it from the tool
+   * gate: with the gate on, a provider without the `toolActionGate` capability is
+   * never offered. Absent means every registered provider is usable.
    */
   providerUsable?: (provider: string) => boolean;
 }

@@ -170,10 +170,17 @@ import {
 } from './compiled-command';
 import { assistantModelDefaults, resolveNodeModel } from './node-model-resolution';
 import { providerReadsWebSearchMode, unsupportedNodeFields } from './node-capability-checks';
-import { collectCredentialValues, redactCredentialValues } from './redaction';
 import { escalateRoute, escalationReason } from './jev/model-router';
 import { executorModelScope, routeNodeModel } from './node-model-routing';
 import type { ModelRouterConfig, NodeRoute } from './schemas/model-router';
+import {
+  assertProviderHonoursToolGate,
+  collectCredentialValues,
+  createWorkflowRunToolGate,
+  providersUsableUnderToolGate,
+  redactCredentialValues,
+  type RunToolGate,
+} from './tool-gate';
 import {
   logNodeComplete,
   logAssistant,
@@ -1727,6 +1734,9 @@ async function resolveNodeProviderAndModel(
         'capability). Use provider claude, or run without --container.'
     );
   }
+  // Same kind of backstop for the tool gate: a provider that cannot ask it would
+  // run every tool unchecked, so the node fails here instead.
+  assertProviderHonoursToolGate(config.toolGate, provider, caps);
 
   // Capability warnings — inform users when features are unsupported. The list lives in
   // node-capability-checks.ts, which the model router also reads.
@@ -2262,6 +2272,9 @@ async function executeNodeInternal(
     ...nodeOptions,
     abortSignal: nodeAbortController.signal,
     ...(shouldForkSession ? { forkSession: true } : {}),
+    // Built here, once per call of this function, which is once per retry
+    // attempt: each attempt starts its own denial count.
+    ...(ctx.toolGateRun && { toolGate: ctx.toolGateRun.forStep(stepName) }),
   };
   let nodeIdleTimedOut = false;
   let lastWatchdogReset: WatchdogReset | undefined;
@@ -5012,6 +5025,7 @@ async function executeLoopGroupBody(
       // enclosing tier and preset in place would run the group's model, attribute it to
       // the workflow's tier, and apply the workflow preset's effort to it.
       workflowLevelOptions: { ...ctx.workflowLevelOptions, workflowTier },
+      toolGateRun: ctx.toolGateRun,
       aiProfile: ctx.aiProfile,
       workflowPreset,
       artifactsDir: ctx.artifactsDir,
@@ -5978,6 +5992,10 @@ async function executeLoopNode(
     };
 
     iterationAttempt: for (let iterRetry = 0; ; iterRetry++) {
+      // A new gate for each iteration and each transient retry of one, like the
+      // one a plain AI node gets per attempt: what an earlier iteration was
+      // denied must not count against this one.
+      const iterationToolGate = ctx.toolGateRun?.forStep(stepName);
       let iterationAbortController = new AbortController();
       // Mid-stream cancel-check throttle (see the check inside the stream loop).
       // The between-iteration status check just ran, so start the clock at the
@@ -6091,6 +6109,7 @@ async function executeLoopNode(
           const iterationOptions: SendQueryOptions | undefined = {
             ...resolvedOptions,
             abortSignal: iterationAbortController.signal,
+            ...(iterationToolGate && { toolGate: iterationToolGate }),
           };
 
           // Reask attempts start a FRESH session (mirrors runStreamPass in
@@ -9225,6 +9244,7 @@ async function executeComposeFanOutNode(
         workflowProvider: ctx.workflowProvider,
         workflowModel: ctx.workflowModel,
         workflowLevelOptions: ctx.workflowLevelOptions,
+        toolGateRun: ctx.toolGateRun,
         aiProfile: ctx.aiProfile,
         workflowPreset: ctx.workflowPreset,
         artifactsDir: ctx.artifactsDir,
@@ -9519,6 +9539,12 @@ interface RunDerived {
   /** Workflow name — used for persist_session keying + telemetry. */
   workflowName: string;
   workflowLevelOptions: WorkflowLevelOptions;
+  /**
+   * The run's Tool Action Gate, or undefined when the gate is off. Required rather
+   * than optional so every context builder has to forward it: a loop_group body
+   * built without it would run its agents ungated.
+   */
+  toolGateRun: RunToolGate | undefined;
   /** Cross-run session-persistence scope key (DB conversation UUID), or undefined to skip. */
   persistScopeKey: string | undefined;
   /** Workflow-level default for per-node `persist_session` (opt-in). */
@@ -9562,6 +9588,8 @@ interface RunLayersContext extends RunInputs, RunDerived {
    * context kind added later routes nothing until it opts in.
    */
   modelRouter?: ModelRouterConfig;
+  /** Whether the router may offer a provider: false for one the tool gate could not check. */
+  providerUsable?: (provider: string) => boolean;
   /** Last captured attempt for this isolated dispatch; unexpected failures retain its attribution. */
   currentExecution?: NodeExecutionRecord;
   unfinishedInvocations?: DagResumeSnapshot['unfinishedInvocations'];
@@ -11544,6 +11572,19 @@ export async function executeDagWorkflow(
   } = options;
   const dagStartTime = Date.now();
 
+  // Built before anything runs: a gate that is on and cannot judge this run (a
+  // container, an unusable classifier setting) stops it here.
+  const toolGateRun = createWorkflowRunToolGate({
+    config,
+    store: deps.store,
+    workflowRunId: workflowRun.id,
+    cwd,
+    artifactsDir,
+    stateDir,
+    baseBranch,
+    inContainer: execContext.kind === 'container',
+  });
+
   // Container capability fail-fast: before ANY node runs (and before any
   // container work), reject a container run whose AI nodes resolve to a provider
   // that can't spawn in-container. No silent downgrade to the host — the user
@@ -11763,6 +11804,9 @@ export async function executeDagWorkflow(
   const runCtx: RunLayersContext = {
     unfinishedInvocations,
     // `off` is the operator's explicit switch: nothing is classified and nothing recorded.
+    // With the gate on, the router must never offer a tier whose provider would
+    // run tools unasked: dispatch would refuse it, so offering it only fails the step.
+    providerUsable: providersUsableUnderToolGate(config.toolGate, getProviderCapabilities),
     ...(config.modelRouter !== undefined && config.modelRouter.mode !== 'off'
       ? { modelRouter: config.modelRouter }
       : {}),
@@ -11779,6 +11823,7 @@ export async function executeDagWorkflow(
     workflowProvider,
     workflowModel,
     workflowLevelOptions,
+    toolGateRun,
     aiProfile,
     workflowPreset,
     artifactsDir,

@@ -52,6 +52,7 @@ reporting declarations; absence means unknown, not unsupported.
 | Inline sub-agents (`agents:`) | ✅ | ❌ | ✅¹ | ❌ | ✅ |
 | Tool restrictions (`allowed_tools`/`denied_tools`) | ✅ | ❌ | ✅ | ✅ | ✅ |
 | Direct chat without file-editing tools | ✅ | ❌ | ✅² | ✅ | ✅ |
+| Tool action gate (`toolGate` config) | ✅³ | ✅⁴ | ❌ | ✅⁵ | ✅⁶ |
 | Structured output (`output_format`) | **enforced** | **enforced** | **enforced** | best-effort | best-effort |
 | Env injection (`env:`) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Spend limit (`maxBudgetUsd`) | ✅ | ❌ | ❌ | ❌ | ❌ |
@@ -72,6 +73,10 @@ reporting declarations; absence means unknown, not unsupported.
 
 - ¹ `opencode` — Inline sub-agents (`agents:`) — Config-file-based agent selection (named agents from `opencode.json`) with per-call model/tools overrides — not inline sub-agent definitions.
 - ² `opencode` — Direct chat without file-editing tools — Sent as a per-session permission rule denying `edit`, which stays on that chat session. Wired from the SDK typings and not yet verified against a running OpenCode; a server that answers without the rule is logged as `opencode.file_write_restriction_unconfirmed`.
+- ³ `claude` — Tool action gate (`toolGate` config) — Through a `PreToolUse` hook that answers `deny`. Verified with real runs: a denied call does not run and its reason reaches the model.
+- ⁴ `codex` — Tool action gate (`toolGate` config) — Through Codex's `PreToolUse` command hook, on macOS and Linux only and with Codex CLI 0.157.0 or newer. A gated turn runs without TTY sessions, and with hooks forced on under the trust bypass, so the user's own configured hooks run too. Hosted tools (web search) never reach the hook. If Codex does not run the hook, the turn is stopped at the first tool call with `codex_tool_gate_inactive`. Codex does not tell the hook when a shell call sets its own working directory (seen in a real run with CLI 0.159.3), so a relative path in such a call is judged against the turn's directory, not where the command runs.
+- ⁵ `pi` — Tool action gate (`toolGate` config) — Every tool Archon builds for the turn is wrapped. Tools from the user's own Pi extensions are not, and with the gate on the built tool set replaces the user's `defaultTools`.
+- ⁶ `copilot` — Tool action gate (`toolGate` config) — Through the `onPreToolUse` hook. Verified against the SDK typings and the runtime bundle only, not with a real run.
 
 ## Legend
 
@@ -84,6 +89,10 @@ reporting declarations; absence means unknown, not unsupported.
   or ❌ (unsupported). See [AI Assistants → Structured output guarantees](/getting-started/ai-assistants/#structured-output-guarantees).
 - **In-process native tools** — the provider can register Archon `NativeTool`s for a
   turn (gates auto-injection of Archon's `manage_run` tool into project-scoped chat).
+- **Tool action gate** — the provider asks the engine before each tool call that can
+  change state and does not run a call the gate denies. With the gate switched on, a
+  workflow node or chat turn on a ❌ provider fails before it starts. See
+  [Tool Action Gate](/reference/tool-gate/).
 
 For per-provider field-level notes (YAML syntax, caveats), see the
 [AI Assistants guide](/getting-started/ai-assistants/).

@@ -85,6 +85,7 @@ describe('workflow run config', () => {
       'container',
       'botName',
       'chatTier',
+      'toolGate',
       'streaming',
       'paths',
       'concurrency',

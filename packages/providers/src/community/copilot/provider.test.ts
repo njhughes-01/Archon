@@ -8,10 +8,13 @@
  * Runs in its own bun test invocation — mocks @github/copilot-sdk and
  * @archon/paths process-wide.
  */
+import { join } from 'node:path';
+
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { SessionEvent } from '@github/copilot-sdk';
 
 import { createMockLogger } from '../../test/mocks/logger';
+import type { ToolActionDecision, ToolActionRequest } from '../../types';
 
 // ─── Mocks ───────────────────────────────────────────────────────────────
 
@@ -121,6 +124,7 @@ mock.module('@github/copilot-sdk', () => ({
 
 // Provider imports AFTER mocks are installed.
 import { CopilotProvider, resetCopilotSingleton } from './provider';
+import { toCopilotToolAction } from './tool-gate';
 
 function evt<T extends SessionEvent['type']>(type: T, data: unknown): SessionEvent {
   return {
@@ -231,6 +235,335 @@ describe('CopilotProvider.sendQuery', () => {
     expect(config.onPermissionRequest({ kind: 'write' }, { sessionId: 's' })).toEqual({
       kind: 'approved',
     });
+  });
+
+  // ─── toolGate: the provider-neutral Tool Action Gate ──────────────────
+  // The fake runtime below does what the Copilot runtime does with a
+  // preToolUse hook: a `deny` settles the call, anything else lets it run.
+
+  type PreToolUseOutput = { permissionDecision?: string; permissionDecisionReason?: string } | void;
+  interface GatedSessionConfig {
+    hooks?: {
+      onPreToolUse?: (
+        input: Record<string, unknown>,
+        invocation: { sessionId: string }
+      ) => Promise<PreToolUseOutput>;
+    };
+    onPermissionRequest: (request: { kind: string }, invocation: { sessionId: string }) => unknown;
+  }
+  const gateDenial: ToolActionDecision = {
+    action: 'deny',
+    needsApproval: true,
+    reason: 'It deletes every file under the home directory.',
+    alternatives: [
+      'Remove one named directory inside the repository.',
+      'Report the work as blocked.',
+    ],
+    ruleId: 'recursive-rm',
+  };
+  type GateStub = (request: ToolActionRequest) => Promise<ToolActionDecision>;
+
+  async function attemptTool(
+    config: GatedSessionConfig,
+    call: { toolName: string; toolArgs: unknown; sessionId?: string; workingDirectory?: string }
+  ): Promise<{ output: PreToolUseOutput; toolBody: ReturnType<typeof mock> }> {
+    const toolBody = mock(() => undefined);
+    const output = await config.hooks?.onPreToolUse?.(
+      {
+        sessionId: call.sessionId ?? 'sess-restrict',
+        timestamp: new Date(),
+        workingDirectory: call.workingDirectory ?? '/workspace/repo',
+        toolName: call.toolName,
+        toolArgs: call.toolArgs,
+      },
+      { sessionId: 'sess-restrict' }
+    );
+    if (output?.permissionDecision !== 'deny') toolBody();
+    return { output, toolBody };
+  }
+
+  const destructiveBash = { toolName: 'bash', toolArgs: JSON.stringify({ command: 'rm -rf ~' }) };
+
+  test('declares the toolActionGate capability', () => {
+    expect(new CopilotProvider().getCapabilities().toolActionGate).toBe(true);
+  });
+
+  test('toolGate: a denied call never runs and the model gets the reason and every alternative', async () => {
+    const gate = mock<GateStub>(async () => gateDenial);
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+    })) as GatedSessionConfig;
+
+    const { output, toolBody } = await attemptTool(config, destructiveBash);
+
+    expect(toolBody).not.toHaveBeenCalled();
+    expect(output?.permissionDecision).toBe('deny');
+    expect(output?.permissionDecisionReason).toContain(
+      'It deletes every file under the home directory.'
+    );
+    expect(output?.permissionDecisionReason).toContain(
+      'Remove one named directory inside the repository.'
+    );
+    expect(output?.permissionDecisionReason).toContain('Report the work as blocked.');
+  });
+
+  test('toolGate: an allowed call runs and the hook gives no decision of its own', async () => {
+    const gate = mock<GateStub>(async () => ({ action: 'allow' }));
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+    })) as GatedSessionConfig;
+
+    const { output, toolBody } = await attemptTool(config, destructiveBash);
+
+    expect(gate).toHaveBeenCalledTimes(1);
+    expect(toolBody).toHaveBeenCalledTimes(1);
+    // An `allow` would pre-approve the call and skip the permission handler.
+    expect(output).toBeUndefined();
+  });
+
+  test('toolGate: read-only tools never reach the gate', async () => {
+    const gate = mock<GateStub>(async () => gateDenial);
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+    })) as GatedSessionConfig;
+
+    for (const call of [
+      { toolName: 'view', toolArgs: JSON.stringify({ path: '/workspace/repo/.env' }) },
+      { toolName: 'grep', toolArgs: JSON.stringify({ pattern: 'x' }) },
+      { toolName: 'glob', toolArgs: JSON.stringify({ pattern: '**/*' }) },
+      { toolName: 'read_bash', toolArgs: JSON.stringify({ shellId: '1' }) },
+      {
+        toolName: 'str_replace_editor',
+        toolArgs: JSON.stringify({ command: 'view', path: '/workspace/repo/a.ts' }),
+      },
+    ]) {
+      const { toolBody } = await attemptTool(config, call);
+      expect(toolBody).toHaveBeenCalledTimes(1);
+    }
+    expect(gate).not.toHaveBeenCalled();
+  });
+
+  test('toolGate: a gate that throws, or answers with neither allow nor deny, is a denial', async () => {
+    for (const gate of [
+      mock<GateStub>(async () => {
+        throw new Error('classifier unreachable');
+      }),
+      mock<GateStub>(async () => ({ action: 'maybe' }) as never),
+    ]) {
+      createSessionSpy.mockClear();
+      const config = (await sessionConfigFor({
+        assistantConfig: {},
+        toolGate: gate,
+      })) as GatedSessionConfig;
+
+      // The SDK treats a handler that throws as "no decision", so the handler
+      // must come back with a denial instead of rejecting.
+      const { output, toolBody } = await attemptTool(config, destructiveBash);
+
+      expect(toolBody).not.toHaveBeenCalled();
+      expect(output?.permissionDecision).toBe('deny');
+      expect(output?.permissionDecisionReason).toContain('tool gate');
+    }
+  });
+
+  test('toolGate: maps each tool to its kind, command, paths and url', async () => {
+    const seen: ToolActionRequest[] = [];
+    const gate = mock<GateStub>(async request => {
+      seen.push(request);
+      return { action: 'allow' };
+    });
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+    })) as GatedSessionConfig;
+    const patch = [
+      '*** Begin Patch',
+      '*** Add File: src/new.ts',
+      '+export {};',
+      '*** Update File: src/old.ts',
+      '*** Move to: src/renamed.ts',
+      '*** Delete File: ../outside.txt',
+      '*** End Patch',
+    ].join('\n');
+
+    for (const call of [
+      { toolName: 'bash', toolArgs: JSON.stringify({ command: 'git push', description: 'push' }) },
+      // Already-parsed arguments are accepted too.
+      { toolName: 'powershell', toolArgs: { command: 'Remove-Item x' } },
+      { toolName: 'write_bash', toolArgs: JSON.stringify({ shellId: '1', input: 'y' }) },
+      { toolName: 'create', toolArgs: JSON.stringify({ path: '/workspace/repo/a.ts' }) },
+      { toolName: 'edit', toolArgs: JSON.stringify({ path: '/workspace/repo/b.ts' }) },
+      {
+        toolName: 'str_replace_editor',
+        toolArgs: JSON.stringify({ command: 'insert', path: '/workspace/repo/c.ts' }),
+      },
+      // A grammar tool's arguments are raw text, not JSON.
+      { toolName: 'apply_patch', toolArgs: patch },
+      { toolName: 'web_fetch', toolArgs: JSON.stringify({ url: 'https://example.com/x' }) },
+      { toolName: 'web_search', toolArgs: JSON.stringify({ query: 'archon' }) },
+      { toolName: 'task', toolArgs: JSON.stringify({ prompt: 'do it' }) },
+      { toolName: 'tool_from_a_newer_runtime', toolArgs: undefined },
+      { toolName: 'constructor', toolArgs: '{}' },
+    ]) {
+      await attemptTool(config, call);
+    }
+
+    const cwd = '/workspace/repo';
+    expect(seen).toEqual([
+      {
+        toolName: 'bash',
+        kind: 'shell',
+        cwd,
+        command: 'git push',
+        input: { command: 'git push', description: 'push' },
+      },
+      {
+        toolName: 'powershell',
+        kind: 'shell',
+        cwd,
+        command: 'Remove-Item x',
+        input: { command: 'Remove-Item x' },
+      },
+      {
+        toolName: 'write_bash',
+        kind: 'shell',
+        cwd,
+        command: 'y',
+        input: { shellId: '1', input: 'y' },
+      },
+      {
+        toolName: 'create',
+        kind: 'file_write',
+        cwd,
+        paths: ['/workspace/repo/a.ts'],
+        input: { path: '/workspace/repo/a.ts' },
+      },
+      {
+        toolName: 'edit',
+        kind: 'file_write',
+        cwd,
+        paths: ['/workspace/repo/b.ts'],
+        input: { path: '/workspace/repo/b.ts' },
+      },
+      {
+        toolName: 'str_replace_editor',
+        kind: 'file_write',
+        cwd,
+        paths: ['/workspace/repo/c.ts'],
+        input: { command: 'insert', path: '/workspace/repo/c.ts' },
+      },
+      {
+        toolName: 'apply_patch',
+        kind: 'file_write',
+        cwd,
+        // Placed as the runtime places them: see tool-gate.test.ts.
+        paths: [
+          join(cwd, 'src/new.ts'),
+          join(cwd, 'src/old.ts'),
+          join(cwd, 'src/renamed.ts'),
+          join(cwd, '../outside.txt'),
+        ],
+        input: { input: patch },
+      },
+      {
+        toolName: 'web_fetch',
+        kind: 'network',
+        cwd,
+        url: 'https://example.com/x',
+        input: { url: 'https://example.com/x' },
+      },
+      { toolName: 'web_search', kind: 'network', cwd, input: { query: 'archon' } },
+      { toolName: 'task', kind: 'other', cwd, input: { prompt: 'do it' } },
+      // A name the audit has never seen is gated, never assumed read-only.
+      { toolName: 'tool_from_a_newer_runtime', kind: 'other', cwd, input: {} },
+      { toolName: 'constructor', kind: 'other', cwd, input: {} },
+    ]);
+  });
+
+  test("toolGate: a configured MCP server's tool is reported as mcp", () => {
+    const call = { toolArgs: '{}', cwd: '/workspace/repo', fromSubagent: false };
+
+    expect(
+      toCopilotToolAction({ ...call, toolName: 'github-create_issue' }, ['github'])?.kind
+    ).toBe('mcp');
+    expect(
+      toCopilotToolAction({ ...call, toolName: 'github/create_issue' }, ['github'])?.kind
+    ).toBe('mcp');
+    // Without the server on this request the name says nothing about its origin.
+    expect(toCopilotToolAction({ ...call, toolName: 'github-create_issue' }, [])?.kind).toBe(
+      'other'
+    );
+  });
+
+  test("toolGate: a sub-agent's tool call is gated and flagged", async () => {
+    const seen: ToolActionRequest[] = [];
+    const gate = mock<GateStub>(async request => {
+      seen.push(request);
+      return gateDenial;
+    });
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+    })) as GatedSessionConfig;
+
+    const sub = await attemptTool(config, { ...destructiveBash, sessionId: 'sub-agent-session' });
+    const main = await attemptTool(config, destructiveBash);
+
+    expect(sub.toolBody).not.toHaveBeenCalled();
+    expect(main.toolBody).not.toHaveBeenCalled();
+    expect(seen.map(request => request.fromSubagent)).toEqual([true, undefined]);
+  });
+
+  test('toolGate works together with restrictFileWrites', async () => {
+    const gate = mock<GateStub>(async () => ({ action: 'allow' }));
+    const config = (await sessionConfigFor({
+      assistantConfig: {},
+      toolGate: gate,
+      restrictFileWrites: true,
+    })) as GatedSessionConfig;
+
+    // The gate lets the edit through without pre-approving it, so the chat's
+    // write rejection in the permission handler still refuses it.
+    const { output } = await attemptTool(config, {
+      toolName: 'edit',
+      toolArgs: JSON.stringify({ path: '/workspace/repo/a.ts' }),
+    });
+    expect(output).toBeUndefined();
+    expect(config.onPermissionRequest({ kind: 'write' }, { sessionId: 's' })).toMatchObject({
+      kind: 'reject',
+    });
+    expect(config.onPermissionRequest({ kind: 'shell' }, { sessionId: 's' })).toEqual({
+      kind: 'approved',
+    });
+  });
+
+  test('without toolGate the session config carries no hooks', async () => {
+    const config = (await sessionConfigFor({ assistantConfig: {} })) as GatedSessionConfig;
+
+    expect('hooks' in config).toBe(false);
+  });
+
+  test('toolGate: a resumed session gets the hook too', async () => {
+    const session = makeFakeSession('sess-resumed');
+    nextResumeSessionResult = session;
+    const gate = mock<GateStub>(async () => gateDenial);
+    const gen = new CopilotProvider().sendQuery('hi', '/tmp', 'sess-resumed', {
+      assistantConfig: {},
+      toolGate: gate,
+    });
+    const firstNext = gen.next();
+    await new Promise(resolve => setTimeout(resolve, 5));
+    session.fire(evt('assistant.message_delta', { messageId: 'm', deltaContent: 'hi' }));
+    session.resolveSend(undefined);
+    await firstNext;
+    await collect(gen);
+
+    const config = resumeSessionSpy.mock.calls[0]![1] as GatedSessionConfig;
+    const { toolBody } = await attemptTool(config, destructiveBash);
+    expect(toolBody).not.toHaveBeenCalled();
   });
 
   test('passes model + streaming=true + workingDirectory to createSession', async () => {

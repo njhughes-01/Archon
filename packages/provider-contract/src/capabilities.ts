@@ -26,6 +26,14 @@ export const providerCapabilitiesSchema = z.object({
    */
   fileWriteRestriction: z.boolean().optional(),
   /**
+   * Whether the provider honours `toolGate` on a request: before each tool call
+   * that can change state it asks the callback, and on a denial it does not run
+   * the tool and returns the reason and alternatives to the model. A provider
+   * without this would run every tool unasked, so a request that turns the gate
+   * on for it fails at dispatch. Omission means unsupported.
+   */
+  toolActionGate: z.boolean().optional(),
+  /**
    * Built-in tool-name vocabulary for advisory validation of
    * `allowed_tools`/`denied_tools` entries. When present, workflow validation
    * warns (never errors) on entries not in this list — after stripping a

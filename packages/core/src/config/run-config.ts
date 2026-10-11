@@ -58,6 +58,11 @@ const keyClassifications = {
     kind: 'unavailable',
     reason: 'the chat tier applies to direct chat turns and has no per-run consumer',
   },
+  toolGate: {
+    kind: 'unavailable',
+    reason:
+      'the tool gate is a safety switch of the install and the repository, and a run may not change it',
+  },
   streaming: {
     kind: 'unavailable',
     reason: 'platform response streaming is process-scoped and has no per-run consumer',

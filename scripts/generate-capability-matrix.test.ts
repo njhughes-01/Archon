@@ -21,4 +21,13 @@ describe('capability matrix reporting availability', () => {
     }
     expect(renderCell({ ...legacy, sessionFork: undefined }, 'sessionFork')).toBe('❌');
   });
+
+  test('a provider that does not declare the tool action gate cannot honour it', () => {
+    // The engine refuses such a provider when the gate is on, so "Unknown" would mislead.
+    const undeclared = { ...CODEX_CAPABILITIES };
+    delete undeclared.toolActionGate;
+    expect(renderCell(undeclared, 'toolActionGate')).toBe('❌');
+    expect(renderCell({ ...undeclared, toolActionGate: false }, 'toolActionGate')).toBe('❌');
+    expect(renderCell({ ...undeclared, toolActionGate: true }, 'toolActionGate')).toBe('✅');
+  });
 });

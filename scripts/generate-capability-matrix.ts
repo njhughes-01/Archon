@@ -58,6 +58,7 @@ const AXES: readonly { key: keyof ProviderCapabilities; label: string }[] = [
   { key: 'agents', label: 'Inline sub-agents (`agents:`)' },
   { key: 'toolRestrictions', label: 'Tool restrictions (`allowed_tools`/`denied_tools`)' },
   { key: 'fileWriteRestriction', label: 'Direct chat without file-editing tools' },
+  { key: 'toolActionGate', label: 'Tool action gate (`toolGate` config)' },
   { key: 'structuredOutput', label: 'Structured output (`output_format`)' },
   { key: 'envInjection', label: 'Env injection (`env:`)' },
   { key: 'costControl', label: 'Spend limit (`maxBudgetUsd`)' },
@@ -110,7 +111,51 @@ const CAVEATS: readonly { provider: string; key: keyof ProviderCapabilities; not
       'Wired from the SDK typings and not yet verified against a running OpenCode; a server ' +
       'that answers without the rule is logged as `opencode.file_write_restriction_unconfirmed`.',
   },
+  {
+    provider: 'claude',
+    key: 'toolActionGate',
+    note:
+      'Through a `PreToolUse` hook that answers `deny`. Verified with real runs: a denied call ' +
+      'does not run and its reason reaches the model.',
+  },
+  {
+    provider: 'codex',
+    key: 'toolActionGate',
+    note:
+      "Through Codex's `PreToolUse` command hook, on macOS and Linux only and with Codex CLI " +
+      '0.157.0 or newer. A gated turn runs without TTY sessions, and with hooks forced on under ' +
+      "the trust bypass, so the user's own configured hooks run too. Hosted tools (web search) " +
+      'never reach the hook. If Codex does not run the hook, the turn is stopped at the first ' +
+      'tool call with `codex_tool_gate_inactive`. Codex does not tell the hook when a shell call ' +
+      'sets its own working directory (seen in a real run with CLI 0.159.3), so a relative path ' +
+      "in such a call is judged against the turn's directory, not where the command runs.",
+  },
+  {
+    provider: 'pi',
+    key: 'toolActionGate',
+    note:
+      "Every tool Archon builds for the turn is wrapped. Tools from the user's own Pi extensions " +
+      "are not, and with the gate on the built tool set replaces the user's `defaultTools`.",
+  },
+  {
+    provider: 'copilot',
+    key: 'toolActionGate',
+    note:
+      'Through the `onPreToolUse` hook. Verified against the SDK typings and the runtime bundle ' +
+      'only, not with a real run.',
+  },
 ];
+
+/**
+ * Capabilities whose contract defines omission as unsupported, so a missing
+ * declaration renders ❌ rather than "Unknown".
+ */
+const OMISSION_MEANS_UNSUPPORTED = new Set<keyof ProviderCapabilities>([
+  // Predates reporting declarations.
+  'sessionFork',
+  // The engine refuses a provider without it when the gate is on.
+  'toolActionGate',
+]);
 
 const SUPERSCRIPT_DIGITS = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'] as const;
 
@@ -138,8 +183,7 @@ export function renderCell(caps: ProviderCapabilities, key: keyof ProviderCapabi
     if (tier === 'best-effort') return 'best-effort';
     return '❌';
   }
-  // sessionFork predates reporting declarations and explicitly defines omission as unsupported.
-  if (caps[key] === undefined && key !== 'sessionFork') return 'Unknown';
+  if (caps[key] === undefined && !OMISSION_MEANS_UNSUPPORTED.has(key)) return 'Unknown';
   return caps[key] ? '✅' : '❌';
 }
 
@@ -274,6 +318,10 @@ function buildMarkdown(providers: ProviderInfo[], caveats: ResolvedCaveat[]): st
     '  or ❌ (unsupported). See [AI Assistants → Structured output guarantees](/getting-started/ai-assistants/#structured-output-guarantees).',
     '- **In-process native tools** — the provider can register Archon `NativeTool`s for a',
     "  turn (gates auto-injection of Archon's `manage_run` tool into project-scoped chat).",
+    '- **Tool action gate** — the provider asks the engine before each tool call that can',
+    '  change state and does not run a call the gate denies. With the gate switched on, a',
+    '  workflow node or chat turn on a ❌ provider fails before it starts. See',
+    '  [Tool Action Gate](/reference/tool-gate/).',
     '',
     'For per-provider field-level notes (YAML syntax, caveats), see the',
     '[AI Assistants guide](/getting-started/ai-assistants/).',

@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
@@ -17,6 +17,7 @@ import type { Api, Model } from '@earendil-works/pi-ai';
 import type { ExtensionProviderRegistration } from './resource-loader';
 
 import { createMockLogger } from '../../test/mocks/logger';
+import type { ToolActionRequest } from '../../types';
 
 // ─── Mock @archon/paths logger so provider instantiation is quiet ───────
 
@@ -1847,6 +1848,177 @@ describe('PiProvider', () => {
     const tools = callArgs.customTools as Array<{ __piTool?: string; name?: string }>;
     expect(callArgs.noTools).toBe('builtin');
     expect(tools.map(t => t.__piTool ?? t.name)).toEqual(['read', 'bash', 'manage_run']);
+  });
+
+  // ─── toolGate: the provider-neutral Tool Action Gate ──────────────────
+
+  /**
+   * Make the next tool set real enough to gate: named tools with a spy body.
+   * Only `names` are armed, because a `mockImplementationOnce` a test never
+   * consumes would leak into the next one.
+   */
+  type SpyToolName = 'read' | 'bash' | 'edit' | 'write';
+  function useSpyTools(
+    names: readonly SpyToolName[] = ['read', 'bash', 'edit', 'write']
+  ): Record<SpyToolName, ReturnType<typeof mock>> {
+    const bodies = {
+      read: mock(async () => 'read ran'),
+      bash: mock(async () => 'bash ran'),
+      edit: mock(async () => 'edit ran'),
+      write: mock(async () => 'write ran'),
+    };
+    const factories = {
+      read: mockCreateReadTool,
+      bash: mockCreateBashTool,
+      edit: mockCreateEditTool,
+      write: mockCreateWriteTool,
+    };
+    for (const name of names) {
+      factories[name].mockImplementationOnce(
+        () => ({ __piTool: name, name, execute: bodies[name] }) as never
+      );
+    }
+    return bodies;
+  }
+
+  type SessionTool = {
+    __piTool?: string;
+    name: string;
+    execute: (toolCallId: string, params: unknown) => Promise<unknown>;
+  };
+  const gateDenial = {
+    action: 'deny' as const,
+    needsApproval: true,
+    reason: 'It deletes every file under the home directory.',
+    alternatives: ['Remove one named directory inside the repository.'],
+  };
+
+  test('declares the toolActionGate capability', () => {
+    expect(new PiProvider().getCapabilities().toolActionGate).toBe(true);
+  });
+
+  test('toolGate: a denied bash call never runs and the reason reaches the tool result', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+    const bodies = useSpyTools();
+    const gate = mock(async (_request: ToolActionRequest) => gateDenial);
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp/repo', undefined, {
+        model: 'google/gemini-2.5-pro',
+        toolGate: gate,
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    // The gate needs the tool objects, so Pi's own defaults are replaced by
+    // the same four tools, built here.
+    expect(callArgs.noTools).toBe('builtin');
+    const tools = callArgs.customTools as SessionTool[];
+    expect(tools.map(t => t.name)).toEqual(['read', 'bash', 'edit', 'write']);
+
+    const bash = tools.find(t => t.name === 'bash');
+    let thrown: Error | undefined;
+    try {
+      await bash?.execute('call-1', { command: 'rm -rf ~' });
+    } catch (err) {
+      thrown = err as Error;
+    }
+    expect(bodies.bash).not.toHaveBeenCalled();
+    expect(thrown?.message).toContain('It deletes every file under the home directory.');
+    expect(thrown?.message).toContain('Remove one named directory inside the repository.');
+    expect(gate.mock.calls[0][0]).toEqual({
+      toolName: 'bash',
+      kind: 'shell',
+      cwd: '/tmp/repo',
+      command: 'rm -rf ~',
+      input: { command: 'rm -rf ~' },
+      toolCallId: 'call-1',
+    });
+
+    // Reads go straight to the tool.
+    await tools.find(t => t.name === 'read')?.execute('call-2', { path: '.env' });
+    expect(bodies.read).toHaveBeenCalledTimes(1);
+    expect(gate).toHaveBeenCalledTimes(1);
+  });
+
+  test('toolGate: an allowed call runs the tool', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+    const bodies = useSpyTools();
+    const gate = mock(async (_request: ToolActionRequest) => ({ action: 'allow' as const }));
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp/repo', undefined, {
+        model: 'google/gemini-2.5-pro',
+        toolGate: gate,
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    const write = (callArgs.customTools as SessionTool[]).find(t => t.name === 'write');
+    expect(await write?.execute('call-1', { path: 'a.txt', content: 'x' })).toBe('write ran');
+    expect(bodies.write).toHaveBeenCalledTimes(1);
+    // The file Pi's tool would open, not the text the model wrote: see tool-gate.test.ts.
+    expect(gate.mock.calls[0][0]).toMatchObject({
+      kind: 'file_write',
+      paths: [resolve('/tmp/repo', 'a.txt')],
+    });
+  });
+
+  test('toolGate works together with restrictFileWrites and native tools', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+    const bodies = useSpyTools(['read', 'bash']);
+    const nativeHandler = mock(() => Promise.resolve('started'));
+    const gate = mock(async (_request: ToolActionRequest) => gateDenial);
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp/repo', undefined, {
+        model: 'google/gemini-2.5-pro',
+        toolGate: gate,
+        restrictFileWrites: true,
+        nativeTools: [
+          {
+            name: 'manage_run',
+            description: 'Manage runs',
+            inputSchema: { properties: {}, required: [] },
+            handler: nativeHandler,
+          },
+        ],
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    const tools = callArgs.customTools as SessionTool[];
+    // The chat's write restriction still removes edit and write.
+    expect(tools.map(t => t.name)).toEqual(['read', 'bash', 'manage_run']);
+
+    await expect(tools[2].execute('call-1', { action: 'start' })).rejects.toThrow(
+      'It deletes every file under the home directory.'
+    );
+    expect(nativeHandler).not.toHaveBeenCalled();
+    expect(gate.mock.calls[0][0]).toMatchObject({ toolName: 'manage_run', kind: 'other' });
+    await expect(tools[1].execute('call-2', { command: 'x' })).rejects.toThrow();
+    expect(bodies.bash).not.toHaveBeenCalled();
+  });
+
+  test('without toolGate the tools handed to Pi are the unwrapped ones', async () => {
+    process.env.GEMINI_API_KEY = 'sk-test';
+    resetScript(scriptedAgentEnd());
+    const bodies = useSpyTools();
+
+    await consume(
+      new PiProvider().sendQuery('hi', '/tmp/repo', undefined, {
+        model: 'google/gemini-2.5-pro',
+        nodeConfig: { allowed_tools: ['read', 'bash', 'edit', 'write'] },
+      })
+    );
+
+    const [callArgs] = mockCreateAgentSession.mock.calls[0] as [Record<string, unknown>];
+    const tools = callArgs.customTools as SessionTool[];
+    expect(tools.find(t => t.name === 'bash')?.execute).toBe(bodies.bash as never);
+    expect(tools.find(t => t.name === 'write')?.execute).toBe(bodies.write as never);
   });
 
   test('requestOptions.env with no tool restrictions overrides Pi defaults with env-aware bash', async () => {

@@ -25,6 +25,9 @@ export const PI_CAPABILITIES: ProviderCapabilities = {
   agents: false,
   toolRestrictions: true,
   fileWriteRestriction: true, // restrictFileWrites → tool set without Pi's edit/write built-ins
+  // toolGate → wrapped `execute` on every tool Archon builds (tool-gate.ts).
+  // Tools from the user's own Pi extensions are not wrapped.
+  toolActionGate: true,
   structuredOutput: 'best-effort', // prompt-augment + repair + validate + reask×3 (no SDK grammar)
   requiresAllPropertiesRequired: false, // best-effort providers never reject schemas at API level
   envInjection: true,

@@ -18,6 +18,9 @@ export type {
   ProviderCredentialCatalog,
   ProviderAttemptAdmission,
   ProviderAdmissionEvent,
+  ToolActionKind,
+  ToolActionRequest,
+  ToolActionDecision,
 } from './types';
 export { CREDENTIAL_KINDS } from './types';
 
