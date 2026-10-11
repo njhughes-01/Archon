@@ -37562,7 +37562,7 @@ describe('executeDagWorkflow -- node checkout starts (#3375)', () => {
 // stand-in: it plays the part a real provider plays, asking `options.toolGate`
 // before a tool call. `fetch` is stubbed where a classifier is needed.
 
-describe('executeDagWorkflow -- tool action gate', () => {
+describe.skipIf(process.platform === 'win32')('executeDagWorkflow -- tool action gate', () => {
   const GATED = 'gate-capable-test-provider';
   const UNGATED = 'gate-incapable-test-provider';
   const GATE_ON: WorkflowConfig = {

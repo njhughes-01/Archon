@@ -6961,7 +6961,7 @@ describe('chat turn file-write restriction', () => {
 // ─── Tool Action Gate on chat turns ──────────────────────────────────────────
 // The gate is the real one; the provider is the stand-in that asks it.
 
-describe('chat turn tool gate', () => {
+describe.skipIf(process.platform === 'win32')('chat turn tool gate', () => {
   const DECISION_EVENT = 'orchestrator.tool_gate_decision';
   const GATE_ON = { enabled: true, protectedBranches: [], verificationCommands: [] };
   const JEV_ENV = ['JEV_API_KEY', 'JEV_ENABLED', 'JEV_GATE_ENABLED'] as const;

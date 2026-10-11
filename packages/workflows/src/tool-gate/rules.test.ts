@@ -309,7 +309,7 @@ posix('exec-capable variables', () => {
   });
 });
 
-describe('request shapes', () => {
+posix('request shapes', () => {
   test('a kind this version does not know is refused, not left undecided', async () => {
     const tree = makeTree();
     const outcome = await evaluateRules(

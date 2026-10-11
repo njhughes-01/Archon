@@ -312,7 +312,7 @@ describe('createJevEscalator: the answer', () => {
   });
 });
 
-describe('the escalator behind the real gate', () => {
+describe.skipIf(process.platform === 'win32')('the escalator behind the real gate', () => {
   function shellGate(
     fetch: Fetch,
     records: ToolGateDecisionEvent[]

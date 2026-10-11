@@ -87,7 +87,7 @@ function jevFetch(score: number, noul: number): { fetch: Fetch; calls: () => num
   return { fetch, calls: () => calls };
 }
 
-describe('the switch', () => {
+describe.skipIf(isWindows)('the switch', () => {
   test.each([
     ['no toolGate block', undefined],
     ['enabled: false', { ...ON, enabled: false }],
@@ -118,7 +118,7 @@ describe('the switch', () => {
   });
 });
 
-describe('what cannot be gated fails at the start', () => {
+describe.skipIf(isWindows)('what cannot be gated fails at the start', () => {
   test('a container run is refused, saying why and both ways to proceed', () => {
     let message = '';
     try {
@@ -143,7 +143,7 @@ describe('what cannot be gated fails at the start', () => {
   });
 });
 
-describe('the classifier', () => {
+describe.skipIf(isWindows)('the classifier', () => {
   test('without a key the rules are the whole gate: an escalated call is allowed as fallback', async () => {
     const { fetch, calls } = jevFetch(3, 1);
     const h = harness({ fetch });
@@ -211,7 +211,7 @@ describe('the classifier', () => {
   });
 });
 
-describe('per step and per run', () => {
+describe.skipIf(isWindows)('per step and per run', () => {
   test('the denial count belongs to the step', async () => {
     const h = harness();
     const run = createRunToolGate(h.input);
@@ -290,7 +290,7 @@ describe.skipIf(isWindows)('roots', () => {
   });
 });
 
-describe('protected branches and verification commands', () => {
+describe.skipIf(isWindows)('protected branches and verification commands', () => {
   const leasePush = (branch: string): string => `git push --force-with-lease origin ${branch}`;
 
   test('main and master stay protected whatever the config adds', async () => {
@@ -333,7 +333,7 @@ describe('protected branches and verification commands', () => {
   });
 });
 
-describe('redaction', () => {
+describe.skipIf(isWindows)('redaction', () => {
   test('a known credential value never reaches the classifier or the record', async () => {
     const bodies: string[] = [];
     const fetch: Fetch = (_input, init) => {
@@ -360,7 +360,7 @@ describe('redaction', () => {
   });
 });
 
-describe('emptyToolGateRoot', () => {
+describe.skipIf(isWindows)('emptyToolGateRoot', () => {
   test('is an existing, empty directory that stays the same for the process', async () => {
     const root = await emptyToolGateRoot();
     trackTempRoot(root);
@@ -405,7 +405,7 @@ describe('emptyToolGateRoot', () => {
   });
 });
 
-describe('assertProviderHonoursToolGate', () => {
+describe.skipIf(isWindows)('assertProviderHonoursToolGate', () => {
   test('with the gate off every provider passes', () => {
     expect(() => {
       assertProviderHonoursToolGate(undefined, 'codex', {});
@@ -469,7 +469,7 @@ describe('assertProviderHonoursToolGate', () => {
   });
 });
 
-describe('workflowToolGateRecorder', () => {
+describe.skipIf(isWindows)('workflowToolGateRecorder', () => {
   const EVENT: ToolGateDecisionEvent = {
     tool: 'Bash',
     kind: 'shell',

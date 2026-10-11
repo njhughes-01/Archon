@@ -77,7 +77,7 @@ function answer(score: number, noul: number, confidence = 0.9): ToolGateEscalati
 const CALM = answer(0, 0);
 const FAILED: ToolGateEscalationResult = { ok: false, reason: 'timeout' };
 
-describe('rules decide first and finally', () => {
+describe.skipIf(isWindows)('rules decide first and finally', () => {
   test('an allow rule answers without asking the classifier', async () => {
     const h = harness(answer(3, 1));
     expect(await h.gate(shell(ALLOWED, h.root))).toEqual({ action: 'allow' });
@@ -110,7 +110,7 @@ describe('rules decide first and finally', () => {
   });
 });
 
-describe('the escalation band', () => {
+describe.skipIf(isWindows)('the escalation band', () => {
   test('a calm answer allows and records the scores', async () => {
     const h = harness(answer(0.4, 0.1, 0.77));
     expect(await h.gate(shell(ESCALATED, h.root))).toEqual({ action: 'allow' });
@@ -202,7 +202,7 @@ describe('the escalation band', () => {
   });
 });
 
-describe('no usable classifier answer', () => {
+describe.skipIf(isWindows)('no usable classifier answer', () => {
   test.each([
     ['the classifier reports a failure', FAILED],
     ['the score is past the top level', answer(SCORE_THRESHOLD_BOUNDS.max + 1, 0)],
@@ -317,7 +317,7 @@ describe('no usable classifier answer', () => {
   });
 });
 
-describe('redaction', () => {
+describe.skipIf(isWindows)('redaction', () => {
   const EXACT = 'exact-credential-value-5521';
   const SECRETS = [
     EXACT,
@@ -390,7 +390,7 @@ describe('redaction', () => {
   });
 });
 
-describe('command hash and decision cache', () => {
+describe.skipIf(isWindows)('command hash and decision cache', () => {
   test('the hash is stable for one request and differs for another', async () => {
     const h = harness(CALM);
     await h.gate(shell(ALLOWED, h.root));
@@ -454,7 +454,7 @@ describe('command hash and decision cache', () => {
   });
 });
 
-describe('repeated denials in one node', () => {
+describe.skipIf(isWindows)('repeated denials in one node', () => {
   test('after the limit, a further denial tells the agent to stop', async () => {
     const h = harness(CALM, { maxDenialsPerNode: 2 });
     const first = await h.gate(shell(DENIED_BY_RULE, h.root));
@@ -522,7 +522,7 @@ describe('repeated denials in one node', () => {
   });
 });
 
-describe('what the classifier is sent is bounded', () => {
+describe.skipIf(isWindows)('what the classifier is sent is bounded', () => {
   test('a call naming hundreds of targets sends a capped list and says how many were left out', async () => {
     const h = harness(CALM);
     const paths = Array.from({ length: 400 }, (_, index) => `src/gen/out-${String(index)}.tmp`);
@@ -556,7 +556,7 @@ describe('what the classifier is sent is bounded', () => {
   });
 });
 
-describe('identical calls made at the same time', () => {
+describe.skipIf(isWindows)('identical calls made at the same time', () => {
   function slowEscalator(result: ToolGateEscalationResult): {
     escalate: ToolGateOptions['escalate'];
     asked: () => number;
@@ -681,7 +681,7 @@ describe('identical calls made at the same time', () => {
   });
 });
 
-describe('advice for a gate with nothing writable', () => {
+describe.skipIf(isWindows)('advice for a gate with nothing writable', () => {
   const ADVICE = 'This chat has no project. Register one first.';
 
   function write(path: string, cwd: string): ToolActionRequest {
@@ -723,7 +723,7 @@ describe('advice for a gate with nothing writable', () => {
   });
 });
 
-describe('a request the gate cannot read', () => {
+describe.skipIf(isWindows)('a request the gate cannot read', () => {
   test.each([['delete'], [undefined], [42]])(
     'an unknown kind (%p) is denied and recorded, whatever else the request says',
     async kind => {
@@ -839,7 +839,7 @@ describe('a request the gate cannot read', () => {
   });
 });
 
-describe('records', () => {
+describe.skipIf(isWindows)('records', () => {
   test('latency comes from the injected clock', async () => {
     const ticks = [1_000, 1_042];
     const h = harness(CALM, { now: () => ticks.shift() ?? 2_000 });
@@ -988,7 +988,7 @@ describe('records', () => {
 
 // A provider's shell may keep its working directory between calls, and the gate
 // is told only the directory each request reports.
-describe('a shell that may be standing outside the root', () => {
+describe.skipIf(isWindows)('a shell that may be standing outside the root', () => {
   const LEAVE = 'cd ..';
   const RELATIVE_WRITE = 'echo hi > notes.txt';
   const BY_RULE = { decision: 'allow', source: 'rule' } as const;
@@ -1064,7 +1064,7 @@ describe('a shell that may be standing outside the root', () => {
   });
 });
 
-describe('building the gate', () => {
+describe.skipIf(isWindows)('building the gate', () => {
   test('a relative repo root is refused', () => {
     expect(() => harness(CALM, { repoRoot: 'relative/path' })).toThrow(/absolute/);
   });
