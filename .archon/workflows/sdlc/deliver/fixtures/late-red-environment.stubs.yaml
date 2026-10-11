@@ -2,6 +2,7 @@
 # environmental failure outside the branch. The classified failure must reach
 # the same explicit rerun-and-resume pause as inherited red, with the PR left
 # draft and flip-ready unreached.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true
@@ -40,6 +41,7 @@ validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], q
 validate__run: { status: green, summary: "stub: full gate green" }
 ci-probe: '{"state":"red","detail":"hosted runner lost network (fail)"}'
 ci-verdict: '{"state":"red","detail":"hosted runner lost network (fail)"}'
+ci-fix__code-index: "stub: index built"
 ci-fix__implement:
   done: true
   green: false

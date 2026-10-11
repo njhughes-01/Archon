@@ -1,4 +1,5 @@
 # An interaction is red, never an inherited/environment delivery bypass.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true

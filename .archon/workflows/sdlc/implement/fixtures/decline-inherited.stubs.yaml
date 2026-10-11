@@ -6,6 +6,7 @@
 # since the implement invocation started, no branch lead. It passes now, because the change
 # this guard would demand does not exist. What the claim is worth is the green gates'
 # question; the sibling fixtures here pin the three no-change cases still refused.
+code-index: "stub: index built"
 implement:
   done: true
   green: false

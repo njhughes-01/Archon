@@ -14,6 +14,7 @@
 # here: the dry-run simulator proceeds past an exhausted bound, so that path
 # is asserted by the engine in real runs, like the corrections loop's own
 # bound.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true
@@ -52,6 +53,7 @@ validate__discover: { checks: [{ name: "project gate", argv: ["stub-gate"] }], q
 validate__run: { status: green, summary: "stub: full gate green" }
 ci-probe: '{"state":"red","detail":"test (windows-latest) (fail)"}'
 ci-verdict: '{"state":"red","detail":"test (windows-latest) (fail)"}'
+ci-fix__code-index: "stub: index built"
 ci-fix__implement:
   done: true
   green: false

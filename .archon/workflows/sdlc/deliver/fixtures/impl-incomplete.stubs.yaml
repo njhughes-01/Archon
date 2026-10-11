@@ -2,6 +2,7 @@
 # real gate script decides). assert-changed is stubbed as passing, so this pins the
 # delivery gate on its own: gate-green refuses `incomplete` as an unfinished
 # validation before anything public happens.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: false

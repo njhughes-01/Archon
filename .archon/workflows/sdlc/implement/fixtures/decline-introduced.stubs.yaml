@@ -4,6 +4,7 @@
 # the evidence behind the claim buys nothing: assert-changed executes for real and
 # the run fails, exactly as it did before the non-introduced tolerance
 # existed.
+code-index: "stub: index built"
 implement:
   done: true
   green: false

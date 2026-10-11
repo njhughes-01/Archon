@@ -1,5 +1,6 @@
 # A correction can uncover that the remaining blocker needs a materially wider
 # work order. The loop stops on replan and gate-ready refuses the ready path.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true
@@ -36,6 +37,7 @@ review__publish:
   findings_summary: "stub: one in-scope correction"
   report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
 ci-note: "No CI evidence is available for this round (no checks reported, or the read failed). Proceed on the review findings alone."
+fix__code-index: "stub: index built"
 fix__implement:
   done: true
   green: true

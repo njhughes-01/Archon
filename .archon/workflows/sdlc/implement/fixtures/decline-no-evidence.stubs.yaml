@@ -3,6 +3,7 @@
 # cause is worth exactly the failing check the summary names, and an empty summary
 # names none. Same bar the green gates hold, one node earlier: assert-changed
 # executes for real and the run fails.
+code-index: "stub: index built"
 implement:
   done: true
   green: false

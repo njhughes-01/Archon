@@ -2,6 +2,7 @@
 # (--exec-code, so the real gate script decides). `red_cause` is declared optional
 # so a green turn need not carry it, which makes this fixture the guard: absence
 # must never read as permission.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: false
