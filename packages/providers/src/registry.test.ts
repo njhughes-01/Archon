@@ -15,6 +15,7 @@ import {
 import { registerPiProvider } from './community/pi/registration';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
+import { join } from 'node:path';
 import { UnknownProviderError } from './errors';
 import type { ProviderRegistration, IAgentProvider } from './types';
 import { EFFORT_LADDER } from '@archon/paths/effort';
@@ -173,7 +174,7 @@ describe('registry', () => {
   describe('getProviderMemoryDirectory', () => {
     test('Claude declares a memory directory for the working directory', () => {
       const dir = getProviderMemoryDirectory('claude', '/work/app', { HOME: '/home/u' });
-      expect(dir).toBe('/home/u/.claude/projects/-work-app/memory');
+      expect(dir).toBe(join('/home/u', '.claude', 'projects', '-work-app', 'memory'));
     });
 
     test('Codex declares none', () => {
