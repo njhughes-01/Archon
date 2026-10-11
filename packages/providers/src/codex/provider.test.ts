@@ -3114,7 +3114,7 @@ describe('tool gate', () => {
     expect(chunks.at(-1)).not.toHaveProperty('isError');
   });
 
-  test.each([
+  posixTest.each([
     ['a shell command', { type: 'item.started', item: commandItem('c1') }],
     [
       'a file change',
