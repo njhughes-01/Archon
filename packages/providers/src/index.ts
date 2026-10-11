@@ -33,6 +33,7 @@ export {
   getAgentProvider,
   getRegistration,
   getProviderCapabilities,
+  getProviderMemoryDirectory,
   parseProviderRunModel,
   getRegisteredProviders,
   getProviderInfoList,

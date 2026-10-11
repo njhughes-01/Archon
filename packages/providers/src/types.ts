@@ -788,6 +788,13 @@ export interface ProviderRegistration {
   /** Static capability declaration — used for dag-executor warnings */
   capabilities: ProviderCapabilities;
 
+  /**
+   * The directory this provider keeps its own persistent memory for a working
+   * directory in, when it has one. A chat turn under the tool gate may write
+   * there; a provider that declares none gets no such allowance.
+   */
+  memoryDirectory?: (cwd: string, env: Readonly<Record<string, string | undefined>>) => string;
+
   /** Whether this is a built-in (maintained by core team) or community provider */
   builtIn: boolean;
 

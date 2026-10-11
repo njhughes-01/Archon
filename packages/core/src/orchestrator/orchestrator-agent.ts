@@ -28,7 +28,7 @@ import { classifyAndFormatError } from '../utils/error-formatter';
 import { toError } from '../utils/error';
 import { quoteCommandArg } from '../utils/command-args';
 import { safeDeactivateSession } from '../state/session-transitions';
-import { getProviderCapabilities } from '@archon/providers';
+import { getProviderCapabilities, getProviderMemoryDirectory } from '@archon/providers';
 import { getAgentProvider } from '../services/provider-admission';
 import { buildManageRunTool } from './manage-run-tool';
 import {
@@ -2619,12 +2619,18 @@ export async function handleMessage(
           providerKey,
           getProviderCapabilities(providerKey)
         );
+        // The provider's own memory for this checkout lives outside it; a chat
+        // that could not write there would lose what the user asks it to remember.
+        const memoryDirectory = hasCheckout
+          ? getProviderMemoryDirectory(providerKey, cwd, { ...process.env, ...effectiveEnv })
+          : undefined;
         // A chat has no run, so its decisions are recorded as structured log lines.
         requestOptions.toolGate = createRunToolGate({
           config: config.toolGate,
           env: process.env,
           repoRoot: hasCheckout ? cwd : await emptyToolGateRoot(),
           ...(!hasCheckout && { outsideRootAdvice: NO_PROJECT_GATE_ADVICE }),
+          ...(memoryDirectory !== undefined && { extraWriteRoots: [memoryDirectory] }),
           credentialValues: collectCredentialValues(
             { ...process.env, ...effectiveEnv },
             protectedEnvKeys,

@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach } from 'bun:test';
 import {
   getAgentProvider,
   getProviderCapabilities,
+  getProviderMemoryDirectory,
   registerProvider,
   getRegistration,
   getRegisteredProviders,
@@ -166,6 +167,23 @@ describe('registry', () => {
 
     test('is case sensitive - Claude throws', () => {
       expect(() => getProviderCapabilities('Claude')).toThrow(UnknownProviderError);
+    });
+  });
+
+  describe('getProviderMemoryDirectory', () => {
+    test('Claude declares a memory directory for the working directory', () => {
+      const dir = getProviderMemoryDirectory('claude', '/work/app', { HOME: '/home/u' });
+      expect(dir).toBe('/home/u/.claude/projects/-work-app/memory');
+    });
+
+    test('Codex declares none', () => {
+      expect(getProviderMemoryDirectory('codex', '/work/app', { HOME: '/home/u' })).toBeUndefined();
+    });
+
+    test('throws UnknownProviderError for unknown type', () => {
+      expect(() => getProviderMemoryDirectory('unknown', '/work/app', {})).toThrow(
+        UnknownProviderError
+      );
     });
   });
 

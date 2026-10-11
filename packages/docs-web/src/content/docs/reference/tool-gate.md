@@ -48,7 +48,7 @@ A gate that is on either judges every call or stops the work. It never stands do
 
 ## What a tool call is judged against
 
-The root is the checkout the node or chat works in. Every path a call names is resolved to where it really lands, following symlinks and `..`, before it is compared with that root. A workflow node may also write into its run's `$ARTIFACTS_DIR` and the project's `$STATE_DIR`, where the secret-file rules apply as they do in the checkout. A chat turn has no such directories. Everything else outside the checkout is outside: `/tmp`, and the project's log directory too, which holds the engine's transcripts of every run.
+The root is the checkout the node or chat works in. Every path a call names is resolved to where it really lands, following symlinks and `..`, before it is compared with that root. A workflow node may also write into its run's `$ARTIFACTS_DIR` and the project's `$STATE_DIR`, where the secret-file rules apply as they do in the checkout. A chat turn has no such directories. With a project selected, a chat may also write inside the provider's own memory directory for that checkout (today Claude's auto-memory folder); only that directory, not its parent, and providers without a memory directory declare none. Everything else outside the checkout is outside: `/tmp`, and the project's log directory too, which holds the engine's transcripts of every run.
 
 ### A chat with no project
 

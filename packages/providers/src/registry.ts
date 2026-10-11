@@ -18,6 +18,7 @@ import { CodexProvider } from './codex/provider';
 import { parseClaudeConfigStrict } from './claude/config';
 import { parseCodexConfigStrict } from './codex/config';
 import { CLAUDE_CAPABILITIES } from './claude/capabilities';
+import { claudeMemoryDirectory } from './claude/memory-directory';
 import { CODEX_CAPABILITIES } from './codex/capabilities';
 import { registerCopilotProvider } from './community/copilot/registration';
 import { registerOpencodeProvider } from './community/opencode/registration';
@@ -87,6 +88,19 @@ export function getProviderCapabilities(id: string): ProviderCapabilities {
   return getRegistration(id).capabilities;
 }
 
+/**
+ * Where a provider keeps its own memory for a working directory, or `undefined`
+ * when it declares none.
+ * @throws UnknownProviderError if not registered
+ */
+export function getProviderMemoryDirectory(
+  id: string,
+  cwd: string,
+  env: Readonly<Record<string, string | undefined>>
+): string | undefined {
+  return getRegistration(id).memoryDirectory?.(cwd, env);
+}
+
 /** Validate and normalize a run-owned model through the provider's strict parser. */
 export function parseProviderRunModel(id: string, model: string): string {
   const parsed = getRegistration(id).parseConfig({ model }, 'run');
@@ -134,6 +148,7 @@ export function registerBuiltinProviders(): void {
       displayName: 'Claude (Anthropic)',
       factory: () => new ClaudeProvider(),
       capabilities: CLAUDE_CAPABILITIES,
+      memoryDirectory: claudeMemoryDirectory,
       builtIn: true,
       parseConfig: parseClaudeConfigStrict,
       credentials: {
