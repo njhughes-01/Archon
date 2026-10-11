@@ -5,6 +5,10 @@ import {
   translateCodexHookCall,
 } from './tool-gate-request';
 
+// Codex gating is unsupported on Windows, and the translation resolves paths with the
+// platform's path module while these tests assert POSIX absolute paths.
+const ON_WINDOWS = process.platform === 'win32';
+
 /** The fields Codex 0.159.3 sends a PreToolUse hook on stdin. */
 function hookPayload(overrides: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -33,7 +37,7 @@ const PATCH = [
   '*** End Patch',
 ].join('\n');
 
-describe('translateCodexHookCall', () => {
+describe.skipIf(ON_WINDOWS)('translateCodexHookCall', () => {
   test('a Bash call becomes a shell request carrying the bare command', () => {
     const result = translateCodexHookCall(
       hookPayload({ tool_name: 'Bash', tool_input: { command: 'git push origin main' } })
@@ -369,7 +373,7 @@ describe('translateCodexHookCall', () => {
   });
 });
 
-describe('readApplyPatch', () => {
+describe.skipIf(ON_WINDOWS)('readApplyPatch', () => {
   test('reads add, update, move and delete targets', () => {
     expect(readApplyPatch(PATCH, '/repo')).toEqual({
       paths: ['/repo/src/new.ts', '/repo/src/old.ts', '/repo/src/renamed.ts', '/abs/gone.ts'],
