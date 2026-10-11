@@ -93,6 +93,9 @@
       "src/claude/config.test.ts"
     ],
     [
+      "src/claude/memory-directory.test.ts"
+    ],
+    [
       "src/community/pi/model-ref.test.ts"
     ],
     [

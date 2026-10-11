@@ -366,6 +366,7 @@ mock.module('@archon/providers', () => ({
   // `validEffortsForProvider` (@archon/workflows/model-validation, #2556).
   // Omitting either lets the REAL implementation run against an empty registry.
   getProviderCapabilities: mock(() => ({ ...DEFAULT_PROVIDER_CAPS })),
+  getProviderMemoryDirectory: mock((): string | undefined => undefined),
   isRegisteredProvider: mock(() => true),
   getRegisteredProviders: mock(() => []),
   // Vendor → env-var map consumed by credentials/delivery (#1955). A realistic
@@ -7069,6 +7070,57 @@ describe.skipIf(process.platform === 'win32')('chat turn tool gate', () => {
       }
     }
     expect(decisionLogs()).toEqual([]);
+  });
+
+  describe('provider memory directory', () => {
+    let memoryHome: string;
+    let memoryMock: ReturnType<typeof mock>;
+
+    beforeEach(async () => {
+      const providers = await import('@archon/providers');
+      memoryMock = providers.getProviderMemoryDirectory as ReturnType<typeof mock>;
+      memoryMock.mockReset();
+      memoryHome = await realpath(await mkdtemp(join(tmpdir(), 'chat-tool-gate-memory-')));
+      memoryMock.mockImplementation(() => join(memoryHome, 'memory'));
+    });
+
+    afterEach(async () => {
+      memoryMock.mockReset();
+      memoryMock.mockImplementation(() => undefined);
+      await removeTempTree(memoryHome);
+    });
+
+    test('a shell append into the declared memory directory is not denied', async () => {
+      const { options } = await turn();
+      const gate = options?.toolGate;
+      if (gate === undefined) throw new Error('the chat was given no tool gate');
+      const decision = await gate(
+        shell(`cat >> ${join(memoryHome, 'memory', 'note.md')} <<'E'\nhello\nE`)
+      );
+      expect(decision.action).not.toBe('deny');
+    });
+
+    test('the parent of the memory directory stays outside the root', async () => {
+      const { options } = await turn();
+      const gate = options?.toolGate;
+      if (gate === undefined) throw new Error('the chat was given no tool gate');
+      const decision = await gate(
+        shell(`cat >> ${join(memoryHome, 'session.jsonl')} <<'E'\nhello\nE`)
+      );
+      expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.path_outside_root' });
+    });
+
+    test('a chat with no project neither asks for the directory nor may write there', async () => {
+      unscoped();
+      const { options } = await turn();
+      const gate = options?.toolGate;
+      if (gate === undefined) throw new Error('the chat was given no tool gate');
+      const decision = await gate(
+        shell(`cat >> ${join(memoryHome, 'memory', 'note.md')} <<'E'\nhello\nE`)
+      );
+      expect(decision).toMatchObject({ action: 'deny', ruleId: 'deny.path_outside_root' });
+      expect(memoryMock).not.toHaveBeenCalled();
+    });
   });
 
   test('gate off: a provider without the capability chats as before', async () => {
