@@ -2811,6 +2811,13 @@ describe('classifyCodexError (#2509 R7)', () => {
   });
 });
 
+// The Codex launcher and hook are POSIX shell scripts, and the provider refuses a
+// gated request on Windows (see the last test here, which runs everywhere).
+// Everything that sends a gated request, or needs a `#!/bin/sh` stand-in binary,
+// runs only where the gate is supported.
+const ON_WINDOWS = process.platform === 'win32';
+const posixTest = test.skipIf(ON_WINDOWS);
+
 describe('tool gate', () => {
   type Gate = NonNullable<NonNullable<Parameters<CodexProvider['sendQuery']>[3]>['toolGate']>;
   type GateDecision = Awaited<ReturnType<Gate>>;
@@ -2941,7 +2948,7 @@ describe('tool gate', () => {
     expect(mockStartThread.mock.calls).toEqual([[EXPECTED_THREAD_OPTIONS]]);
   });
 
-  test('with a gate, only the binary path and the config overrides change', async () => {
+  posixTest('with a gate, only the binary path and the config overrides change', async () => {
     let launcherExisted = false;
     let socketExisted = false;
     mockRunStreamed.mockImplementation(() =>
@@ -2971,22 +2978,25 @@ describe('tool gate', () => {
     expect(existsSync(join(options.codexPathOverride, '..'))).toBe(false);
   });
 
-  test('a gated request does not become the shared client for later ungated ones', async () => {
-    mockRunStreamed.mockImplementation(() =>
-      Promise.resolve({
-        events: (async function* () {
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      })
-    );
+  posixTest(
+    'a gated request does not become the shared client for later ungated ones',
+    async () => {
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        })
+      );
 
-    await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
-    await collect(undefined);
+      await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+      await collect(undefined);
 
-    expect(MockCodex.mock.calls[1]).toEqual([{ codexPathOverride: undefined }]);
-  });
+      expect(MockCodex.mock.calls[1]).toEqual([{ codexPathOverride: undefined }]);
+    }
+  );
 
-  test('keeps the workflow skill and MCP overrides next to the hook', async () => {
+  posixTest('keeps the workflow skill and MCP overrides next to the hook', async () => {
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
         events: (async function* () {
@@ -3004,7 +3014,7 @@ describe('tool gate', () => {
     expect(gatedOptions().config.skills).toEqual({ include_instructions: false });
   });
 
-  test('a resumed thread is gated the same way', async () => {
+  posixTest('a resumed thread is gated the same way', async () => {
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
         events: (async function* () {
@@ -3020,7 +3030,7 @@ describe('tool gate', () => {
     expect(gatedOptions().codexPathOverride.endsWith('/codex')).toBe(true);
   });
 
-  test('the skill-catalog fallback client is still gated', async () => {
+  posixTest('the skill-catalog fallback client is still gated', async () => {
     let attempt = 0;
     mockRunStreamed.mockImplementation(() => {
       attempt += 1;
@@ -3048,39 +3058,43 @@ describe('tool gate', () => {
     expect('skills' in gatedOptions(1).config).toBe(false);
   });
 
-  test('a denied call reaches the model with the reason and alternatives, and the turn goes on', async () => {
-    const gate = mock<Gate>(() => Promise.resolve(DENY));
-    let hook: { exitCode: number; stderr: string } | undefined;
-    mockRunStreamed.mockImplementation(() =>
-      Promise.resolve({
-        events: (async function* () {
-          hook = await callHook('Bash', { command: 'git push origin main' });
-          yield {
-            type: 'item.completed',
-            item: { id: 'm1', type: 'agent_message', text: 'The push was blocked.' },
-          };
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      })
-    );
+  posixTest(
+    'a denied call reaches the model with the reason and alternatives, and the turn goes on',
+    async () => {
+      const gate = mock<Gate>(() => Promise.resolve(DENY));
+      let hook: { exitCode: number; stderr: string } | undefined;
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            hook = await callHook('Bash', { command: 'git push origin main' });
+            yield {
+              type: 'item.completed',
+              item: { id: 'm1', type: 'agent_message', text: 'The push was blocked.' },
+            };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        })
+      );
 
-    const chunks = await collect({ toolGate: gate });
+      const chunks = await collect({ toolGate: gate });
 
-    expect(hook).toEqual({
-      exitCode: 2,
-      stderr: 'Pushing to main needs approval.\nSafer alternatives:\n- Push to a feature branch\n',
-    });
-    expect(gate.mock.calls[0][0]).toMatchObject({
-      toolName: 'Bash',
-      kind: 'shell',
-      command: 'git push origin main',
-      cwd: '/workspace',
-    });
-    expect(chunks.at(-1)).toMatchObject({ type: 'result' });
-    expect(chunks.at(-1)).not.toHaveProperty('isError');
-  });
+      expect(hook).toEqual({
+        exitCode: 2,
+        stderr:
+          'Pushing to main needs approval.\nSafer alternatives:\n- Push to a feature branch\n',
+      });
+      expect(gate.mock.calls[0][0]).toMatchObject({
+        toolName: 'Bash',
+        kind: 'shell',
+        command: 'git push origin main',
+        cwd: '/workspace',
+      });
+      expect(chunks.at(-1)).toMatchObject({ type: 'result' });
+      expect(chunks.at(-1)).not.toHaveProperty('isError');
+    }
+  );
 
-  test('an allowed call runs: the hook passes and the command item is accepted', async () => {
+  posixTest('an allowed call runs: the hook passes and the command item is accepted', async () => {
     let hook: { exitCode: number; stderr: string } | undefined;
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
@@ -3160,27 +3174,30 @@ describe('tool gate', () => {
     );
   });
 
-  test('a patch the model pipes to apply_patch in the shell is covered by its shell hook call', async () => {
-    // Seen in a real run: the hook reports `Bash`, the stream reports a file change.
-    mockRunStreamed.mockImplementation(() =>
-      Promise.resolve({
-        events: (async function* () {
-          await callHook('Bash', { command: "apply_patch <<'EOF'\n*** Begin Patch\nEOF" });
-          yield {
-            type: 'item.completed',
-            item: { id: 'f1', type: 'file_change', status: 'completed', changes: [] },
-          };
-          yield { type: 'turn.completed', usage: defaultUsage };
-        })(),
-      })
-    );
+  posixTest(
+    'a patch the model pipes to apply_patch in the shell is covered by its shell hook call',
+    async () => {
+      // Seen in a real run: the hook reports `Bash`, the stream reports a file change.
+      mockRunStreamed.mockImplementation(() =>
+        Promise.resolve({
+          events: (async function* () {
+            await callHook('Bash', { command: "apply_patch <<'EOF'\n*** Begin Patch\nEOF" });
+            yield {
+              type: 'item.completed',
+              item: { id: 'f1', type: 'file_change', status: 'completed', changes: [] },
+            };
+            yield { type: 'turn.completed', usage: defaultUsage };
+          })(),
+        })
+      );
 
-    const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
+      const chunks = await collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) });
 
-    expect(chunks.at(-1)).not.toHaveProperty('isError');
-  });
+      expect(chunks.at(-1)).not.toHaveProperty('isError');
+    }
+  );
 
-  test('a hook call for a tool with no stream item does not cover a command', async () => {
+  posixTest('a hook call for a tool with no stream item does not cover a command', async () => {
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
         events: (async function* () {
@@ -3200,7 +3217,7 @@ describe('tool gate', () => {
     });
   });
 
-  test('a denied call does not cover a tool that then runs unasked', async () => {
+  posixTest('a denied call does not cover a tool that then runs unasked', async () => {
     const gate = mock<Gate>(() => Promise.resolve(DENY));
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
@@ -3223,7 +3240,7 @@ describe('tool gate', () => {
     });
   });
 
-  test('a second tool call needs its own hook call', async () => {
+  posixTest('a second tool call needs its own hook call', async () => {
     mockRunStreamed.mockImplementation(() =>
       Promise.resolve({
         events: (async function* () {
@@ -3245,7 +3262,7 @@ describe('tool gate', () => {
     });
   });
 
-  test('hook calls from a crashed attempt do not cover the retry', async () => {
+  posixTest('hook calls from a crashed attempt do not cover the retry', async () => {
     let attempt = 0;
     mockRunStreamed.mockImplementation(() => {
       attempt += 1;
@@ -3285,7 +3302,7 @@ describe('tool gate', () => {
     expect(chunks.at(-1)).not.toHaveProperty('isError');
   });
 
-  describe('teardown', () => {
+  describe.skipIf(ON_WINDOWS)('teardown', () => {
     async function directoryAfter(run: () => Promise<unknown>): Promise<string> {
       await run().catch(() => undefined);
       return join(gatedOptions().codexPathOverride, '..');
@@ -3370,26 +3387,29 @@ describe('tool gate', () => {
     });
   });
 
-  test('refuses a gated request on a Codex CLI older than the gate was proven on', async () => {
-    // An older CLI may not know `features.unified_exec_tty` and would keep the
-    // unhooked stdin path open without saying so.
-    await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.156.9\n');
-    const { readdirSync } = await import('node:fs');
-    const gateDirs = (): string[] =>
-      readdirSync(tmpdir()).filter(
-        name => name.startsWith('archon-codex-gate-') && !name.includes('test')
+  posixTest(
+    'refuses a gated request on a Codex CLI older than the gate was proven on',
+    async () => {
+      // An older CLI may not know `features.unified_exec_tty` and would keep the
+      // unhooked stdin path open without saying so.
+      await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.156.9\n');
+      const { readdirSync } = await import('node:fs');
+      const gateDirs = (): string[] =>
+        readdirSync(tmpdir()).filter(
+          name => name.startsWith('archon-codex-gate-') && !name.includes('test')
+        );
+      const before = gateDirs();
+
+      await expect(collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })).rejects.toThrow(
+        /needs Codex CLI 0\.157\.0 or newer.* is 0\.156\.9/
       );
-    const before = gateDirs();
 
-    await expect(collect({ toolGate: mock<Gate>(() => Promise.resolve(ALLOW)) })).rejects.toThrow(
-      /needs Codex CLI 0\.157\.0 or newer.* is 0\.156\.9/
-    );
+      expect(MockCodex).not.toHaveBeenCalled();
+      expect(gateDirs().filter(name => !before.includes(name))).toEqual([]);
+    }
+  );
 
-    expect(MockCodex).not.toHaveBeenCalled();
-    expect(gateDirs().filter(name => !before.includes(name))).toEqual([]);
-  });
-
-  test('does not read the Codex version for an ungated request', async () => {
+  posixTest('does not read the Codex version for an ungated request', async () => {
     await writeFile(join(codexDir, 'version.txt'), 'codex-cli 0.1.0\n');
     mockRunStreamed.mockResolvedValue({
       events: (async function* () {

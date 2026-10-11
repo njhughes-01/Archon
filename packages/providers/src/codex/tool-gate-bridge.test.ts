@@ -20,6 +20,10 @@ import {
 } from './tool-gate-version';
 import { createMockLogger } from '../test/mocks/logger';
 
+// A unix socket and `#!/bin/sh` programs: the gate is not supported for Codex on
+// Windows, so these run only where it is. The refusal itself is tested in provider.test.ts.
+const ON_WINDOWS = process.platform === 'win32';
+
 const mockLogger = createMockLogger();
 mock.module('@archon/paths', () => ({
   createLogger: mock(() => mockLogger),
@@ -151,7 +155,7 @@ async function replaceListener(
   await new Promise<void>(resolve => server.listen(socketPath, resolve));
 }
 
-describe('openCodexToolGateBridge', () => {
+describe.skipIf(ON_WINDOWS)('openCodexToolGateBridge', () => {
   test('keeps its files in a private directory and removes them on close', async () => {
     const bridge = await openBridge(mock<Gate>(() => Promise.resolve(ALLOW)));
     const directory = bridge.directory;
@@ -218,7 +222,7 @@ describe('openCodexToolGateBridge', () => {
   });
 });
 
-describe('the hook program', () => {
+describe.skipIf(ON_WINDOWS)('the hook program', () => {
   test('allow: exits 0 and prints nothing', async () => {
     const gate = mock<Gate>(() => Promise.resolve(ALLOW));
     const bridge = await openBridge(gate);
@@ -541,7 +545,7 @@ describe('resolveSdkBundledCodexCommand', () => {
   });
 });
 
-describe('the Codex version floor', () => {
+describe.skipIf(ON_WINDOWS)('the Codex version floor', () => {
   /** A stand-in Codex binary whose `--version` output and exit status the test sets. */
   async function versionedCodex(output: string, exitCode = 0): Promise<string[]> {
     const dir = await tempDir();
@@ -630,7 +634,7 @@ describe('the Codex version floor', () => {
   });
 });
 
-describe('the Codex launcher', () => {
+describe.skipIf(ON_WINDOWS)('the Codex launcher', () => {
   /** A stand-in Codex binary that records its arguments, one per line. */
   async function fakeCodex(dirName = 'bin'): Promise<{ path: string; argsFile: string }> {
     const root = await tempDir();
