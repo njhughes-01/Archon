@@ -15,6 +15,7 @@ import {
 } from '@archon/workflows/schemas/workflow-run';
 import { HeadlessPlatform } from '../adapters/headless';
 import { startRunLiveOwner } from '@archon/core/services/run-live-owner';
+import { isRunFollowedUp, runEnginePlatform } from '@archon/core/services/run-follow-up';
 
 const log = createLogger('workflow-resume-service');
 const CONTINUATION_SCAN_INTERVAL_MS = 5_000;
@@ -130,6 +131,10 @@ export async function resumeWorkflowRunFromServer(
     const destination = target.kind === 'platform' ? target.destination : undefined;
     const platform: IWorkflowPlatform =
       destination?.platform ?? new HeadlessPlatform(resumableRun.conversation_id);
+    // A followed-up run's chat hears its result from the follow-up, so the engine sends
+    // nowhere and no result card is posted here. The row exists on every resume, so a
+    // failure is always recorded on it.
+    const followedUp = isRunFollowedUp(platform.getPlatformType(), resumableRun);
     const continuation = await resolveRunWorkflow(resumableRun, workflowCwd, platform);
     if (!continuation.ok) {
       log.info(
@@ -168,7 +173,7 @@ export async function resumeWorkflowRunFromServer(
 
       const engine = new InProcessWorkflowEngine(deps);
       const admission = await engine.resume({
-        platform,
+        platform: followedUp ? runEnginePlatform(platform) : platform,
         conversationId: platformConversationId,
         cwd: resumableRun.working_path,
         legacyWorkflow: continuation.workflow,
@@ -194,7 +199,13 @@ export async function resumeWorkflowRunFromServer(
         .then(
           async result => {
             await closeRunLiveOwner();
-            if (destination?.resultConversationId === undefined || 'paused' in result) return;
+            if (
+              followedUp ||
+              destination?.resultConversationId === undefined ||
+              'paused' in result
+            ) {
+              return;
+            }
             let message: string;
             let resultRunId: string;
             if (result.success) {

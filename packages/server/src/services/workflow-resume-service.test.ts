@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { IWorkflowPlatform, WorkflowDeps } from '@archon/workflows/deps';
 import type { IWorkflowStore } from '@archon/workflows/store';
@@ -91,6 +91,7 @@ mock.module('@archon/workflows/executor', () => ({
 
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
 import { HeadlessPlatform } from '../adapters/headless';
+import { disableRunFollowUp, enableRunFollowUp } from '@archon/core/services/run-follow-up';
 
 import {
   resumeWorkflowRunFromServer,
@@ -612,6 +613,79 @@ describe('workflow continuation scanner', () => {
       category: 'workflow_result',
       segment: 'new',
       workflowResult: { workflowName: 'deliver', runId: 'run-1' },
+    });
+  });
+
+  describe('run follow-up on a resumed run', () => {
+    afterEach(() => {
+      disableRunFollowUp('telegram');
+    });
+
+    // A parent conversation makes the destination carry a result conversation, which is
+    // how a followed-up foreground run reaches the direct result send.
+    async function resumeOn(
+      metadata: Record<string, unknown>,
+      result: Awaited<ReturnType<typeof mockExecuteWorkflow>>
+    ): Promise<{ sendMessage: ReturnType<typeof mock>; enginePlatform: IWorkflowPlatform }> {
+      const paused = run('wait-chat', 'paused', metadata);
+      mockResumeWorkflow.mockResolvedValueOnce(paused);
+      mockResolveRunWorkflow.mockResolvedValueOnce({
+        ok: true,
+        workflow: makeTestResolvedWorkflow({ name: 'deliver' }),
+      });
+      mockHydrateResumableRun.mockResolvedValueOnce({
+        preCreatedRun: { ...paused, status: 'running' },
+        priorCompletedNodes: new Map(),
+        priorUsage: { costUsd: 0 },
+        priorNodeSessions: [],
+      });
+      mockExecuteWorkflow.mockResolvedValueOnce(result);
+      const sendMessage = mock(async () => undefined);
+      const platform = {
+        sendMessage,
+        getStreamingMode: () => 'batch' as const,
+        getPlatformType: () => 'telegram',
+      } satisfies IWorkflowPlatform;
+      await resumeWorkflowRunFromServer(paused, undefined, {
+        kind: 'platform',
+        destination: { platform, conversationId: 'chat-1', resultConversationId: 'chat-1' },
+      });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      return { sendMessage, enginePlatform: mockExecuteWorkflow.mock.calls[0]?.[1] as never };
+    }
+
+    const stamp = { follow_up: { conversation_id: 'chat-db-1' } };
+    const success = { success: true as const, workflowRunId: 'run-1', summary: 'done' };
+    const failure = { success: false as const, workflowRunId: 'run-1', error: 'boom' };
+
+    test('a stamped run resumes on a silent engine and sends no result card', async () => {
+      enableRunFollowUp('telegram');
+      for (const result of [success, failure]) {
+        mockExecuteWorkflow.mockClear();
+        const { sendMessage, enginePlatform } = await resumeOn(stamp, result);
+        expect(enginePlatform).not.toBeUndefined();
+        await enginePlatform.sendMessage('chat-1', '{"ready":true}');
+        expect(sendMessage).not.toHaveBeenCalled();
+      }
+    });
+
+    test('an unstamped run keeps the real platform and its result card', async () => {
+      enableRunFollowUp('telegram');
+      const { sendMessage, enginePlatform } = await resumeOn({}, success);
+      await enginePlatform.sendMessage('chat-1', 'step');
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      expect(sendMessage).toHaveBeenCalledWith('chat-1', 'done', expect.anything());
+    });
+
+    test('a stamped run with follow-up off keeps the real platform and its result card', async () => {
+      const { sendMessage, enginePlatform } = await resumeOn(stamp, failure);
+      await enginePlatform.sendMessage('chat-1', 'step');
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+      expect(sendMessage).toHaveBeenCalledWith(
+        'chat-1',
+        'Workflow **deliver** failed: boom',
+        expect.anything()
+      );
     });
   });
 

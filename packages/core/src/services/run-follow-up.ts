@@ -6,11 +6,16 @@
  * platform-agnostic. The host decides which platform types get follow-ups and drives
  * delivery; with no platform enabled, nothing on any path changes.
  */
-import { spellWorkflowCommand, type WorkflowCommandSurface } from '@archon/workflows/deps';
-import type {
-  RunTerminalStatus,
-  WorkflowRun,
-  WorkflowRunOutcome,
+import {
+  spellWorkflowCommand,
+  type IWorkflowPlatform,
+  type WorkflowCommandSurface,
+} from '@archon/workflows/deps';
+import {
+  readRunFollowUp,
+  type RunTerminalStatus,
+  type WorkflowRun,
+  type WorkflowRunOutcome,
 } from '@archon/workflows/schemas/workflow-run';
 import { formatPausedGateSection, type PausedGateContext } from '../orchestrator/prompt-builder';
 import type { NonTerminalWorkflowRunStatus } from './run-attention-watch';
@@ -27,6 +32,32 @@ export function disableRunFollowUp(platformType: string): void {
 
 export function isRunFollowUpEnabled(platformType: string): boolean {
   return followUpPlatforms.has(platformType);
+}
+
+/**
+ * The platform a run's engine is handed when its chat is followed up: with follow-up
+ * enabled for the platform's type the engine sends nowhere, so its own step output does
+ * not reach the chat and an approval gate pauses instead of failing on an undeliverable
+ * message. The host's follow-up then tells the chat's AI, which reports in its own words.
+ * Any other platform is returned as is. Callers keep sending their own notices on the real
+ * platform, and must report on it any failure that no run row records.
+ */
+export function runEnginePlatform(platform: IWorkflowPlatform): IWorkflowPlatform {
+  if (!isRunFollowUpEnabled(platform.getPlatformType())) return platform;
+  return {
+    sendMessage: async () => undefined,
+    getStreamingMode: () => 'batch',
+    getPlatformType: () => platform.getPlatformType(),
+  };
+}
+
+/**
+ * Whether a run the chat will be told about: its platform has follow-up enabled and the
+ * row carries the stamp. A resumed row keeps the stamp it was created with, so only a
+ * stamped run is followed up.
+ */
+export function isRunFollowedUp(platformType: string, run: Pick<WorkflowRun, 'metadata'>): boolean {
+  return isRunFollowUpEnabled(platformType) && readRunFollowUp(run.metadata) !== undefined;
 }
 
 /**

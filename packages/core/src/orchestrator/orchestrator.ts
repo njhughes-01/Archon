@@ -71,7 +71,6 @@ import {
   CONTINUATION_METADATA_KEY,
   RUN_FOLLOW_UP_METADATA_KEY,
 } from '@archon/workflows/schemas/workflow-run';
-import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { ResolvedWorkflow, WorkflowSource } from '@archon/workflows/schemas/workflow';
 import type { RunModelOverrides } from '@archon/workflows/model-validation';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
@@ -87,7 +86,7 @@ import { isPerUserGitHubEnabled } from '../github-auth/config';
 import { getUserGithubNoreplyEmail } from '../db/user-github-token-store';
 import { toBranchName } from '@archon/git';
 import { startRunLiveOwner } from '../services/run-live-owner';
-import { isRunFollowUpEnabled } from '../services/run-follow-up';
+import { isRunFollowUpEnabled, runEnginePlatform } from '../services/run-follow-up';
 
 type IsolationResolution =
   | { status: 'existing'; cwd: string; env: IsolationEnvironmentRow }
@@ -391,13 +390,7 @@ async function dispatchBackgroundWorkflowOwned(
   // With follow-up on, the engine sends nowhere, the gate pauses, and the host's follow-up
   // tells the chat; isolation notices go to the chat that asked.
   const followUp = isRunFollowUpEnabled(ctx.platform.getPlatformType());
-  const enginePlatform: IWorkflowPlatform = followUp
-    ? {
-        sendMessage: async () => undefined,
-        getStreamingMode: () => 'batch',
-        getPlatformType: () => ctx.platform.getPlatformType(),
-      }
-    : ctx.platform;
+  const enginePlatform = runEnginePlatform(ctx.platform);
   const isolationNoticeConversationId = followUp ? ctx.conversationId : workerPlatformId;
 
   // 2. Create worker conversation in DB; propagate userId so the worker
