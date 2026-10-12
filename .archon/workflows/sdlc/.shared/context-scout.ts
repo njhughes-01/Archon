@@ -50,6 +50,8 @@ export interface ScoutSettings extends JevAccess {
   maxFileBytes: number;
   /** Most characters of code and question text in one request. */
   maxRequestChars: number;
+  /** Tokens a second the run may send, on average, across all its requests. */
+  tokensPerSecond: number;
 }
 
 export type ScoutAvailability =
@@ -86,6 +88,9 @@ const NUMBERS = {
   // Jev accepts 32k tokens of state plus the longest question. Code runs near three
   // characters a token, so this stays well inside that without a tokenizer.
   maxRequestChars: ['JEV_SCOUT_MAX_REQUEST_CHARS', 40_000, positiveInteger],
+  // Jev's limit is 100K tokens a second. The default leaves room for one request's worth
+  // of overshoot and for the estimate's error.
+  tokensPerSecond: ['JEV_SCOUT_TOKENS_PER_SECOND', 80_000, positiveInteger],
 } as const satisfies Record<string, readonly [string, number, Check]>;
 
 type NumericSetting = keyof typeof NUMBERS;
@@ -124,6 +129,7 @@ export function readScoutSettings(env: NodeJS.ProcessEnv): ScoutAvailability {
     maxChars: number('maxChars'),
     maxFileBytes: number('maxFileBytes'),
     maxRequestChars: number('maxRequestChars'),
+    tokensPerSecond: number('tokensPerSecond'),
   };
   // A window must add at least one new line, or the windows never reach the end.
   if (settings.windowOverlap >= settings.windowLines) unusable.push(NUMBERS.windowOverlap[0]);
@@ -522,6 +528,8 @@ export interface ClassifyInput {
   fetch?: Fetch;
   /** Milliseconds, for the deadline. A seam for tests. */
   now?: () => number;
+  /** Waits for pacing and retries. A seam for tests. */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 interface Plan {
@@ -600,16 +608,29 @@ function pack(windows: readonly PlannedWindow[], maxRequestChars: number): Plann
   return requests;
 }
 
+/** Code runs near three characters a token; the same estimate sizes the requests above. */
+const CHARS_PER_TOKEN = 3;
+/** Waits before each resend of a request Jev answered 429 or 529; no entry, no resend. */
+const RETRY_DELAYS_MS = [500, 1000, 2000];
+const RETRYABLE_STATUSES = new Set([429, 529]);
+
 /**
  * Ask the question about every file, or as many as the budget allows.
  *
  * All or nothing past the plan: when any request fails, the answers already received are
  * discarded and the result is `unavailable`. A list that silently lacked some files'
  * answers would read as complete.
+ *
+ * Request starts are spaced so the average rate stays under `tokensPerSecond`, and an
+ * answer of 429 or 529 is retried with backoff, as Jev's documentation asks. Any other
+ * failure is not retried.
  */
 export async function classifyFiles(input: ClassifyInput): Promise<ScoutClassification> {
   const { question, files, settings } = input;
   const now = input.now ?? Date.now;
+  const sleep =
+    input.sleep ??
+    ((ms: number): Promise<void> => new Promise<void>(done => setTimeout(done, ms)));
   const startedAt = now();
   const planned = plan(question, files, settings);
   const requests = pack(planned.windows, settings.maxRequestChars);
@@ -619,6 +640,9 @@ export async function classifyFiles(input: ClassifyInput): Promise<ScoutClassifi
   let started = 0;
   let charsSent = 0;
   let failure = '';
+  // When the next request may start. Taken synchronously with the request, so no two
+  // workers reserve the same slot.
+  let nextStartAt = 0;
   // The whole limiter: each worker takes the next request until none is left or one
   // failed. JavaScript runs one of them at a time, so the shared counters need no lock.
   const worker = async (): Promise<void> => {
@@ -630,29 +654,50 @@ export async function classifyFiles(input: ClassifyInput): Promise<ScoutClassifi
       const request = requests[next++];
       started += 1;
       charsSent += request.chars;
+      const tokens = Math.ceil(request.chars / CHARS_PER_TOKEN);
+      const arrivedAt = now();
+      const startAt = Math.max(arrivedAt, nextStartAt);
+      nextStartAt = startAt + (tokens / settings.tokensPerSecond) * 1000;
+      if (startAt > arrivedAt) await sleep(startAt - arrivedAt);
       // A window is named by its place in the plan, so an answer finds its way back.
       const names = request.windows.map(
         (_window, index) => `w${String(request.first + index).padStart(4, '0')}`
       );
-      const answered = await askJevNoul({
-        apiBase: settings.apiBase,
-        apiKey: settings.apiKey,
-        model: settings.model,
-        timeoutMs: settings.timeoutMs,
-        fetch: input.fetch,
-        state: Object.fromEntries(
-          request.windows.map((window, index) => [
-            names[index],
-            {
-              path: planned.paths[window.file],
-              start_line: window.startLine,
-              end_line: window.endLine,
-              code: window.code,
-            },
-          ])
-        ),
-        questions: Object.fromEntries(names.map(name => [name, windowQuestion(question, name)])),
-      });
+      const ask = (): ReturnType<typeof askJevNoul> =>
+        askJevNoul({
+          apiBase: settings.apiBase,
+          apiKey: settings.apiKey,
+          model: settings.model,
+          timeoutMs: settings.timeoutMs,
+          fetch: input.fetch,
+          state: Object.fromEntries(
+            request.windows.map((window, index) => [
+              names[index],
+              {
+                path: planned.paths[window.file],
+                start_line: window.startLine,
+                end_line: window.endLine,
+                code: window.code,
+              },
+            ])
+          ),
+          questions: Object.fromEntries(names.map(name => [name, windowQuestion(question, name)])),
+          });
+      let answered = await ask();
+      for (const delay of RETRY_DELAYS_MS) {
+        if (answered.ok || answered.reason !== 'http_error') break;
+        if (answered.status === undefined || !RETRYABLE_STATUSES.has(answered.status)) break;
+        if (now() - startedAt > settings.deadlineMs) {
+          failure = 'deadline';
+          return;
+        }
+        await sleep(delay);
+        if (now() - startedAt > settings.deadlineMs) {
+          failure = 'deadline';
+          return;
+        }
+        answered = await ask();
+      }
       if (!answered.ok) {
         failure ||=
           `classifier_${answered.reason}` +

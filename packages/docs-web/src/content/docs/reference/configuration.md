@@ -660,6 +660,9 @@ Each run is bounded by a file, a window and a character budget. When a budget is
 | `JEV_SCOUT_MAX_REQUEST_CHARS` | Most characters in one request | `40000` |
 | `JEV_SCOUT_TIMEOUT_MS` | Longest one classifier request may take | `30000` |
 | `JEV_SCOUT_DEADLINE_MS` | Longest the whole classification may take before it stands down | `120000` |
+| `JEV_SCOUT_TOKENS_PER_SECOND` | Tokens a second the classification sends on average, estimated from request size; Jev's limit is `100000` | `80000` |
+
+The scout spaces its requests to stay under `JEV_SCOUT_TOKENS_PER_SECOND`, and retries a request answered with HTTP 429 or 529 three times, waiting 0.5, 1 and 2 seconds; any other failure is not retried.
 
 An unusable number makes the classification report `unavailable` and name the variable; it never falls back to the default, so a mistyped threshold or budget cannot quietly become another policy.
 
