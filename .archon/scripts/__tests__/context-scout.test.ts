@@ -157,6 +157,7 @@ describe('readScoutSettings', () => {
         maxChars: 600_000,
         maxFileBytes: 200_000,
         maxRequestChars: 40_000,
+        tokensPerSecond: 80_000,
       },
     });
 
@@ -175,6 +176,7 @@ describe('readScoutSettings', () => {
       JEV_SCOUT_MAX_CHARS: '7000',
       JEV_SCOUT_MAX_FILE_BYTES: '8000',
       JEV_SCOUT_MAX_REQUEST_CHARS: '9000',
+      JEV_SCOUT_TOKENS_PER_SECOND: '5000',
     });
     expect(overridden).toEqual({
       available: true,
@@ -193,6 +195,7 @@ describe('readScoutSettings', () => {
         maxChars: 7000,
         maxFileBytes: 8000,
         maxRequestChars: 9000,
+        tokensPerSecond: 5000,
       },
     });
   });
@@ -208,6 +211,8 @@ describe('readScoutSettings', () => {
     // More requests at once than any classifier endpoint should be handed by one run.
     ['JEV_SCOUT_PARALLELISM', '17'],
     ['JEV_SCOUT_MAX_FILES', 'many'],
+    ['JEV_SCOUT_TOKENS_PER_SECOND', '0'],
+    ['JEV_SCOUT_TOKENS_PER_SECOND', 'abc'],
   ])('is unavailable when %s is %s', (name, value) => {
     expect(readScoutSettings({ JEV_API_KEY: 'k', [name]: value })).toEqual({
       available: false,
@@ -737,6 +742,179 @@ describe('classifyFiles', () => {
     expect(result.reason).toBe('deadline');
     expect(result.files).toEqual([]);
     expect(jev.bodies.length).toBeLessThan(4);
+  });
+
+  describe('pacing and retries', () => {
+    /**
+     * A shared virtual clock. A sleep wakes in order of its wake time, one per macrotask,
+     * so everything a woken worker does happens before the next one wakes. Nothing waits
+     * in real time.
+     */
+    function clock(): {
+      now: () => number;
+      sleep: (ms: number) => Promise<void>;
+      sleeps: number[];
+    } {
+      let time = 1_000;
+      const sleeps: number[] = [];
+      const waiting: { wake: number; done: () => void }[] = [];
+      const wakeEarliest = (): void => {
+        waiting.sort((a, b) => a.wake - b.wake);
+        const next = waiting.shift();
+        if (next === undefined) return;
+        time = Math.max(time, next.wake);
+        next.done();
+      };
+      return {
+        now: () => time,
+        sleeps,
+        sleep: (ms: number): Promise<void> =>
+          new Promise<void>(done => {
+            sleeps.push(ms);
+            waiting.push({ wake: time + ms, done });
+            setTimeout(wakeEarliest, 0);
+          }),
+      };
+    }
+
+    /** Answers with `statuses` in order, then succeeds; records the clock at every send. */
+    function scripted(
+      time: () => number,
+      statuses: number[]
+    ): { fetch: Fetch; starts: number[]; calls: () => number } {
+      const ok = fakeJev(() => 0.9);
+      const starts: number[] = [];
+      let calls = 0;
+      const fetch: Fetch = async (input, init) => {
+        starts.push(time());
+        const status = statuses[calls];
+        calls += 1;
+        if (status !== undefined) return new Response('{}', { status });
+        return ok.fetch(input, init);
+      };
+      return { fetch, starts, calls: () => calls };
+    }
+
+    const oneWindowEach = (count: number): ScoutFile[] =>
+      Array.from({ length: count }, (_unused, index) => file(`f${String(index)}.ts`, 40));
+
+    it.each([1, 3])(
+      'spaces request starts by tokens over tokensPerSecond with %i in flight',
+      async parallelism => {
+        const fake = clock();
+        const sent = scripted(fake.now, []);
+        const result = await classifyFiles({
+          question: QUESTION,
+          files: oneWindowEach(4),
+          settings: settings({ maxRequestChars: 1000, parallelism, tokensPerSecond: 500 }),
+          fetch: sent.fetch,
+          now: fake.now,
+          sleep: fake.sleep,
+        });
+
+        expect(result.status).toBe('ok');
+        expect(result.counts.requests).toBe(4);
+        // Every request is the same size, so every slot is the same width.
+        const tokens = Math.ceil(result.counts.charsSent / 4 / 3);
+        const slot = (tokens / 500) * 1000;
+        expect(sent.starts).toEqual([0, 1, 2, 3].map(index => 1_000 + index * slot));
+      }
+    );
+
+    it('does not wait when the rate already allows the request', async () => {
+      const fake = clock();
+      const sent = scripted(fake.now, []);
+
+      const result = await classifyFiles({
+        question: QUESTION,
+        files: oneWindowEach(1),
+        settings: settings({ maxRequestChars: 1000 }),
+        fetch: sent.fetch,
+        now: fake.now,
+        sleep: fake.sleep,
+      });
+
+      expect(result.status).toBe('ok');
+      expect(fake.sleeps).toEqual([]);
+    });
+
+    it.each([429, 529])('resends the same request after a %i and uses the answers', async status => {
+      const fake = clock();
+      const sent = scripted(fake.now, [status]);
+
+      const result = await classifyFiles({
+        question: QUESTION,
+        files: [file('a.ts', 3)],
+        settings: settings(),
+        fetch: sent.fetch,
+        now: fake.now,
+        sleep: fake.sleep,
+      });
+
+      expect(result.status).toBe('ok');
+      expect(result.files[0].confidence).toBe(0.9);
+      expect(sent.calls()).toBe(2);
+      expect(fake.sleeps).toEqual([500]);
+      // A request counts once, however many attempts it took.
+      expect(result.counts.requests).toBe(1);
+    });
+
+    it('gives up after three retries of a 429, backing off 500, 1000 and 2000 ms', async () => {
+      const fake = clock();
+      const sent = scripted(fake.now, [429, 429, 429, 429]);
+
+      const result = await classifyFiles({
+        question: QUESTION,
+        files: [file('a.ts', 3)],
+        settings: settings(),
+        fetch: sent.fetch,
+        now: fake.now,
+        sleep: fake.sleep,
+      });
+
+      expect(result.status).toBe('unavailable');
+      expect(result.reason).toBe('classifier_http_error:429');
+      expect(result.files).toEqual([]);
+      expect(sent.calls()).toBe(4);
+      expect(fake.sleeps).toEqual([500, 1000, 2000]);
+    });
+
+    it('does not retry other statuses', async () => {
+      const fake = clock();
+      const sent = scripted(fake.now, [500]);
+
+      const result = await classifyFiles({
+        question: QUESTION,
+        files: [file('a.ts', 3)],
+        settings: settings(),
+        fetch: sent.fetch,
+        now: fake.now,
+        sleep: fake.sleep,
+      });
+
+      expect(result.reason).toBe('classifier_http_error:500');
+      expect(sent.calls()).toBe(1);
+      expect(fake.sleeps).toEqual([]);
+    });
+
+    it('stands down with the deadline reason when it passes during a retry wait', async () => {
+      const fake = clock();
+      const sent = scripted(fake.now, [429, 429, 429]);
+
+      const result = await classifyFiles({
+        question: QUESTION,
+        files: [file('a.ts', 3)],
+        // The first wait (500 ms) fits; the second ends past 700 ms.
+        settings: settings({ deadlineMs: 700 }),
+        fetch: sent.fetch,
+        now: fake.now,
+        sleep: fake.sleep,
+      });
+
+      expect(result.status).toBe('unavailable');
+      expect(result.reason).toBe('deadline');
+      expect(sent.calls()).toBeLessThan(4);
+    });
   });
 
   it('is ok with nothing to do when there are no files', async () => {
