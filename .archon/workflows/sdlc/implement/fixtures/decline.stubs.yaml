@@ -3,6 +3,7 @@
 # declared for the red); assert-changed executes for real, so
 # assert-changed must fail the run: a run with nothing to show and nothing to say
 # about why fails rather than reporting success.
+code-index: "stub: index built"
 implement:
   done: true
   green: false

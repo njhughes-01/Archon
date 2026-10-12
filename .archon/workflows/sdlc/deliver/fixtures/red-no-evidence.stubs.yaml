@@ -5,6 +5,7 @@
 #
 # The project gate's half of the same rule is validate-red-no-evidence.stubs.yaml.
 # One script serves all three gates, so neither can drift from the other.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: false

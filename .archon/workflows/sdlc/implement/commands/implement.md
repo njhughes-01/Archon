@@ -34,6 +34,17 @@ When the work or the request names a tracked item — an issue, a ticket, a docu
 
 This run must already be on that pull request's branch, or for a pull request from a fork, on the run's review branch at the pull request's head — launched onto it with `--adopt`, or from the pull request itself. Confirm that before editing with `gh pr view <number> --repo "$REPO_PATH" --json headRefName,headRefOid,isCrossRepository,maintainerCanModify`, where `REPO_PATH` is the `owner/repo` of `origin` — in a clone of a fork the CLI's default resolution targets the fork's upstream parent, and the check would read the wrong pull request. For a same-repository pull request, `git branch --show-current` must equal `headRefName`. For a fork (`isCrossRepository: true`), `git rev-parse HEAD` must equal `headRefOid` at the start of the run, and `maintainerCanModify` must be true: that flag is the author's permission for this run to push to their branch, and without it the work has nowhere to go. If either check fails, stop with `done: true, green: false` and say which check failed; never switch branches, fetch the pull request's head into this checkout, or start a replacement branch — the run's estate is fixed at launch, and work done anywhere else is invisible to it. On a match, work and commit on the current branch as usual; the pull request stays the one public surface, and later nodes push to its head and read it back by its number.
 
+## Code graph (Codanna)
+
+This checkout has a Codanna index of its code and markdown docs, built when the run started. Query it from the shell with `codegraph <tool> key:value ...` before grep and whole-file reads:
+
+- You know the behaviour but not where it lives: `codegraph semantic_search_with_context query:"plain-language description" limit:3`. It returns the matching functions with their callers and callees.
+- You know a name: `codegraph find_symbol <Name>`, or `codegraph search_symbols query:<part> limit:5` for part of it.
+- Who calls it, what it calls, and what a change to it would touch: `codegraph find_callers <name>`, `codegraph get_calls <name>`, `codegraph analyze_impact <name>`. Pass `symbol_id:<N>` when a name matches several symbols.
+- What comments and docstrings say about a topic: `codegraph semantic_search_docs query:"..."`. What the markdown docs say: `codegraph search_documents query:"..."`.
+
+Then read only the line ranges the results point to. Keep using text search for string literals, environment variables, config, templates, migrations, and non-code assets. The index is from the start of the run and does not see this turn's own edits; after substantial edits, `codegraph --index` refreshes it in about a second. If a command reports no index or fails, use ordinary reads and carry on.
+
 ## How to work
 
 1. Make the project runnable first: if dependencies are missing, install them with the project's own package manager in locked mode. Never update a lockfile.

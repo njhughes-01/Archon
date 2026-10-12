@@ -4,6 +4,7 @@
 # the gate with the caveat recorded, and pause with the rerun-and-resume action
 # visible. The fixture pins the route: classification instead of a probe death,
 # then one fresh check read and an action-required wait rather than flip-ready.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true
@@ -49,6 +50,7 @@ ci-verdict: '{"state":"red","detail":"e2e-smoke (fail)"}'
 # honest-decline state, and the real guard must pass it via the inherited
 # cause plus summary — the same proof correction-honest-decline pins
 # for the corrections loop.
+ci-fix__code-index: "stub: index built"
 ci-fix__implement:
   done: true
   green: false

@@ -23,12 +23,24 @@ returns: implement
 outcome_field: green
 
 nodes:
+  # Builds or refreshes this checkout's Codanna index for the implement node. A
+  # checkout already indexed by a plan or investigate run in the same worktree is
+  # refreshed in about a second. The implement node reaches the index through the
+  # `codegraph` shell command because a loop node does not carry `mcp`. Never fails
+  # the run on purpose: the index only speeds up navigation, and the agent falls
+  # back to ordinary reads when it is missing.
+  - id: code-index
+    bash: |
+      timeout 540 codegraph --index 2>&1 || echo "code-index: FAILED; agent steps will use ordinary reads"
+    timeout: 600000
+
   # Run success ≠ green. The loop completes on `done`, which deliberately includes
   # a definitive blocked decline (green: false) — so a completed run's status never
   # certifies the work. Consumers read $implement.output.green; compositions gate on
   # it deterministically before spending or shipping (deliver does), and the
   # workflow's outcome_field records it as the run's authored outcome.
   - id: implement
+    depends_on: [code-index]
     loop:
       command: implement
       until_field: done

@@ -5,6 +5,7 @@
 #
 # The sibling case, a non-green project gate that declares no cause at all, is
 # validate-red.stubs.yaml.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true

@@ -10,6 +10,7 @@
 # discard every correction before it. The round now passes its guard, the continuation
 # review certifies the branch ready, and the inherited break rides to the CI wait like
 # any other, where the pull request's own checks decide.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true
@@ -47,6 +48,7 @@ review__publish:
   findings_summary: "stub: 1 Important finding open"
   report: { type: archon_artifact, run_id: "fixture-run", path: "review/report.md" }
 ci-note: "CI state for this pull request (head abc123def456): Concluded non-green checks:\n- test (windows-latest) (fail)"
+fix__code-index: "stub: index built"
 fix__implement:
   done: true
   green: false

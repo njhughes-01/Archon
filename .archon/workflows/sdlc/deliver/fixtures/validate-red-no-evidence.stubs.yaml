@@ -2,6 +2,7 @@
 # before it (--exec-code, so the real gate script decides). A full gate that comes
 # back red, calls the red environmental, and says nothing about which check failed
 # stops the run — the caveat it would record tells a reader nothing to act on.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true

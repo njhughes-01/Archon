@@ -1,5 +1,6 @@
 # An adjacent proved defect survives in discovery artifacts and the report but
 # does not turn an otherwise-ready review into correction work.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true

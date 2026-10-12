@@ -6,6 +6,7 @@
 # The runner, result, gate-green and gate-validated are deliberately unstubbed:
 # the real scripts pass the green implementation and refuse the unfinished
 # validation.
+impl__code-index: "stub: index built"
 impl__implement:
   done: true
   green: true

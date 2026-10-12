@@ -3,6 +3,7 @@
 # partway; every check that ran passed, the rest never ran. The loop declares
 # `incomplete`, and assert-changed refuses it as an unfinished validation, not as
 # red nobody explained, whatever else the turn did.
+code-index: "stub: index built"
 implement:
   done: true
   green: false
