@@ -6,7 +6,11 @@
  * platform-agnostic. The host decides which platform types get follow-ups and drives
  * delivery; with no platform enabled, nothing on any path changes.
  */
-import { spellWorkflowCommand, type WorkflowCommandSurface } from '@archon/workflows/deps';
+import {
+  spellWorkflowCommand,
+  type IWorkflowPlatform,
+  type WorkflowCommandSurface,
+} from '@archon/workflows/deps';
 import type {
   RunTerminalStatus,
   WorkflowRun,
@@ -27,6 +31,23 @@ export function disableRunFollowUp(platformType: string): void {
 
 export function isRunFollowUpEnabled(platformType: string): boolean {
   return followUpPlatforms.has(platformType);
+}
+
+/**
+ * The platform a run's engine is handed when its chat is followed up: with follow-up
+ * enabled for the platform's type the engine sends nowhere, so its own step output does
+ * not reach the chat and an approval gate pauses instead of failing on an undeliverable
+ * message. The host's follow-up then tells the chat's AI, which reports in its own words.
+ * Any other platform is returned as is. Callers keep sending their own notices on the real
+ * platform, and must report on it any failure that no run row records.
+ */
+export function runEnginePlatform(platform: IWorkflowPlatform): IWorkflowPlatform {
+  if (!isRunFollowUpEnabled(platform.getPlatformType())) return platform;
+  return {
+    sendMessage: async () => undefined,
+    getStreamingMode: () => 'batch',
+    getPlatformType: () => platform.getPlatformType(),
+  };
 }
 
 /**

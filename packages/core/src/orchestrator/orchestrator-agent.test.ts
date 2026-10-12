@@ -25,6 +25,7 @@ import {
   withObservableCapturedSource,
 } from '@archon/workflows/test-utils';
 import type { Codebase, Conversation, IPlatformAdapter } from '../types';
+import type { IWorkflowPlatform } from '@archon/workflows/deps';
 import type { MergedConfig } from '../config/config-types';
 import type { MessageRow } from '../schemas/message';
 import type { Session } from '../schemas/session';
@@ -3359,6 +3360,154 @@ describe('workflow dispatch routing — interactive flag', () => {
     // The user-visible notice still fires.
     const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
     expect(sent).toContain('starting fresh in the same worktree');
+  });
+
+  describe('run follow-up on a foreground run', () => {
+    afterEach(() => {
+      disableRunFollowUp('telegram');
+    });
+
+    function telegramPlatform(): ReturnType<typeof makePlatform> {
+      const platform = makePlatform();
+      platform.getPlatformType.mockImplementation(() => 'telegram');
+      return platform;
+    }
+
+    function arrange(): void {
+      mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(makeDispatchConversation()));
+      mockGetCodebase.mockReturnValueOnce(Promise.resolve(makeCodebase()));
+      mockHandleCommand.mockReturnValueOnce(Promise.resolve(makeWorkflowResult(true)));
+    }
+
+    function submitted(): {
+      platform: IWorkflowPlatform;
+      opts: { followUpConversationId?: string };
+    } {
+      const args = mockExecuteWorkflow.mock.calls[0] as unknown[];
+      return {
+        platform: args[1] as IWorkflowPlatform,
+        opts: args[7] as { followUpConversationId?: string },
+      };
+    }
+
+    test('fresh run: the engine sends nowhere and the run is stamped for the chat', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const { platform: enginePlatform, opts } = submitted();
+      expect(enginePlatform).not.toBe(platform);
+      expect(enginePlatform.getPlatformType()).toBe('telegram');
+      platform.sendMessage.mockClear();
+      await enginePlatform.sendMessage('conv-1', '{"ready":true}');
+      expect(platform.sendMessage).not.toHaveBeenCalled();
+      expect(opts.followUpConversationId).toBe('conv-1-db');
+    });
+
+    test('fresh run on a platform without follow-up: real platform, no stamp', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      const platform = makePlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const { platform: enginePlatform, opts } = submitted();
+      expect(enginePlatform).toBe(platform);
+      expect(opts.followUpConversationId).toBeUndefined();
+    });
+
+    test('fresh run with follow-up off: real platform, no stamp', async () => {
+      arrange();
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const { platform: enginePlatform, opts } = submitted();
+      expect(enginePlatform).toBe(platform);
+      expect(opts.followUpConversationId).toBeUndefined();
+    });
+
+    test('a failure no run row records is sent to the real chat', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      mockExecuteWorkflow.mockResolvedValueOnce({
+        success: false,
+        error: 'Database error creating workflow run',
+      });
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+      expect(sent).toContain('failed: Database error creating workflow run');
+    });
+
+    test('a failure the run row records is left to the follow-up', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      mockExecuteWorkflow.mockResolvedValueOnce({
+        success: false,
+        workflowRunId: 'run-1',
+        error: 'node failed',
+      });
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+      expect(sent).not.toContain('node failed');
+    });
+
+    test('starting fresh in the same worktree: the notice reaches the chat, the engine does not', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      mockFindResumableRunByParentConversation.mockReturnValueOnce(
+        Promise.resolve(makeResumableRun({ id: 'empty-prior-run', status: 'paused' }))
+      );
+      mockHydrateResumableRun.mockReturnValueOnce(Promise.resolve(null));
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      const { platform: enginePlatform, opts } = submitted();
+      expect(enginePlatform).not.toBe(platform);
+      expect(opts.followUpConversationId).toBe('conv-1-db');
+      const sent = platform.sendMessage.mock.calls.map(c => String(c[1])).join('\n');
+      expect(sent).toContain('starting fresh in the same worktree');
+    });
+
+    test('resuming a stamped run: the engine sends nowhere', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      mockFindResumableRunByParentConversation.mockReturnValueOnce(
+        Promise.resolve(
+          makeResumableRun({
+            status: 'paused',
+            metadata: { follow_up: { conversation_id: 'conv-1-db' } },
+          })
+        )
+      );
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      expect(submitted().platform).not.toBe(platform);
+    });
+
+    test('resuming an unstamped run keeps the real platform, so nothing goes silent', async () => {
+      enableRunFollowUp('telegram');
+      arrange();
+      mockFindResumableRunByParentConversation.mockReturnValueOnce(
+        Promise.resolve(makeResumableRun({ status: 'paused' }))
+      );
+      const platform = telegramPlatform();
+
+      await handleMessage(platform, 'conv-1', '/workflow run test-workflow');
+
+      expect(submitted().platform).toBe(platform);
+    });
   });
 
   test('calls dispatchBackgroundWorkflow for non-interactive workflow on web', async () => {

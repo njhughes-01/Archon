@@ -35,6 +35,7 @@ import {
   RUN_FOLLOW_UP_CONVERSATION_ENV,
   RUN_FOLLOW_UP_PROMPT_SECTION,
   isRunFollowUpEnabled,
+  runEnginePlatform,
 } from '../services/run-follow-up';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
 import { resolveWorkflowSourceRoot } from '../utils/workflow-source-root';
@@ -84,7 +85,8 @@ import type {
   WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
 import { isWorkflowWaitContext } from '@archon/workflows/schemas/workflow-run';
-import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import { readRunFollowUp, type WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowExecutionResult } from '@archon/workflows/schemas/workflow';
 import { spellWorkflowCommand, type WorkflowCommandSurface } from '@archon/workflows/deps';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
 import { isPerUserGitHubEnabled } from '../github-auth/config';
@@ -1311,6 +1313,11 @@ async function dispatchOrchestratorWorkflowOwned(
     // falls through to a fresh run on another owner's worktree.
     const deps = createWorkflowDeps();
     const engine = new InProcessWorkflowEngine(deps);
+    // A resumed row keeps the stamp it was created with, and the executor never restamps
+    // it. Only a stamped run is followed up, so only its engine may go silent.
+    const resumeFollowedUp =
+      isRunFollowUpEnabled(platform.getPlatformType()) &&
+      readRunFollowUp(resumableRun.metadata) !== undefined;
     const resumeOwner = await startRunLiveOwner(resumableRun.id);
     let resumeOwnerClosed = false;
     try {
@@ -1378,7 +1385,7 @@ async function dispatchOrchestratorWorkflowOwned(
             );
           }
           admission = await engine.resume({
-            platform,
+            platform: resumeFollowedUp ? runEnginePlatform(platform) : platform,
             conversationId,
             cwd: resumableWorkingPath,
             legacyWorkflow: workflow,
@@ -1423,7 +1430,10 @@ async function dispatchOrchestratorWorkflowOwned(
         throw err;
       }
       if (admission.accepted) {
-        await admission.settled;
+        const result = await admission.settled;
+        if (resumeFollowedUp) {
+          await reportUnrecordedRunFailure(platform, conversationId, workflow.name, result);
+        }
       } else {
         await resumeOwner.close();
         resumeOwnerClosed = true;
@@ -1456,9 +1466,10 @@ async function dispatchOrchestratorWorkflowOwned(
         // executor adopts for us there (see #2690). `captured.preparedSource` proves
         // the helper has already run `owner.hold`, which is the only thing the wrap
         // needs to know to reclaim if the rename fails.
+        const followUp = isRunFollowUpEnabled(platform.getPlatformType());
         await withRunLiveOwner(captured.preparedSource.runId, {}, async () => {
-          await engine.submit({
-            platform,
+          const result = await engine.submit({
+            platform: runEnginePlatform(platform),
             conversationId,
             cwd: resumableWorkingPath,
             workflow,
@@ -1467,6 +1478,8 @@ async function dispatchOrchestratorWorkflowOwned(
             options: {
               codebaseId: codebase.id,
               parentConversationId: conversation.id,
+              // This branch creates a fresh row, so the stamp is written here.
+              ...(followUp ? { followUpConversationId: conversation.id } : {}),
               userId,
               source,
               preparedSource: captured.preparedSource,
@@ -1488,6 +1501,9 @@ async function dispatchOrchestratorWorkflowOwned(
               ...(options?.runConfig ? { runConfig: options.runConfig } : {}),
             },
           });
+          if (followUp) {
+            await reportUnrecordedRunFailure(platform, conversationId, workflow.name, result);
+          }
         });
       }
     } finally {
@@ -1554,9 +1570,10 @@ async function dispatchOrchestratorWorkflowOwned(
     // The wrap owns the capture until `executeWorkflow`'s rename succeeds; the
     // executor adopts for us there (see #2690). `freshCaptured` proves the prior
     // `captureFreshSource` call already ran `owner.hold`.
+    const followUp = isRunFollowUpEnabled(platform.getPlatformType());
     await withRunLiveOwner(freshCaptured.preparedSource.runId, {}, async () => {
-      await freshEngine.submit({
-        platform,
+      const result = await freshEngine.submit({
+        platform: runEnginePlatform(platform),
         conversationId,
         cwd,
         workflow,
@@ -1565,6 +1582,7 @@ async function dispatchOrchestratorWorkflowOwned(
         options: {
           codebaseId: codebase.id,
           parentConversationId: conversation.id,
+          ...(followUp ? { followUpConversationId: conversation.id } : {}),
           userId,
           source,
           preparedSource: freshCaptured.preparedSource,
@@ -1590,8 +1608,31 @@ async function dispatchOrchestratorWorkflowOwned(
           ...(options?.runConfig ? { runConfig: options.runConfig } : {}),
         },
       });
+      if (followUp) {
+        await reportUnrecordedRunFailure(platform, conversationId, workflow.name, result);
+      }
     });
   }
+}
+
+/**
+ * A followed-up run's engine sends nowhere, and the follow-up reports only what a run row
+ * records. A failure returned without a run id has no row to read (the executor returns one
+ * only before it creates the row, or after it cancelled a guard-blocked one), so this chat
+ * hears it here. The background dispatch applies the same rule to a failure it caught.
+ */
+async function reportUnrecordedRunFailure(
+  platform: IPlatformAdapter,
+  conversationId: string,
+  workflowName: string,
+  result: WorkflowExecutionResult
+): Promise<void> {
+  if (result.success || result.workflowRunId !== undefined) return;
+  await platform
+    .sendMessage(conversationId, `Workflow **${workflowName}** failed: ${result.error}`)
+    .catch((sendErr: unknown) => {
+      getLog().error({ err: toError(sendErr) }, 'foreground_workflow_notify_failed');
+    });
 }
 
 /**

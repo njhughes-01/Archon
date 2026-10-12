@@ -54,7 +54,8 @@ For streaming mode details, see [Configuration](/getting-started/configuration/)
 
 When the chat's AI starts a workflow run, with its run tool or with `archon workflow run` in its shell, the chat is told when that run finishes, fails, is cancelled, loses its process, or stops for a decision. The server checks those runs every 15 seconds and sends the chat's AI an automatic message marked `[Archon run update — automatic, not typed by the user]`; the AI then reports the result in its own words and carries on, or asks you. An automatic turn never approves, rejects, resumes, cancels, or abandons a run unless you already gave that decision in the chat.
 
-- Only runs started by this chat's AI are followed up. Runs started from a terminal, the Web UI, or the foreground of a chat message are not.
+- Only runs started by this chat's AI are followed up. Runs started from a terminal or the Web UI are not.
+- A run the chat's AI starts in the chat itself is followed up the same way. While it runs, the engine's own step output is not posted to the chat; the AI reports the result when the run ends.
 - Each event is followed up once, also across server restarts. Runs that ended more than 24 hours ago are not picked up.
 - If the automatic turn fails, or never reaches the AI because the chat's working directory or project no longer exists, the chat gets a one-line note about the run; the follow-up is not retried.
 - If you send `/reset` after the run started, the chat gets one short note instead, and the new session is not woken. Runs that `/reset` itself cancelled get no message.
