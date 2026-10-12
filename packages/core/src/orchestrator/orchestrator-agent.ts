@@ -35,6 +35,7 @@ import {
   RUN_FOLLOW_UP_CONVERSATION_ENV,
   RUN_FOLLOW_UP_PROMPT_SECTION,
   isRunFollowUpEnabled,
+  isRunFollowedUp,
   runEnginePlatform,
 } from '../services/run-follow-up';
 import { getArchonWorkspacesPath, ensureArchonWorkspacesPath } from '@archon/paths';
@@ -85,7 +86,7 @@ import type {
   WorkflowSource,
 } from '@archon/workflows/schemas/workflow';
 import { isWorkflowWaitContext } from '@archon/workflows/schemas/workflow-run';
-import { readRunFollowUp, type WorkflowRun } from '@archon/workflows/schemas/workflow-run';
+import type { WorkflowRun } from '@archon/workflows/schemas/workflow-run';
 import type { WorkflowExecutionResult } from '@archon/workflows/schemas/workflow';
 import { spellWorkflowCommand, type WorkflowCommandSurface } from '@archon/workflows/deps';
 import type { WorkflowRunConfigInput } from '@archon/workflows/schemas/run-config';
@@ -1313,11 +1314,8 @@ async function dispatchOrchestratorWorkflowOwned(
     // falls through to a fresh run on another owner's worktree.
     const deps = createWorkflowDeps();
     const engine = new InProcessWorkflowEngine(deps);
-    // A resumed row keeps the stamp it was created with, and the executor never restamps
-    // it. Only a stamped run is followed up, so only its engine may go silent.
-    const resumeFollowedUp =
-      isRunFollowUpEnabled(platform.getPlatformType()) &&
-      readRunFollowUp(resumableRun.metadata) !== undefined;
+    // The executor never restamps a resumed row, so only an already stamped run may go silent.
+    const resumeFollowedUp = isRunFollowedUp(platform.getPlatformType(), resumableRun);
     const resumeOwner = await startRunLiveOwner(resumableRun.id);
     let resumeOwnerClosed = false;
     try {

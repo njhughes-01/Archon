@@ -11,10 +11,11 @@ import {
   type IWorkflowPlatform,
   type WorkflowCommandSurface,
 } from '@archon/workflows/deps';
-import type {
-  RunTerminalStatus,
-  WorkflowRun,
-  WorkflowRunOutcome,
+import {
+  readRunFollowUp,
+  type RunTerminalStatus,
+  type WorkflowRun,
+  type WorkflowRunOutcome,
 } from '@archon/workflows/schemas/workflow-run';
 import { formatPausedGateSection, type PausedGateContext } from '../orchestrator/prompt-builder';
 import type { NonTerminalWorkflowRunStatus } from './run-attention-watch';
@@ -48,6 +49,15 @@ export function runEnginePlatform(platform: IWorkflowPlatform): IWorkflowPlatfor
     getStreamingMode: () => 'batch',
     getPlatformType: () => platform.getPlatformType(),
   };
+}
+
+/**
+ * Whether a run the chat will be told about: its platform has follow-up enabled and the
+ * row carries the stamp. A resumed row keeps the stamp it was created with, so only a
+ * stamped run is followed up.
+ */
+export function isRunFollowedUp(platformType: string, run: Pick<WorkflowRun, 'metadata'>): boolean {
+  return isRunFollowUpEnabled(platformType) && readRunFollowUp(run.metadata) !== undefined;
 }
 
 /**
