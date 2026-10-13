@@ -1,6 +1,6 @@
 import type { ExecNode, WorkflowDefinition } from './schemas';
 import { inputEnvKey, isExecNode, isIncludeDirective } from './schemas';
-import { EXEC_NODE_ENVIRONMENT_NAMES } from './exec-environment';
+import { DOCUMENTED_HOST_ENVIRONMENT_NAMES, EXEC_NODE_ENVIRONMENT_NAMES } from './exec-environment';
 import { isInlineScript } from './executor-shared';
 import type { TemplateSlot } from './template-walker';
 import { visitNodeTemplateSlots } from './template-walker';
@@ -87,7 +87,10 @@ export function validateExecInputTargets(
     if (source === undefined) continue;
 
     const availableNames = [...new Set([...target.bindingNames, ...declaredInputs])].sort();
-    const availableEnv = new Set(EXEC_NODE_ENVIRONMENT_NAMES);
+    const availableEnv = new Set([
+      ...EXEC_NODE_ENVIRONMENT_NAMES,
+      ...DOCUMENTED_HOST_ENVIRONMENT_NAMES,
+    ]);
     for (const name of availableNames) availableEnv.add(inputEnvKey(name));
 
     for (const read of scanEnvironmentReads(source.text, source.runtime)) {

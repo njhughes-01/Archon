@@ -7,6 +7,7 @@
     "./executor": "./src/executor.ts",
     "./loader": "./src/loader.ts",
     "./deprecation": "./src/deprecation.ts",
+    "./parse-warning-summary": "./src/parse-warning-summary.ts",
     "./router": "./src/router.ts",
     "./store": "./src/store.ts",
     "./terminal-record": "./src/terminal-record.ts",
@@ -71,7 +72,8 @@
       "src/template-walker.test.ts"
     ],
     [
-      "src/unbound-exec-inputs.test.ts"
+      "src/unbound-exec-inputs.test.ts",
+      "src/parse-warning-summary.test.ts"
     ],
     [
       "src/workflow-discovery-command-scan.test.ts"
