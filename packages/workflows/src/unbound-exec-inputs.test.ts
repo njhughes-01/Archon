@@ -165,6 +165,23 @@ nodes:
     expect(warnings[0]).toContain("Available bindings/inputs: 'alpha', 'middle', 'zeta'.");
   });
 
+  test('accepts the host settings the bundled SDLC pack documents', () => {
+    const result = parseWorkflow(
+      `name: host-setting
+description: Read a documented host setting
+nodes:
+  - id: read-pr
+    script: |
+      console.log(process.env.ARCHON_SDLC_FORGE)
+    runtime: bun
+`,
+      'host-setting.yaml'
+    );
+
+    expect(result.workflow).not.toBeNull();
+    expect(result.warnings).toEqual([]);
+  });
+
   test('does not claim dynamic, aliased, or unsupported accessors', () => {
     const result = parseWorkflow(
       `name: unsupported-forms

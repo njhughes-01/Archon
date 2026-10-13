@@ -78,6 +78,7 @@ import {
 } from '@archon/workflows/utils/workflow-requirements';
 import { WorkflowInputContractError } from '@archon/workflows/workflow-inputs';
 import { formatDeprecationNotice } from '@archon/workflows/deprecation';
+import { summarizeParseWarnings } from '@archon/workflows/parse-warning-summary';
 import type {
   ResolvedWorkflow,
   WorkflowDefinition,
@@ -1151,7 +1152,11 @@ async function dispatchOrchestratorWorkflowOwned(
   // output, so it lands even when the workflow immediately backgrounds itself.
   // Best-effort: a delivery failure must not stop the run the user asked for.
   if (parseWarnings && parseWarnings.length > 0) {
-    const lines = parseWarnings.map(w => `- ${w}`).join('\n');
+    // One line per distinct warning: a pack whose scripts share an ambient
+    // variable would otherwise repeat the same paragraph once per node.
+    const lines = summarizeParseWarnings(parseWarnings)
+      .map(w => `- ${w}`)
+      .join('\n');
     try {
       await platform.sendMessage(
         conversationId,

@@ -4773,6 +4773,48 @@ describe('handleWorkflowRunCommand — E2 single codebase auto-select', () => {
     );
   });
 
+  // A pack whose scripts all read one ambient variable writes the same warning
+  // once per node. The chat gets one line; the run still carries every warning.
+  test('folds a variable read by several nodes into one chat line', async () => {
+    const envRead = (node: string): string =>
+      `Node '${node}' script (/pack/${node}.ts line 14) reads environment variable ` +
+      "'PACK_SETTING', which is not provided by its bindings, declared inputs, or the engine. " +
+      "Available bindings/inputs: 'pr'.";
+    const warnings = [envRead('ci-note'), envRead('read-pr-body'), envRead('flip-ready')];
+    const conversation = makeConversation({ codebase_id: null });
+    const codebase = makeCodebaseForSync();
+    mockGetOrCreateConversation.mockReturnValueOnce(Promise.resolve(conversation));
+    mockParseCommand.mockReturnValueOnce({ command: 'workflow', args: ['run', 'assist'] });
+    mockHandleCommand.mockReturnValueOnce(
+      Promise.resolve({
+        success: true,
+        message: 'Running workflow assist...',
+        workflow: { kind: 'start', definition: assistWorkflow, args: 'test prompt' },
+      })
+    );
+    mockListCodebases.mockReturnValueOnce(Promise.resolve([codebase]));
+    mockDiscoverWorkflowsWithConfig.mockReturnValueOnce(
+      Promise.resolve({
+        workflows: [makeTestWorkflowWithSource({ name: 'assist' }, 'project', warnings)],
+        errors: [],
+      })
+    );
+
+    const platform = makePlatform();
+    await handleMessage(platform, 'conv-1', '/workflow run assist test prompt');
+
+    expect(platform.sendMessage).toHaveBeenCalledWith(
+      'conv-1',
+      "⚠️ `assist` declares keys the engine ignores:\n- 3 nodes ('ci-note', 'read-pr-body', " +
+        "'flip-ready') read environment variable 'PACK_SETTING', which is not provided by their " +
+        'bindings, declared inputs, or the engine.'
+    );
+    const ctx = (mockDispatchBackgroundWorkflow as ReturnType<typeof mock>).mock.calls[0][0] as {
+      parseWarnings?: readonly string[];
+    };
+    expect(ctx.parseWarnings).toEqual(warnings);
+  });
+
   // The contract behind persisting warnings on the run: a failed chat delivery
   // must not take the record with it. If this ever regresses, a Slack hiccup at
   // dispatch reproduces #2213 exactly — a dropped `interactive:` gate with

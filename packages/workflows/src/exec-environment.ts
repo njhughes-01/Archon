@@ -86,3 +86,12 @@ export const EXEC_NODE_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set(
     })
   )
 );
+
+/**
+ * Host settings a workflow's scripts may read without a binding. The engine does
+ * not set these; a host execution inherits them from the environment Archon runs
+ * with, where the bundled SDLC pack documents them (`.archon/workflows/sdlc/README.md`).
+ */
+export const DOCUMENTED_HOST_ENVIRONMENT_NAMES: ReadonlySet<string> = new Set([
+  'ARCHON_SDLC_FORGE',
+]);
