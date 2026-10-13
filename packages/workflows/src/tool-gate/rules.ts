@@ -229,6 +229,14 @@ export interface RuleContext {
   extraWriteRoots?: readonly string[];
   /** Real paths no call may write, move or remove, inside a write root or not. */
   protectedPaths?: readonly string[];
+  /**
+   * Set for a caller that may merge a pull request of its own repository: a
+   * project chat, where a person asked for the merge. `repository` is that
+   * repository as `owner/name`, which the command must name with `--repo`;
+   * without it no merge is accepted.
+   * Absent for workflow steps, where a merge always escalates.
+   */
+  ownPullRequestMerge?: { repository?: string };
 }
 
 export const DEFAULT_PROTECTED_BRANCHES: readonly string[] = ['main', 'master'];
@@ -508,6 +516,65 @@ function isOwnPullRequestStep(view: CommandView, verb: string, judgement: Judgem
     if (previous.startsWith('-') && !previous.includes('=') && takesValue) return true;
     return /^[A-Za-z0-9._/-]+$/.test(arg.text) && !arg.text.includes('//');
   });
+}
+
+/** How `gh pr merge` may merge: nothing that skips checks, waits unattended or removes a branch. */
+const GH_MERGE_SWITCHES: ReadonlySet<string> = new Set([
+  ...['-s', '--squash', '-m', '--merge', '-r', '--rebase'],
+]);
+const GH_MERGE_REPOSITORY_OPTIONS: ReadonlySet<string> = new Set(['-R', '--repo']);
+const GH_MERGE_HEAD_OPTION = '--match-head-commit';
+
+/**
+ * Whether a `gh pr merge` merges one numbered pull request of the caller's own
+ * repository, named with `--repo`, the ordinary way. GitHub still applies the branch's required
+ * checks, because `--admin` is not accepted; neither is `--auto`, which merges
+ * later with nobody watching, nor `--delete-branch`, which removes a branch a
+ * worktree may hold. A `--repo` must name the caller's repository exactly.
+ */
+function isOwnPullRequestMerge(
+  view: CommandView,
+  judgement: Judgement,
+  context: RuleContext
+): boolean {
+  const own = context.ownPullRequestMerge;
+  if (own === undefined || view.args.some(arg => arg.dynamic || arg.glob)) return false;
+  if (view.args[0]?.text !== 'pr' || view.args[1]?.text !== 'merge') return false;
+  // Any variable set for the command could change the repository or the account
+  // `gh` acts as (`GIT_DIR`, `GH_TOKEN`, ...), so none is accepted.
+  if (view.command.assignments.length > 0 || judgement.environment.size > 0) return false;
+  if (view.command.wrappers.some(wrapper => WRAPPERS[wrapper]?.kind !== 'benign')) return false;
+
+  // The repository must be named. Without `--repo`, `gh` takes it from wherever
+  // the shell stands, which a `cd` or a nested checkout moves unseen.
+  const repository = own.repository?.toLowerCase();
+  if (repository === undefined) return false;
+  const words = view.args.slice(2).map(arg => arg.text);
+  let numbers = 0;
+  let named = 0;
+  for (let index = 0; index < words.length; index += 1) {
+    const word = words[index] ?? '';
+    if (!word.startsWith('-')) {
+      if (!/^[0-9]+$/.test(word)) return false;
+      numbers += 1;
+      continue;
+    }
+    if (GH_MERGE_SWITCHES.has(word)) continue;
+    const [name, inline] = word.split(/=(.*)/s);
+    const value = inline ?? words[(index += 1)];
+    if (value === undefined || value.startsWith('-')) return false;
+    if (name === GH_MERGE_HEAD_OPTION && /^[0-9a-f]{7,64}$/i.test(value)) continue;
+    if (
+      name !== undefined &&
+      GH_MERGE_REPOSITORY_OPTIONS.has(name) &&
+      value.toLowerCase() === repository
+    ) {
+      named += 1;
+      continue;
+    }
+    return false;
+  }
+  return numbers === 1 && named === 1;
 }
 
 const DATABASE_CLIENTS: ReadonlySet<string> = new Set(['psql', 'mysql', 'mongosh', 'redis-cli']);
@@ -2581,7 +2648,7 @@ function onlyShowsState(head: string, positionals: readonly Arg[]): boolean {
 }
 
 /** Raises the mutation signal for the verbs that change state outside what git can undo. */
-function judgeMutation(view: CommandView, judgement: Judgement): void {
+function judgeMutation(view: CommandView, judgement: Judgement, context: RuleContext): void {
   const { command, args } = view;
   const { head } = command;
   const parsed = parseOptions(args, specFor(head));
@@ -2649,7 +2716,10 @@ function judgeMutation(view: CommandView, judgement: Judgement): void {
   if (head === 'gh') {
     const [group, verb] = positionals.map(arg => arg.text);
     if (group !== undefined && GH_GROUPS.has(group) && verb !== undefined) {
-      const ownStep = group === 'pr' && isOwnPullRequestStep(view, verb, judgement);
+      const ownStep =
+        group === 'pr' &&
+        (isOwnPullRequestStep(view, verb, judgement) ||
+          (verb === 'merge' && isOwnPullRequestMerge(view, judgement, context)));
       if (!GH_READ_VERBS.has(verb) && !ownStep) {
         signal(judgement, 'risk.mutation_verb', 'unlikely');
         noteFact(judgement.facts, 'githubAction', githubAction(group, verb));
@@ -3539,7 +3609,7 @@ async function judgeCommand(view: CommandView, outer: ShellScope, mode: Mode): P
   if (command.head === 'ln' || command.head === 'cp') await noteLinks(view, scope);
 
   await judgeReads(view, scope, mode);
-  judgeMutation(view, judgement);
+  judgeMutation(view, judgement, scope.context);
   judgeNetworkClient(view, judgement);
 
   if (mode.nesting < MAX_SCRIPT_NESTING) {

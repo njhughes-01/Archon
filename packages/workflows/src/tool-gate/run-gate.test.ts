@@ -17,6 +17,7 @@ import {
   assertProviderHonoursToolGate,
   createRunToolGate,
   emptyToolGateRoot,
+  githubRepositoryOf,
   providerHonoursToolGate,
   providersUsableUnderToolGate,
   workflowToolGateRecorder,
@@ -466,6 +467,64 @@ describe.skipIf(isWindows)('assertProviderHonoursToolGate', () => {
     expect(message).toContain('toolGate.enabled: false');
     expect(message).toContain('~/.archon/config.yaml');
     expect(message).toContain('.archon/config.yaml if it is set there');
+  });
+});
+
+describe.skipIf(isWindows)('merging a pull request', () => {
+  const KEYED = { JEV_API_KEY: 'k' };
+
+  test('a workflow step is refused when the classifier says the merge is risky', async () => {
+    const { fetch, calls } = jevFetch(3, 1);
+    const h = harness({ fetch, env: KEYED });
+    const gate = createRunToolGate(h.input)?.forStep('pr');
+    expect(await gate?.(shell('gh pr merge 5 --squash --repo acme/app', h.root))).toMatchObject({
+      action: 'deny',
+      needsApproval: true,
+    });
+    expect(calls()).toBe(1);
+  });
+
+  test('a caller given the merge of its own repository is allowed without the classifier', async () => {
+    const { fetch, calls } = jevFetch(3, 1);
+    const h = harness({ fetch, env: KEYED, ownPullRequestMerge: { repository: 'acme/app' } });
+    const gate = createRunToolGate(h.input)?.forStep('chat');
+    expect(await gate?.(shell('gh pr merge 5 --squash --repo acme/app', h.root))).toEqual({
+      action: 'allow',
+    });
+    expect(calls()).toBe(0);
+    // The merge that skips required checks still goes to the classifier, which refuses it.
+    expect(
+      await gate?.(shell('gh pr merge 5 --squash --admin --repo acme/app', h.root))
+    ).toMatchObject({
+      action: 'deny',
+    });
+    expect(calls()).toBe(1);
+  });
+});
+
+describe('githubRepositoryOf', () => {
+  test.each([
+    ['https://github.com/acme/app', 'acme/app'],
+    ['https://github.com/acme/app.git', 'acme/app'],
+    ['https://github.com/acme/app/', 'acme/app'],
+    ['git@github.com:acme/app.git', 'acme/app'],
+    ['ssh://git@github.com/acme/my.app.git', 'acme/my.app'],
+  ])('%s is %s', (url, expected) => {
+    expect(githubRepositoryOf(url)).toBe(expected);
+  });
+
+  test.each([
+    null,
+    undefined,
+    '',
+    'acme/app',
+    'https://gitlab.com/acme/app',
+    'https://github.com.evil.test/acme/app',
+    'https://github.com/acme/app/pull/5',
+    'https://github.com/acme',
+    'https://evil.test/https://github.com/acme/app',
+  ])('%s has none', url => {
+    expect(githubRepositoryOf(url)).toBeUndefined();
   });
 });
 

@@ -558,3 +558,92 @@ posix('a call that names more paths than are placed', () => {
     expect(await ruleOf(`touch ${inside.join(' ')}`, tree)).toBe('deny.command_too_large');
   });
 });
+
+posix('a chat merging a pull request of its own project', () => {
+  const REPO = 'acme/app';
+  function chatTree(): Tree {
+    const tree = makeTree();
+    tree.context = { ...tree.context, ownPullRequestMerge: { repository: REPO } };
+    mkdirSync(join(tree.root, 'src', 'vendor'), { recursive: true });
+    return tree;
+  }
+
+  test('without the option a merge still escalates', async () => {
+    expect(await ruleOf(`gh pr merge 5 --squash --repo ${REPO}`, makeTree())).toBe(
+      'risk.mutation_verb'
+    );
+  });
+
+  test.each([
+    `gh pr merge 5 --repo ${REPO}`,
+    `gh pr merge 5 --squash --repo ${REPO}`,
+    `gh pr merge 5 -s -R ${REPO}`,
+    `gh pr merge 5 --merge --repo ${REPO}`,
+    `gh pr merge 5 --rebase --repo ${REPO}`,
+    `gh pr merge --squash -R ${REPO} 5`,
+    'gh pr merge 5 --squash --repo=ACME/App',
+    `gh pr merge 5 --squash --repo ${REPO} --match-head-commit 6ea69665`,
+  ])('allows %s', async command => {
+    const outcome = await judge(command, chatTree());
+    expect(outcome.outcome).toBe('allow');
+    expect(outcome.ruleId).toBe('default.no_signal');
+  });
+
+  test.each([
+    // The repository is not named: gh would take it from wherever the shell stands.
+    'gh pr merge 5',
+    'gh pr merge 5 --squash',
+    'cd src/vendor && gh pr merge 5',
+    'cd && gh pr merge 5',
+    'cd - && gh pr merge 5',
+    // Skips the repository's required checks.
+    `gh pr merge 5 --squash --admin --repo ${REPO}`,
+    // Removes the branch a worker may still have checked out.
+    `gh pr merge 5 --squash --delete-branch --repo ${REPO}`,
+    `gh pr merge 5 -d --repo ${REPO}`,
+    `gh pr merge 5 -sd --repo ${REPO}`,
+    `gh pr merge 5 --auto --repo ${REPO}`,
+    // Another repository, by option, operand, variable or early option.
+    'gh pr merge 5 --squash --repo other/app',
+    'gh pr merge 5 --squash --repo github.example.com/acme/app',
+    `gh pr merge 5 --repo ${REPO} --repo other/app`,
+    `gh pr merge 5 --repo other/app --repo ${REPO}`,
+    `gh pr merge https://github.com/other/app/pull/5 --repo ${REPO}`,
+    `gh pr merge other/app#5 --repo ${REPO}`,
+    `gh -R other/app pr merge 5 --repo ${REPO}`,
+    // A variable that moves the repository or swaps the account.
+    `GH_REPO=other/app gh pr merge 5 --repo ${REPO}`,
+    `GIT_DIR=/tmp/other/.git gh pr merge 5 --repo ${REPO}`,
+    `GH_TOKEN=x gh pr merge 5 --repo ${REPO}`,
+    `GITHUB_TOKEN=x gh pr merge 5 --repo ${REPO}`,
+    `export GH_HOST=github.example.com; gh pr merge 5 --repo ${REPO}`,
+    // Not one pull request number.
+    `gh pr merge --repo ${REPO}`,
+    `gh pr merge feature/login --repo ${REPO}`,
+    `gh pr merge 5 6 --repo ${REPO}`,
+    `gh pr merge "$PR" --repo ${REPO}`,
+    // Other state-changing verbs stay escalated.
+    `gh pr close 5 --repo ${REPO}`,
+    `gh pr ready 5 --repo ${REPO}`,
+    'gh repo delete acme/app --yes',
+  ])('still escalates %s', async command => {
+    const outcome = await judge(command, chatTree());
+    expect(outcome.outcome).not.toBe('allow');
+    expect(outcome.outcome === 'escalate' ? outcome.signals : []).toContain('risk.mutation_verb');
+  });
+
+  test('no merge is accepted when the project repository is unknown', async () => {
+    const tree = makeTree();
+    tree.context = { ...tree.context, ownPullRequestMerge: {} };
+    expect(await ruleOf('gh pr merge 5 --squash', tree)).toBe('risk.mutation_verb');
+    expect(await ruleOf(`gh pr merge 5 --repo ${REPO}`, tree)).toBe('risk.mutation_verb');
+  });
+
+  test('a second command in the same call is judged on its own', async () => {
+    const outcome = await judge(
+      `gh pr merge 5 --repo ${REPO} && gh pr merge 6 --admin --repo ${REPO}`,
+      chatTree()
+    );
+    expect(outcome.outcome).toBe('escalate');
+  });
+});
