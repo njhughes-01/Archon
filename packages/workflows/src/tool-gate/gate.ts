@@ -184,6 +184,11 @@ export interface ToolGateOptions {
    */
   protectedPaths?: readonly string[];
   /**
+   * Lets the caller merge a pull request of its own repository with a plain
+   * `gh pr merge <number>`. Set for a project chat only; see `RuleContext`.
+   */
+  ownPullRequestMerge?: { repository?: string };
+  /**
    * Whether a classifier key is configured. When false the classifier is never
    * called and a risk-signalled call is allowed and recorded as `fallback`.
    * When true and no usable answer comes back, the call is denied.
@@ -491,6 +496,9 @@ export function createToolGate(options: ToolGateOptions): ToolGate {
     verificationCommands: options.verificationCommands ?? DEFAULT_VERIFICATION_COMMANDS,
     extraWriteRoots: realPaths('extraWriteRoots', options.extraWriteRoots),
     protectedPaths: realPaths('protectedPaths', options.protectedPaths),
+    ...(options.ownPullRequestMerge !== undefined && {
+      ownPullRequestMerge: options.ownPullRequestMerge,
+    }),
   };
   // A root that holds the home directory (the filesystem root included) would
   // turn "outside the repository" into nearly nothing.

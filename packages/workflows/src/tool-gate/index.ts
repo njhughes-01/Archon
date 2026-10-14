@@ -65,6 +65,7 @@ export type { ToolGateJevAvailability, ToolGateJevSettings } from './escalate-je
 export {
   assertProviderHonoursToolGate,
   createRunToolGate,
+  githubRepositoryOf,
   createWorkflowRunToolGate,
   emptyToolGateRoot,
   providerHonoursToolGate,

@@ -45,6 +45,8 @@ export interface RunToolGateInput {
   extraWriteRoots?: readonly string[];
   /** Paths no step may write, move, remove or print. */
   protectedPaths?: readonly string[];
+  /** Set for a project chat: it may merge a pull request of its own repository. */
+  ownPullRequestMerge?: { repository?: string };
   /** Exact credential values the engine knows it handed to the steps. */
   credentialValues: readonly string[];
   /** The branch the work is based on. Protected along with the configured ones. */
@@ -128,6 +130,7 @@ export function createRunToolGate(input: RunToolGateInput): RunToolGate | undefi
       repoRoot: input.repoRoot,
       extraWriteRoots: input.extraWriteRoots,
       protectedPaths: input.protectedPaths,
+      ownPullRequestMerge: input.ownPullRequestMerge,
       classifierConfigured: jev.status === 'on',
       escalate,
       // Returned, not only called: the gate waits for a sink that is still writing.
@@ -295,4 +298,17 @@ export function createWorkflowRunToolGate(
     inContainer: input.inContainer,
     record: workflowToolGateRecorder(input.store, input.workflowRunId),
   });
+}
+
+/**
+ * The `owner/name` of a GitHub repository address, for the one option that
+ * compares a `--repo` against the caller's own repository. Anything else (no
+ * address, another host, an address with more to it) gives `undefined`.
+ */
+export function githubRepositoryOf(url: string | null | undefined): string | undefined {
+  const match =
+    /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(
+      url ?? ''
+    );
+  return match === null ? undefined : `${match[1] ?? ''}/${match[2] ?? ''}`;
 }

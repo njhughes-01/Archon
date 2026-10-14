@@ -65,6 +65,7 @@ import {
   collectCredentialValues,
   createRunToolGate,
   emptyToolGateRoot,
+  githubRepositoryOf,
 } from '@archon/workflows/tool-gate';
 import type { WorkflowResumeAdmission } from '@archon/workflows/engine-port';
 import { TerminalStatusWriteError } from '@archon/workflows/terminal-status-write';
@@ -2675,6 +2676,12 @@ export async function handleMessage(
           repoRoot: hasCheckout ? cwd : await emptyToolGateRoot(),
           ...(!hasCheckout && { outsideRootAdvice: NO_PROJECT_GATE_ADVICE }),
           ...(memoryDirectory !== undefined && { extraWriteRoots: [memoryDirectory] }),
+          // A project chat may merge a pull request of its own repository when
+          // the user asks: the plain merge only, which GitHub's required checks
+          // still guard. Workflow steps are not given this.
+          ...(scopedCodebase !== undefined && {
+            ownPullRequestMerge: { repository: githubRepositoryOf(scopedCodebase.repository_url) },
+          }),
           credentialValues: collectCredentialValues(
             { ...process.env, ...effectiveEnv },
             protectedEnvKeys,

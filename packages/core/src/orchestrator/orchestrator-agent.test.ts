@@ -7249,6 +7249,34 @@ describe.skipIf(process.platform === 'win32')('chat turn tool gate', () => {
     return platform.sendMessage.mock.calls.map(call => call[1]);
   }
 
+  // A person asks the chat to merge; the chat's gate lets the plain merge of its
+  // own project's pull request through, and nothing wider.
+  test('a project chat may merge a pull request of its own repository', async () => {
+    const codebase = makeCodebase({
+      default_cwd: checkout,
+      repository_url: 'https://github.com/acme/app.git',
+    });
+    mockGetCodebase.mockImplementation(() => Promise.resolve(codebase));
+    mockListCodebases.mockImplementation(() => Promise.resolve([codebase]));
+    mockGetOrCreateConversation.mockImplementation(() =>
+      Promise.resolve(makeConversation({ codebase_id: codebase.id }))
+    );
+    const { options } = await turn();
+    const gate = options?.toolGate;
+    if (gate === undefined) throw new Error('the chat was given no tool gate');
+
+    const ruleFor = async (command: string): Promise<unknown> => {
+      mockLogger.info.mockClear();
+      await gate(shell(command));
+      return decisionLogs()[0]?.ruleId;
+    };
+    expect(await ruleFor('gh pr merge 5 --squash --repo acme/app')).toBe('default.no_signal');
+    expect(await ruleFor('gh pr merge 5 --squash')).toBe('risk.mutation_verb');
+    expect(await ruleFor('gh pr merge 5 --squash --repo other/app')).toBe('risk.mutation_verb');
+    expect(await ruleFor('gh pr merge 5 --squash --admin')).toBe('risk.mutation_verb');
+    expect(await ruleFor('gh pr close 5')).toBe('risk.mutation_verb');
+  });
+
   test('gate off: a chat turn carries no toolGate, scoped or not', async () => {
     for (const toolGate of [undefined, { ...GATE_ON, enabled: false }]) {
       for (const scope of [(): void => scopeTo(checkout), unscoped]) {
