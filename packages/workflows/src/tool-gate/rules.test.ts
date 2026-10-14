@@ -596,6 +596,21 @@ posix('a chat merging a pull request of its own project', () => {
     'cd src/vendor && gh pr merge 5',
     'cd && gh pr merge 5',
     'cd - && gh pr merge 5',
+    // Not the whole call: an earlier command or a wrapper can change what gh reads.
+    `cd src/vendor && gh pr merge 5 --repo ${REPO}`,
+    `export GH_HOST+=h.invalid; gh pr merge 5 --repo ${REPO}`,
+    `declare -x GH_TOKEN+=x; gh pr merge 5 --repo ${REPO}`,
+    `unset GH_TOKEN GITHUB_TOKEN && gh pr merge 5 --repo ${REPO}`,
+    `printf -v GH_HOST h.invalid; export GH_HOST; gh pr merge 5 --repo ${REPO}`,
+    `: \${GH_HOST:=h.invalid}; export GH_HOST; gh pr merge 5 --repo ${REPO}`,
+    `env -u GH_TOKEN gh pr merge 5 --repo ${REPO}`,
+    `env -i gh pr merge 5 --repo ${REPO}`,
+    `sudo gh pr merge 5 --repo ${REPO}`,
+    `time gh pr merge 5 --repo ${REPO}`,
+    `bash -c 'unset GH_TOKEN; gh pr merge 5 --repo ${REPO}'`,
+    `bash -c 'gh pr merge 5 --repo ${REPO}'`,
+    `true; gh pr merge 5 --repo ${REPO}`,
+    `gh pr merge 5 --repo ${REPO} | cat`,
     // Skips the repository's required checks.
     `gh pr merge 5 --squash --admin --repo ${REPO}`,
     // Removes the branch a worker may still have checked out.
@@ -639,11 +654,23 @@ posix('a chat merging a pull request of its own project', () => {
     expect(await ruleOf(`gh pr merge 5 --repo ${REPO}`, tree)).toBe('risk.mutation_verb');
   });
 
-  test('a second command in the same call is judged on its own', async () => {
-    const outcome = await judge(
-      `gh pr merge 5 --repo ${REPO} && gh pr merge 6 --admin --repo ${REPO}`,
-      chatTree()
+  test('the parse a provider hands over must also be one command', async () => {
+    const tree = chatTree();
+    const request = (parsedCommands: string[]) =>
+      evaluateRules(
+        {
+          toolName: 'Bash',
+          kind: 'shell',
+          cwd: tree.root,
+          command: `gh pr merge 5 --repo ${REPO}`,
+          parsedCommands,
+          input: {},
+        },
+        tree.context
+      );
+    expect((await request([`gh pr merge 5 --repo ${REPO}`])).outcome).toBe('allow');
+    expect((await request([`unset GH_TOKEN; gh pr merge 5 --repo ${REPO}`])).outcome).toBe(
+      'escalate'
     );
-    expect(outcome.outcome).toBe('escalate');
   });
 });

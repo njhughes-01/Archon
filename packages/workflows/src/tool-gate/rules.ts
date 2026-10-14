@@ -530,7 +530,8 @@ const GH_MERGE_HEAD_OPTION = '--match-head-commit';
  * repository, named with `--repo`, the ordinary way. GitHub still applies the branch's required
  * checks, because `--admin` is not accepted; neither is `--auto`, which merges
  * later with nobody watching, nor `--delete-branch`, which removes a branch a
- * worktree may hold. A `--repo` must name the caller's repository exactly.
+ * worktree may hold. A `--repo` must name the caller's repository exactly, and
+ * the merge must be the only command of the call.
  */
 function isOwnPullRequestMerge(
   view: CommandView,
@@ -540,10 +541,11 @@ function isOwnPullRequestMerge(
   const own = context.ownPullRequestMerge;
   if (own === undefined || view.args.some(arg => arg.dynamic || arg.glob)) return false;
   if (view.args[0]?.text !== 'pr' || view.args[1]?.text !== 'merge') return false;
-  // Any variable set for the command could change the repository or the account
-  // `gh` acts as (`GIT_DIR`, `GH_TOKEN`, ...), so none is accepted.
+  // The merge must be the whole call. An earlier command could set or unset a
+  // variable `gh` reads (`GH_HOST`, `GH_TOKEN`) in a form this reader does not
+  // see, and a wrapper (`env -u`, `sudo`) could do the same.
+  if (judgement.sole !== view.command || view.command.wrappers.length > 0) return false;
   if (view.command.assignments.length > 0 || judgement.environment.size > 0) return false;
-  if (view.command.wrappers.some(wrapper => WRAPPERS[wrapper]?.kind !== 'benign')) return false;
 
   // The repository must be named. Without `--repo`, `gh` takes it from wherever
   // the shell stands, which a `cd` or a nested checkout moves unseen.
@@ -746,6 +748,12 @@ interface Judgement {
   heads: Map<string, Promise<string | undefined>>;
   /** Where a shell request starts, which is what its provider placed the request's own paths by. */
   startCwd: string | undefined;
+  /**
+   * The command of the script being read at the top level, when it is the only
+   * one there. Nothing before it in the call could have set a variable, moved
+   * the shell or dropped a credential for it.
+   */
+  sole: ShellCommand | undefined;
 }
 
 function newJudgement(): Judgement {
@@ -769,6 +777,7 @@ function newJudgement(): Judgement {
     worktrees: new Set(),
     heads: new Map(),
     startCwd: undefined,
+    sole: undefined,
   };
 }
 
@@ -3854,6 +3863,10 @@ async function judgeScript(
     return false;
   }
   if (parsed.opaque.length > 0) signal(judgement, 'risk.opaque_shell');
+  if (mode.nesting === 0) {
+    const alone = parsed.commands.length === 1 && parsed.opaque.length === 0;
+    judgement.sole = alone ? parsed.commands[0] : undefined;
+  }
 
   const views: CommandView[] = parsed.commands.map(command => toView(command, context));
   for (const view of views) {
